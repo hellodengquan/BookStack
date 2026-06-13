@@ -8,7 +8,7 @@ return [
 
     'failed' => 'Ови акредитиви се не поклапају са нашом евиденцијом.',
     'throttle' => 'Превише покушаја пријаве. Покушајте поново за :seconds секунди.',
-    'mfa_throttle' => 'Too many multi-factor verification attempts. Please try again in :seconds seconds.',
+    'mfa_throttle' => 'Превише покушаја потврђивања вишефакторском аутентификацијом. Молим вас покушајте поново за :seconds секунди.',
 
     // Login & Register
     'sign_up' => 'Региструј се',

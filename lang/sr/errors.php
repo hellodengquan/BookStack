@@ -9,7 +9,7 @@ return [
     'permissionJson' => 'Немате овлашћење да извршите ову акцију.',
 
     // Auth
-    'error_user_exists_different_creds' => 'Корисник са е-мејл адресом :email већ постоји са другим приступним подацима.',
+    'error_user_exists_different_creds' => 'Корисник са адресом е-поште :email већ постоји са другим приступним подацима.',
     'auth_pre_register_theme_prevention' => 'User account could not be registered for the provided details',
     'email_already_confirmed' => 'Email has already been confirmed, Try logging in.',
     'email_confirmation_invalid' => 'This confirmation token is not valid or has already been used, Please try registering again.',
@@ -94,13 +94,13 @@ return [
     'empty_comment' => 'Cannot add an empty comment.',
 
     // Error pages
-    '404_page_not_found' => 'Page Not Found',
-    'sorry_page_not_found' => 'Sorry, The page you were looking for could not be found.',
-    'sorry_page_not_found_permission_warning' => 'If you expected this page to exist, you might not have permission to view it.',
-    'image_not_found' => 'Image Not Found',
-    'image_not_found_subtitle' => 'Sorry, The image file you were looking for could not be found.',
-    'image_not_found_details' => 'If you expected this image to exist it might have been deleted.',
-    'return_home' => 'Return to home',
+    '404_page_not_found' => 'Страна није пронађена',
+    'sorry_page_not_found' => 'Извините, страна коју сте тражили није могла бити пронађена.',
+    'sorry_page_not_found_permission_warning' => 'Ако сте очекивали да ова страна постоји, можда немате дозволу да је прегледате.',
+    'image_not_found' => 'Слика није пронађена',
+    'image_not_found_subtitle' => 'Извините, слика коју сте тражили није могла бити пронађена.',
+    'image_not_found_details' => 'Ако сте очекивали да ова слика постоји, можда је обрисана.',
+    'return_home' => 'Повратак на почетну',
     'error_occurred' => 'Догодила се грешка',
     'app_down' => ':appName is down right now',
     'back_soon' => 'It will be back up soon.',

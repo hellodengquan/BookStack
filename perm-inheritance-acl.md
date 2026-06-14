@@ -2356,7 +2356,631 @@ BookStack 的权限缓存**完全不使用 Redis/Memcached 等外部缓存**，�
 
 ---
 
-## 二十二、最终设计要点总览
+## 二十二、草稿（Draft）与已发布（Published）状态的权限链路
+
+### 22.1 Page 的 draft 状态字段
+
+Page 模型有一个 `draft` 布尔字段：
+
+```php
+// app/Entities/Models/Page.php:41
+protected $casts = [
+    'draft'    => 'boolean',
+    'template' => 'boolean',
+];
+```
+
+两种状态：
+- `draft = true`：草稿页，只有创建者可见
+- `draft = false`：已发布页，受正常权限链控制
+
+### 22.2 草稿可见性的双重过滤
+
+Page 列表查询经过**两层独立过滤**：
+
+```
+Page::scopeVisible($query)
+        │
+        ├─► Layer 1: restrictDraftsOnPageQuery()  ← 草稿可见性过滤
+        │     ├─► draft = false → 可见（所有已发布页）
+        │     └─► draft = true AND owned_by = 当前用户 → 可见（自己的草稿）
+        │
+        └─► Layer 2: parent::scopeVisible()       ← JointPermission 权限过滤
+              └─► WHERE EXISTS (joint_permissions ...)
+```
+
+位置：`app/Entities/Models/Page.php:48`
+
+```php
+public function scopeVisible(Builder $query): Builder
+{
+    $query = app()->make(PermissionApplicator::class)->restrictDraftsOnPageQuery($query);
+    return parent::scopeVisible($query);
+}
+```
+
+**关键**：草稿过滤**优先于**权限过滤。即使 JointPermission 允许查看某页面，如果该页面是草稿且不属于当前用户，仍然不可见。
+
+### 22.3 restrictDraftsOnPageQuery 的实现
+
+位置：`app/Permissions/PermissionApplicator.php:117`
+
+```php
+public function restrictDraftsOnPageQuery(Builder $query): Builder
+{
+    return $query->where(function (Builder $query) {
+        $query->where('draft', '=', false)
+            ->orWhere(function (Builder $query) {
+                $query->where('draft', '=', true)
+                    ->where('owned_by', '=', $this->currentUser()->id);
+            });
+    });
+}
+```
+
+生成的 SQL：
+
+```sql
+WHERE (draft = 0 OR (draft = 1 AND owned_by = ?))
+```
+
+**注意**：草稿可见性基于 `owned_by` 字段而非 `created_by`。这是有意设计：
+- `owned_by` 是当前页面所有者，可随页面转移而改变
+- `created_by` 仅记录创建者
+
+### 22.4 草稿的 EntityPermission 和 JointPermission
+
+**草稿仍然参与 EntityPermission 继承链和 JointPermission 预计算**。
+
+这意味着：
+
+| 场景 | JointPermission | 草稿过滤 | 最终结果 |
+|------|-----------------|----------|----------|
+| 已发布页 + 有权限 | ✅ 允许 | ✅ draft=false | ✅ 可见 |
+| 已发布页 + 无权限 | ❌ 拒绝 | ✅ draft=false | ❌ 不可见 |
+| 自己的草稿 + 有权限 | ✅ 允许 | ✅ owned_by=me | ✅ 可见 |
+| 自己的草稿 + 无权限 | ❌ 拒绝 | ✅ owned_by=me | ❌ 不可见（权限优先） |
+| 他人草稿 + 有权限 | ✅ 允许 | ❌ owned_by≠me | ❌ 不可见（草稿过滤优先） |
+| 他人草稿 + 无权限 | ❌ 拒绝 | ❌ owned_by≠me | ❌ 不可见 |
+
+**关键推论**：
+- 自己的草稿也受 EntityPermission 控制——如果书的 Fallback 设为拒绝查看，自己的草稿也看不到
+- 他人草稿即使有权限也看不到——草稿可见性严格限定于所有者
+
+### 22.5 草稿的生命周期与权限变化
+
+```
+创建草稿 (PageRepo::getNewDraftPage)
+  ├─► draft = true
+  ├─► owned_by = 当前用户
+  ├─► rebuildPermissions() → JointPermission 正常计算
+  │
+  ▼
+发布草稿 (PageRepo::publishDraft)
+  ├─► draft = false
+  ├─► revision_count = 1
+  ├─► rebuildPermissions() → JointPermission 重新计算
+  │
+  ▼
+更新已发布页面 (PageRepo::updatePage)
+  ├─► draft 保持 false
+  ├─► 可能产生 update_draft 类型的 PageRevision（编辑草稿）
+  └─► rebuildPermissions()
+```
+
+**注意**：`update_draft` 类型的 PageRevision 和页面的 `draft` 字段是**两个不同的概念**：
+- `Page.draft = true`：整个页面是新建草稿，还未发布
+- `PageRevision.type = 'update_draft'`：已发布页面的编辑草稿，保存在修订记录中，不影响页面本身的 draft 字段
+
+### 22.6 草稿在目录树和搜索中的过滤
+
+**目录树**：
+
+```php
+// app/Entities/Tools/BookContents.php:28
+->where('draft', '=', false)  // 目录树只显示已发布页面
+```
+
+**搜索**：
+
+```php
+// app/Search/SearchController.php:104
+->where('draft', '=', false)  // 搜索结果排除草稿
+```
+
+**导出**：
+
+```php
+// app/Exports/ZipExports/Models/ZipExportBook.php:73
+} else if ($child instanceof Page && !$child->draft) {  // 导出排除草稿
+```
+
+这些场景统一策略：**草稿对非所有者完全不可见**，即使有足够的 EntityPermission。
+
+### 22.7 草稿不能添加评论
+
+位置：`app/Activity/CommentRepo.php:46`
+
+```php
+public function create(Entity $entity, string $html, ?int $parentId, string $contentRef): Comment
+{
+    if ($entity instanceof Page && $entity->draft) {
+        throw new \Exception(trans('errors.cannot_add_comment_to_draft'));
+    }
+    // ...
+}
+```
+
+这是业务层面的额外限制：草稿页禁止添加评论，与权限无关。
+
+---
+
+## 二十三、评论、附件等子资源的权限继承
+
+### 23.1 核心原则：子资源没有独立的 EntityPermission
+
+Comment（评论）、Attachment（附件）、Image（图片）这三类子资源**不拥有自己的 EntityPermission 记录**，也不参与 JointPermission 预计算。
+
+它们的权限通过**父实体（Page）的权限 + 自身的系统权限（RolePermission）**联合控制。
+
+```
+子资源权限 = 父页面可见性 ∩ 子资源操作的系统权限
+
+          ┌──────────────────────┐
+          │  父页面（Page）权限   │
+          │  JointPermission     │
+          │  EntityPermission    │
+          └──────────┬───────────┘
+                     │ AND
+                     ▼
+          ┌──────────────────────┐
+          │  子资源系统权限       │
+          │  comment-create-all  │
+          │  attachment-update-own│
+          │  image-delete-all    │
+          └──────────────────────┘
+```
+
+### 23.2 子资源的非 JointPermission 标识
+
+位置：`app/Permissions/PermissionApplicator.php:39`
+
+```php
+$nonJointPermissions = ['restrictions', 'image', 'attachment', 'comment'];
+```
+
+当 `checkOwnableUserAccess()` 检测到权限前缀在这个列表中时，**跳过 EntityPermission 继承链评估**，只检查系统权限（RolePermission）：
+
+```php
+if (in_array($explodedPermission[0], $nonJointPermissions)) {
+    return $hasRolePermission;  // 只看 xxx-all / xxx-own，不走 EntityPermission
+}
+```
+
+这意味着：`comment-create-all`、`attachment-update-own` 等权限**完全由角色系统权限决定**，不受 EntityPermission 继承链影响。
+
+### 23.3 Comment（评论）的权限路径
+
+#### 可见性（列表查询）
+
+位置：`app/Activity/Models/Comment.php:107`
+
+```php
+public function scopeVisible(Builder $query): Builder
+{
+    return app()->make(PermissionApplicator::class)
+        ->restrictEntityRelationQuery($query, 'comments', 'commentable_id', 'commentable_type');
+}
+```
+
+Comment 通过 `commentable_id/commentable_type` 多态关联到 Page，利用 `restrictEntityRelationQuery()` 过滤：
+
+```sql
+-- 只返回关联页面有查看权限的评论
+-- 且关联页面不是草稿（draft = false）
+WHERE EXISTS (
+    SELECT 1 FROM joint_permissions jp
+    WHERE jp.entity_id = comments.commentable_id
+      AND jp.entity_type = comments.commentable_type
+      AND jp.role_id IN (用户角色IDs)
+    GROUP BY entity_type, entity_id
+    HAVING (status IN (1, 3) OR (owner_id = ? AND status != 2))
+)
+AND (
+    comments.commentable_type != 'page'
+    OR EXISTS (
+        SELECT 1 FROM entity_page_data
+        WHERE entity_page_data.page_id = comments.commentable_id
+          AND entity_page_data.draft = false  -- ★ 草稿页的评论不可见
+    )
+)
+```
+
+**Comment 的 JointPermission 关联**：
+
+位置：`app/Activity/Models/Comment.php:97`
+
+```php
+public function jointPermissions(): HasMany
+{
+    // ★ 巧妙：Comment 复用了关联 Page 的 JointPermission
+    return $this->hasMany(JointPermission::class, 'entity_id', 'commentable_id')
+        ->whereColumn('joint_permissions.entity_type', '=', 'comments.commentable_type');
+}
+```
+
+Comment 自身没有 JointPermission 行，但通过关联定义"借"了父 Page 的 JointPermission，实现无缝的权限过滤。
+
+#### 创建评论
+
+```
+CommentController::savePageComment()
+        │
+        ├─► 1. findVisibleById($pageId) ← 确认页面可见（含草稿过滤）
+        │
+        └─► 2. checkPermission(CommentCreateAll) ← 只检查系统权限，不走 EntityPermission
+              │
+              └─► 非 JointPermission 类型，直接看角色有没有 comment-create-all
+```
+
+**注意**：评论创建权限是 `comment-create-all`，没有 `comment-create-own`。任何人只要有此权限就能在任何可见页面上评论。
+
+#### 更新/删除评论
+
+```
+CommentController::update()
+        │
+        ├─► 1. checkOwnablePermission(PageView, comment.entity) ← 确认能看页面
+        └─► 2. checkOwnablePermission(CommentUpdate, comment)  ← 检查评论操作权限
+              │
+              ├─► comment-update-all → 任何评论都可修改
+              └─► comment-update-own + created_by = 当前用户 → 只能改自己的评论
+```
+
+### 23.4 Attachment（附件）的权限路径
+
+#### 可见性（列表查询）
+
+位置：`app/Uploads/Attachment.php:114`
+
+```php
+public function scopeVisible(): Builder
+{
+    return app()->make(PermissionApplicator::class)
+        ->restrictPageRelationQuery(self::query(), 'attachments', 'uploaded_to');
+}
+```
+
+使用 `restrictPageRelationQuery()` 而非 `restrictEntityRelationQuery()`，因为附件是一对多关系（uploaded_to 指向 page_id），不需要多态处理：
+
+```sql
+WHERE EXISTS (
+    SELECT 1 FROM joint_permissions jp
+    WHERE jp.entity_id = attachments.uploaded_to
+      AND jp.entity_type = 'page'
+      AND jp.role_id IN (用户角色IDs)
+    GROUP BY entity_type, entity_id
+    HAVING (status IN (1, 3) OR (owner_id = ? AND status != 2))
+)
+AND EXISTS (
+    SELECT 1 FROM entities
+    LEFT JOIN entity_page_data ON entities.id = entity_page_data.page_id
+    WHERE entities.id = attachments.uploaded_to
+      AND entities.type = 'page'
+      AND (entity_page_data.draft = false
+           OR (entity_page_data.draft = true AND entities.created_by = ?))
+    -- ★ 自己的草稿页面的附件也可见
+)
+```
+
+#### 创建附件
+
+```
+AttachmentController::upload()
+        │
+        ├─► 1. findVisibleByIdOrFail($pageId) ← 确认页面可见
+        ├─► 2. checkPermission(AttachmentCreateAll) ← 系统权限
+        └─► 3. checkOwnablePermission(PageUpdate, $page) ← 还需有页面编辑权限
+              │
+              └─► 这是双重检查：不仅要 attachment-create 权限，还要 page-update 权限
+```
+
+**关键**：附件创建需要**两个权限同时满足**——`attachment-create-all` + `page-update(-all/-own)`。
+
+#### 更新/删除附件
+
+```
+AttachmentController::update()
+        │
+        ├─► 1. checkOwnablePermission(PageView, attachment.page) ← 能看页面
+        ├─► 2. checkOwnablePermission(PageUpdate, attachment.page) ← 能编辑页面
+        └─► 3. checkOwnablePermission(AttachmentUpdate, attachment) ← 附件操作权限
+              ├─► attachment-update-all
+              └─► attachment-update-own + created_by = 当前用户
+```
+
+**注意下载附件**：
+
+```
+AttachmentController::get()
+        │
+        └─► findVisibleByIdOrFail(attachment.uploaded_to) ← 仅需页面可见
+              │
+              └─► 不需要 attachment 特定权限，只需要能看页面就能下载附件
+```
+
+### 23.5 Image（图片）的权限路径
+
+图片与附件类似，通过 `restrictPageRelationQuery()` 控制可见性：
+
+```php
+// app/Uploads/ImageRepo.php:67
+$imageQuery = $this->permissions->restrictPageRelationQuery($imageQuery, 'images', 'uploaded_to');
+```
+
+图片权限的系统权限项：
+
+| 权限 | 含义 |
+|------|------|
+| `image-create-all` | 可上传图片到任何可见页面 |
+| `image-update-all` / `image-update-own` | 修改图片信息 |
+| `image-delete-all` / `image-delete-own` | 删除图片 |
+
+### 23.6 子资源权限总结对比
+
+| 子资源 | 可见性查询方法 | 创建权限 | 操作权限 | 能否独立设 EntityPermission |
+|--------|---------------|----------|----------|---------------------------|
+| **Comment** | `restrictEntityRelationQuery` | `comment-create-all` | `comment-update/delete-all/own` | ❌ |
+| **Attachment** | `restrictPageRelationQuery` | `attachment-create-all` + `page-update` | `attachment-update/delete-all/own` | ❌ |
+| **Image** | `restrictPageRelationQuery` | `image-create-all` | `image-update/delete-all/own` | ❌ |
+
+**共同特点**：
+- 都没有自己的 `entity_permissions` 记录
+- 可见性完全依赖父页面（Page）的 JointPermission
+- 操作权限由系统权限（RolePermission）+ owned_by/created_by 判断
+- 草稿页面的子资源对非所有者不可见（`restrictEntityRelationQuery` 和 `restrictPageRelationQuery` 都过滤了 draft）
+
+### 23.7 restrictPageRelationQuery vs restrictEntityRelationQuery 的区别
+
+| 方法 | 适用场景 | 多态关系 | 草稿过滤 |
+|------|----------|---------|----------|
+| `restrictEntityRelationQuery` | Comment 等多态关联 | `commentable_id + commentable_type` | 关联实体是 Page 时排除草稿 |
+| `restrictPageRelationQuery` | Attachment/Image 等一对多 | `uploaded_to`（直接 page_id） | 同样排除草稿（含自己的草稿可见） |
+
+**细微差异**：
+- `restrictEntityRelationQuery` 简单地排除所有草稿页面关联的记录（`draft = false`）
+- `restrictPageRelationQuery` 更精细：自己的草稿也可见（`draft = false OR (draft = true AND created_by = me)`）
+
+这解释了为什么附件在用户编辑自己的草稿页面时可以看到，而评论在草稿页面上完全不可见（另有 `cannot_add_comment_to_draft` 业务限制）。
+
+---
+
+## 二十四、API Token 鉴权与 Session 鉴权的不同路径
+
+### 24.1 两种鉴权方式总览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    请求进入 BookStack                        │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+            ┌───────────┴───────────┐
+            │                       │
+            ▼                       ▼
+┌───────────────────┐   ┌───────────────────┐
+│  Web 路由          │   │  API 路由          │
+│  /books, /pages   │   │  /api/books       │
+│  Session Guard    │   │  ApiAuthenticate   │
+└────────┬──────────┘   └────────┬──────────┘
+         │                       │
+         │              ┌────────┴────────┐
+         │              │                 │
+         │              ▼                 ▼
+         │    ┌─────────────────┐ ┌─────────────────┐
+         │    │ Session Cookie  │ │ Authorization   │
+         │    │ 已有登录会话    │ │ Header: Token   │
+         │    │ (GET only!)    │ │ id:secret       │
+         │    └────────┬───────┘ └────────┬────────┘
+         │             │                  │
+         │             ▼                  ▼
+         │    sessionUserHasApiAccess()   ApiTokenGuard
+         │    + access-api 权限           ::user()
+         │    + GET 限制                  + Token 验证
+         │             │                  + 过期检查
+         │             │                  + access-api 权限
+         │             │                  │
+         │             └────────┬─────────┘
+         │                      │
+         ▼                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│              同一套权限检查逻辑                               │
+│  • checkOwnableUserAccess()                                 │
+│  • restrictEntityQuery() → joint_permissions                │
+│  • checkPermission() → role_permissions                     │
+│  • user()->can() → User::permissions()                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 24.2 Session 鉴权路径
+
+**Web 路由**使用 Laravel 默认的 Session Guard：
+
+```
+请求 → StartSession 中间件 → Auth Session Guard → user() 从 Session 读取
+```
+
+**API 路由**也可以使用 Session，但有严格限制。
+
+#### ApiAuthenticate 中间件
+
+位置：`app/Http/Middleware/ApiAuthenticate.php:17`
+
+```php
+public function handle(Request $request, Closure $next)
+{
+    $this->ensureAuthorizedBySessionOrToken($request);
+    return $next($request);
+}
+
+protected function ensureAuthorizedBySessionOrToken(Request $request): void
+{
+    // 优先使用已有的 Session
+    if (session()->isStarted()) {
+        // 1. 必须有 access-api 权限
+        if (!$this->sessionUserHasApiAccess()) {
+            throw new ApiAuthException(trans('errors.api_user_no_api_permission'), 403);
+        }
+        // 2. ★ 只允许 GET 请求（防 CSRF）
+        if ($request->method() !== 'GET') {
+            throw new ApiAuthException(trans('errors.api_cookie_auth_only_get'), 403);
+        }
+        return;
+    }
+
+    // 无 Session → 走 API Token 认证
+    auth()->shouldUse('api');     // 切换到 api guard
+    auth()->authenticate();       // 验证 Token
+}
+```
+
+**Session Cookie 鉴权的三个条件**：
+1. 有活跃的 Session（已登录）
+2. 用户有 `access-api` 系统权限
+3. 请求方法是 GET
+
+**为什么 Session 只允许 GET？**
+- 防止 CSRF 攻击：浏览器自动携带 Cookie，恶意网站可以伪造 POST 请求
+- API Token 通过 `Authorization` Header 传递，不会被浏览器自动携带，不受 CSRF 影响
+- GET 请求是幂等的，不会修改数据，CSRF 风险可接受
+
+### 24.3 API Token 鉴权路径
+
+#### ApiTokenGuard
+
+位置：`app/Api/ApiTokenGuard.php:15`
+
+```
+Authorization: Token {token_id}:{secret}
+        │
+        ▼
+ApiTokenGuard::getAuthorisedUserFromRequest()
+        │
+        ├─► 1. validateTokenHeaderValue() —— 格式校验
+        │     ├─► 非空
+        │     └─► "Token " 前缀 + 包含 ":"
+        │
+        ├─► 2. 解析 token_id 和 secret
+        │     $id, $secret = explode(':', str_replace('Token ', '', $authToken))
+        │
+        ├─► 3. 查询 ApiToken
+        │     ApiToken::where('token_id', '=', $id)->with(['user'])->first()
+        │
+        └─► 4. validateToken($token, $secret)
+              ├─► Token 存在？
+              ├─► Hash::check($secret, $token->secret) —— 密钥比对
+              ├─► $token->expires_at > now() —— 未过期？
+              └─► $token->user->can(access-api) —— 用户有 API 权限？
+```
+
+#### ApiToken 模型
+
+位置：`app/Api/ApiToken.php:22`
+
+| 字段 | 说明 |
+|------|------|
+| `token_id` | Token 的公开标识（存储在数据库中，用于查找） |
+| `secret` | Token 的密钥哈希（`Hash::make()` 存储，验证时 `Hash::check()`） |
+| `name` | Token 名称（用户自定义） |
+| `user_id` | 所属用户 |
+| `expires_at` | 过期时间（默认 100 年后） |
+
+**Token 格式**：`Token {token_id}:{raw_secret}`
+
+- `token_id`：明文存储在数据库中，用于快速查找
+- `raw_secret`：只在创建时展示一次，数据库中只存哈希值
+- 分隔符 `:` 用于区分 ID 和 Secret
+
+### 24.4 两种鉴权路径的权限差异
+
+| 维度 | Session Cookie | API Token |
+|------|---------------|-----------|
+| **认证方式** | Session ID in Cookie | Authorization Header |
+| **Guard** | 默认 Session Guard | `api` (ApiTokenGuard) |
+| **支持的 HTTP 方法** | 仅 GET | GET / POST / PUT / DELETE / PATCH |
+| **CSRF 保护** | 通过限制 GET 实现 | 不需要（Header 不会被自动携带） |
+| **用户状态检查** | Session 中已有用户 | 重新从数据库加载 |
+| **access-api 权限** | ✅ 需要 | ✅ 需要 |
+| **邮件确认检查** | ✅ 登录时已检查 | ✅ awaitingEmailConfirmation 检查 |
+| **MFA 检查** | ✅ 登录时已通过 | ❌ **不检查 MFA** |
+| **权限检查逻辑** | 同一套 | 同一套 |
+| **JointPermission** | 同一套 | 同一套 |
+| **EntityPermission** | 同一套 | 同一套 |
+
+### 24.5 API Token 不受 MFA 限制
+
+**重要安全特性**：API Token 认证**不触发 MFA（多因素认证）检查**。
+
+```
+Session 登录流程：
+  用户名/密码 → MFA 验证 → Session 建立 → 后续请求自动认证
+
+API Token 认证流程：
+  Authorization: Token xxx:yyy → 验证 Token → 直接认证（无 MFA）
+```
+
+**设计理由**：
+- API Token 通常用于自动化集成（CI/CD、脚本），无法交互式输入 MFA
+- Token 本身已经是第二因素（类似应用密码 / App Password）
+- Token 可随时撤销，风险可控
+
+### 24.6 权限检查的统一入口
+
+无论哪种鉴权方式，权限检查最终都走同一套代码：
+
+```
+user() → 返回当前认证用户
+        │
+        ├─► Session: 从 Session 中恢复的 User 对象
+        └─► API Token: 从 ApiToken.user 关联加载的 User 对象
+                │
+                ▼
+user()->can($permission)        → User::permissions() → role_permissions 表
+user()->roles                   → User::roles 关联
+checkOwnableUserAccess()        → PermissionApplicator → JointPermission + EntityPermission
+restrictEntityQuery()           → JointPermission WHERE EXISTS 子查询
+```
+
+**权限数据完全一致**：同一个用户的角色和权限，无论通过哪种方式认证，权限判断结果相同。
+
+### 24.7 API Token 的生命周期管理
+
+| 操作 | 审计日志 | 权限要求 |
+|------|----------|----------|
+| 创建 Token | `api_token_create` | 自己创建或 UsersManage |
+| 更新 Token | `api_token_update` | 自己管理或 UsersManage |
+| 删除 Token | `api_token_delete` | 自己管理或 UsersManage |
+
+**Token 不可读取**：Secret 只在创建时展示一次，之后无法再获取。如果丢失，只能删除重建。
+
+### 24.8 auth()->shouldUse('api') 的作用
+
+位置：`app/Http/Middleware/ApiAuthenticate.php:50`
+
+```php
+auth()->shouldUse('api');
+```
+
+这行代码将当前请求的默认 Guard 切换为 `api`（ApiTokenGuard），影响后续所有 `auth()` 调用：
+
+- `auth()->user()` → 使用 ApiTokenGuard 获取用户
+- `auth()->id()` → 使用 ApiTokenGuard 获取用户 ID
+- `auth()->check()` → 使用 ApiTokenGuard 检查认证状态
+
+**在 Session 模式下**：不调用 `shouldUse('api')`，保持默认的 Session Guard。这样 `user()` 辅助函数仍然从 Session 获取用户。
+
+---
+
+## 二十五、最终设计要点总览
 
 1. **自底向上就近优先**：继承链从自身开始向上查找，离得越近优先级越高
 2. **角色显式覆盖父级**：同一角色的权限，子级设置覆盖父级设置
@@ -2393,4 +3017,10 @@ BookStack 的权限缓存**完全不使用 Redis/Memcached 等外部缓存**，�
 33. **全量重建的雪崩风险**：TRUNCATE 后重建期间全站不可见，建议在低峰期执行或考虑热切换方案
 34. **分块参数设计**：5/10 本图书/块、50/100 个书架/块、1000 行 SQL/块，平衡内存、锁、吞吐量
 35. **不引入 Redis**：对中小团队场景做了简单性优先的权衡，JointPermission 表本身就是持久化缓存
+36. **草稿的可见性双重过滤**：JointPermission 权限过滤 + draft/owned_by 草稿可见性过滤，两层叠加
+37. **子资源不参与继承链**：Comment/Attachment/Image 没有自己的 EntityPermission，通过父实体（Page）的权限间接控制
+38. **子资源权限 = 父页面权限 ∩ 自身系统权限**：先确认能看页面，再检查 comment-create/attachment-update 等操作权限
+39. **API Token 鉴权与 Session 鉴权的分叉点**：同一套权限检查逻辑，但认证路径和 HTTP 方法限制不同
+40. **Session Cookie 鉴权只允许 GET**：防止 CSRF 攻击，写操作必须走 API Token
+41. **API Token 鉴权需 access-api 权限**：Token 本身 + 用户角色必须有 access-api 才能通过
 

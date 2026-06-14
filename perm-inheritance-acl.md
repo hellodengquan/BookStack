@@ -1128,3 +1128,623 @@ protected function destroyCommonRelations(Entity $entity): void
 14. **单实体 vs 列表查询的分流**：列表查询走预计算表（一次 SQL），单实体检查走实时评估（灵活但多查询）
 15. **MassEntityPermissionEvaluator 的批量优化**：重建时预加载所有权限到内存，避免逐实体查询的 N+1 问题
 
+---
+
+## 十六、跨租户权限隔离与共享边界
+
+### 16.1 BookStack 的"多租户"定位
+
+BookStack **不是传统意义上的多租户 SaaS 系统**，没有独立的租户隔离沙箱。它采用的是**单实例、多用户、基于角色的权限隔离**模型。所有实体共享同一张表，通过 `joint_permissions` 表进行行级权限过滤。
+
+**没有的概念**：
+- ❌ 没有独立的租户 Schema/数据库
+- ❌ 没有 `tenant_id` 字段
+- ❌ 没有租户级管理员（只有全局管理员）
+- ❌ 没有数据物理隔离
+
+**有的隔离方式**：
+- ✅ 基于角色的访问控制（RBAC）
+- ✅ 实体级 EntityPermission 精细化权限
+- ✅ Public 角色实现公开/私密内容区分
+- ✅ Owner 权限实现"我的文档"隔离
+
+### 16.2 Public 角色与公开访问边界
+
+**Public 角色**是 BookStack 实现"访客共享"的核心机制。
+
+#### Public 系统角色
+
+位置：`app/Users/Models/Role.php:114`
+
+```php
+public static function getSystemRole(string $systemName): ?self
+{
+    static $cache = [];
+    if (!isset($cache[$systemName])) {
+        $cache[$systemName] = static::query()->where('system_name', '=', $systemName)->first();
+    }
+    return $cache[$systemName];
+}
+```
+
+系统内置两个特殊角色：
+- `system_name = 'public'` —— 公开访客角色
+- `system_name = 'admin'` —— 管理员角色
+
+#### Public 用户
+
+位置：`app/Users/Models/User.php:103`
+
+```php
+public function isGuest(): bool
+{
+    return $this->system_name === 'public';
+}
+```
+
+- Public 用户（访客）自动拥有 Public 角色
+- 当 `setting('app-public')` 为 true 时，未登录用户以 Public 用户身份访问
+- Public 用户**不能分配其他角色**（迁移 `2023_06_10_071823_remove_guest_user_secondary_roles.php` 移除了该能力）
+
+#### 公开访问的全局开关
+
+```php
+// app/Users/Models/User.php:111
+public function hasAppAccess(): bool
+{
+    return !$this->isGuest() || setting('app-public');
+}
+```
+
+- `app-public = true`：未登录用户可以访问系统，以 Public 角色参与权限评估
+- `app-public = false`：未登录用户直接被拒绝，连登录页外的内容都看不到
+
+#### Public 角色在权限继承中的行为
+
+Public 角色和其他角色**完全一样**参与 EntityPermission 继承链评估，没有任何特殊待遇：
+
+```
+未登录用户访问页面：
+  用户角色 = [public_role_id]
+  评估过程与普通用户完全一致
+  → 遍历继承链
+  → collapseAndCategorisePermissions
+  → evaluatePermitsByType
+```
+
+**实现"公开文档"的标准方式**：
+在 Book 级别设置 `role_id = 0`（fallback / 其他所有人）的 view = true，那么所有用户（包括 Public）都能看到这本书及其子内容。
+
+### 16.3 共享的层级边界
+
+实体权限的共享是**向下继承**的，遵循以下边界：
+
+| 操作 | 共享范围 | 影响深度 |
+|------|----------|----------|
+| 设置 Bookshelf 权限 | 仅书架本身 | 不影响书架下的 Book |
+| 书架权限下发到 Book | 所有选中的 Book | 触发每个 Book 独立重建，影响其下所有章节和页面 |
+| 设置 Book 权限 | 该书 + 章节 + 页面 | 完整继承链，影响最大 |
+| 设置 Chapter 权限 | 该章节 + 其下页面 | 部分影响，Book 级别不受影响 |
+| 设置 Page 权限 | 仅该页面 | 影响最小 |
+| 设置 Fallback（其他所有人） | 当前层级及以下 | 阻断向上继承，所有未单独设置角色的用户都受影响 |
+
+### 16.4 Owner 权限的"准租户"隔离
+
+`xxx-view-own` 权限 + `owned_by` 字段提供了一种**"我的文档"**级别的软隔离：
+
+```sql
+-- JointPermission 中 owner_id 非空表示：
+-- 当用户是所有者且状态不是 EXPLICIT_DENY 时生效
+HAVING (status IN (1, 3) OR (owner_id = ? AND status != 2))
+```
+
+典型应用场景：
+- 普通用户有 `page-view-own` 但没有 `page-view-all`
+- 只能看到自己创建的页面和**显式开放给所有人**的页面
+- 形成一种"个人工作区 + 共享内容区"的软隔离效果
+
+### 16.5 跨"租户"共享的实践模式
+
+虽然没有原生多租户，但 BookStack 社区常用以下模式实现类似效果：
+
+| 模式 | 实现方式 | 隔离程度 |
+|------|----------|----------|
+| **按书架分区** | 每个团队一个书架，通过书架权限控制可见性 | 弱（书架不参与继承，需手动下发到 Book） |
+| **按书分区** | 每个团队一本书/一组书，设置 Book 级权限 | 中（继承链完整，能有效隔离） |
+| **角色+Owner** | 创建团队角色，配合 owned_by 实现"我的团队内容" | 中（依赖内容创建时的归属设置） |
+| **Public 角色** | 公开内容通过 fallback 开放给 Public 角色 | 弱（只有公开/私密二元选择） |
+
+### 16.6 管理员权限的穿透性
+
+系统管理员（Admin 角色）**完全绕过**所有实体权限检查：
+
+```php
+// app/Permissions/EntityPermissionEvaluator.php:24
+if (in_array(0, $userRoleIds)) {
+    return true;  // 系统管理员直接放行
+}
+```
+
+```php
+// app/Permissions/JointPermissionBuilder.php:265
+if ($isAdminRole) {
+    // 管理员所有实体所有操作都是 EXPLICIT_ALLOW
+    return $this->createJointPermissionDataArray($entity, $roleId, PermissionStatus::EXPLICIT_ALLOW, true);
+}
+```
+
+**管理员的权限是全局的**，不存在"只能管理某些书"的部分管理员概念。这也是 BookStack 不是多租户系统的重要标志。
+
+---
+
+## 十七、权限模板与角色继承路径
+
+### 17.1 两套权限体系
+
+BookStack 的权限系统由**两个正交的层级**组成：
+
+```
+┌─────────────────────────────────────────────────────┐
+│  层级一：系统级权限（RolePermission）                 │
+│  - 定义角色"能做什么类型的操作"                       │
+│  - 如：page-view-all, book-create-own               │
+│  - 存储在 role_permissions + permission_role 表     │
+└────────────────────┬────────────────────────────────┘
+                     │ 组合
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│  层级二：实体级权限（EntityPermission）              │
+│  - 定义"对具体实体的访问限制"                        │
+│  - 如：Book id=3 对 role_id=5 禁止 view              │
+│  - 存储在 entity_permissions 表                      │
+│  - 预计算结果缓存在 joint_permissions 表             │
+└─────────────────────────────────────────────────────┘
+```
+
+两套权限共同决定最终访问结果：
+
+```
+用户能访问实体 X 吗？
+    ├─► 有系统级权限 xxx-view-all 吗？ ──是──► 允许
+    │
+    ├─► 是实体所有者且有 xxx-view-own 吗？ ──是──► 允许
+    │
+    └─► EntityPermission 继承链评估
+          ├─► 有角色显式允许？ ──是──► 允许
+          ├─► 有角色显式拒绝？ ──是──► 拒绝
+          ├─► 有 fallback 允许？ ──是──► 允许
+          └─► 其他情况 → 拒绝
+```
+
+### 17.2 RolePermission（系统权限）详解
+
+定义位置：`app/Permissions/Permission.php`（枚举）
+存储位置：`role_permissions` 表 + `permission_role` 关联表
+
+#### 权限命名规则
+
+```
+{实体类型}-{动作}-{范围}
+```
+
+| 部分 | 可选值 | 说明 |
+|------|--------|------|
+| 实体类型 | `page`, `chapter`, `book`, `bookshelf`, `image`, `attachment`, `comment` | 操作对象类型 |
+| 动作 | `view`, `create`, `update`, `delete` | 操作类型 |
+| 范围 | `all`, `own` | **all** = 所有实体；**own** = 仅自己所有的实体 |
+
+**特殊权限**（没有 all/own 后缀）：
+- `access-api` —— 访问 API
+- `content-export` —— 导出内容
+- `content-import` —— 导入内容
+- `editor-change` —— 切换编辑器
+- `receive-notifications` —— 接收通知
+- `restrictions-manage` —— 管理权限（实体级）
+- `restrictions-manage-all` / `restrictions-manage-own`
+- `settings-manage` —— 管理系统设置
+- `templates-manage` —— 管理模板
+- `user-roles-manage` —— 管理角色
+- `users-manage` —— 管理用户
+
+#### 权限的层级语义
+
+以 `page-view` 为例：
+
+| 权限 | 含义 |
+|------|------|
+| `page-view-all` | 可以查看所有页面（不受 EntityPermission 限制？不，还是受限制的） |
+| `page-view-own` | 可以查看**自己拥有的**页面（配合 owned_by 字段） |
+
+**注意**：`xxx-view-all` 只是系统权限层面的"全局查看许可"，仍然会被 EntityPermission 的显式拒绝覆盖。完整逻辑见 `checkOwnableUserAccess()`。
+
+### 17.3 角色之间的关系：无继承，只有叠加
+
+BookStack 的角色**没有父子继承关系**。用户可以拥有多个角色，权限是**"或"叠加**的。
+
+```
+用户拥有角色 A + 角色 B：
+  系统权限 = (角色 A 的权限) ∪ (角色 B 的权限)
+  实体权限 = 任一角色允许即允许
+```
+
+```php
+// app/Permissions/EntityPermissionEvaluator.php:38
+// max() 实现多角色或运算
+return max($permitsByType['role']) 
+    ? PermissionStatus::EXPLICIT_ALLOW 
+    : PermissionStatus::EXPLICIT_DENY;
+```
+
+```php
+// app/Users/Models/User.php:165
+// 系统权限也是合并去重
+$this->permissions = $this->newQuery()->getConnection()->table('role_user', 'ru')
+    ->select('role_permissions.name as name')->distinct()
+    // ...
+    ->where('ru.user_id', '=', $this->id)
+    ->pluck('name');
+```
+
+### 17.4 系统角色的"模板"作用
+
+虽然没有"权限模板"的概念，但 Role 本身起到了**权限集合模板**的作用：
+
+| "模板"类型 | 实现方式 | 特点 |
+|-----------|----------|------|
+| **系统内置角色** | `system_name` 字段标记的 admin / public | 不可删除，有特殊逻辑 |
+| **默认注册角色** | `registration-role` 设置 | 新用户注册时自动分配 |
+| **普通角色** | 后台创建的角色 | 可自由编辑权限，分配给用户 |
+| **外部认证映射** | `external_auth_id` 字段 | LDAP/SAML 登录时自动匹配角色 |
+
+#### 角色创建的"复制"功能
+
+位置：`tests/User/RoleManagementTest.php:224`（测试验证），前端 UI 提供"复制角色"按钮
+
+创建角色时可以通过 `?copy_from=<role_id>` 参数预填充另一个角色的权限，这是一种**手动模板复制**机制，而非动态继承。
+
+### 17.5 checkOwnableUserAccess 完整决策流
+
+位置：`app/Permissions/PermissionApplicator.php:27`
+
+这是**单实体权限检查**的总入口，综合了系统权限 + 实体权限：
+
+```php
+public function checkOwnableUserAccess(Model&OwnableInterface $ownable, string|Permission $permission): bool
+{
+    // 1. 计算权限全称（如 page-view-all）
+    $allRolePermission = $user->can($fullPermission . '-all');
+    $ownRolePermission = $user->can($fullPermission . '-own');
+    $isOwner = $user->id === $ownableFieldVal;
+    $hasRolePermission = $allRolePermission || ($isOwner && $ownRolePermission);
+
+    // 2. 非实体类权限（image/attachment/comment/restrictions）
+    //    只看系统权限，不走 JointPermission
+    if (in_array($explodedPermission[0], $nonJointPermissions)) {
+        return $hasRolePermission;
+    }
+
+    // 3. 系统权限 + EntityPermission 联合判断
+    if ($hasRolePermission) {
+        // 有系统权限 → 再检查 EntityPermission 是否显式拒绝
+        $entityPermissionResult = $this->hasEntityPermission($entity, $userRoleIds, $action);
+        if (is_null($entityPermissionResult)) {
+            return true;  // 无 EntityPermission 设置 → 系统权限说了算
+        }
+        return $entityPermissionResult;  // 有设置 → EntityPermission 说了算
+    }
+
+    // 4. 没有系统权限 → 检查 EntityPermission 是否显式允许
+    $entityPermissionResult = $this->hasEntityPermission($entity, $userRoleIds, $action);
+    if (is_null($entityPermissionResult)) {
+        return false;  // 无设置 → 默认拒绝
+    }
+    return $entityPermissionResult;  // 有设置 → EntityPermission 说了算
+}
+```
+
+**核心规则总结**：
+
+| 系统权限 | EntityPermission 结果 | 最终结论 |
+|----------|----------------------|----------|
+| ✅ 有 | null（无设置） | ✅ 允许（系统权限生效） |
+| ✅ 有 | EXPLICIT_ALLOW | ✅ 允许 |
+| ✅ 有 | EXPLICIT_DENY | ❌ 拒绝（显式拒绝覆盖系统权限） |
+| ✅ 有 | IMPLICIT_ALLOW | ✅ 允许 |
+| ✅ 有 | IMPLICIT_DENY | ❌ 拒绝 |
+| ❌ 无 | null（无设置） | ❌ 拒绝（默认拒绝） |
+| ❌ 无 | EXPLICIT_ALLOW | ✅ 允许（实体级授权覆盖系统级拒绝） |
+| ❌ 无 | EXPLICIT_DENY | ❌ 拒绝 |
+| ❌ 无 | IMPLICIT_ALLOW | ✅ 允许 |
+| ❌ 无 | IMPLICIT_DENY | ❌ 拒绝 |
+
+> 💡 **关键点**：EntityPermission 的显式设置（EXPLICIT_*）可以**正反双向**覆盖系统权限。系统权限只是"默认值"，EntityPermission 是"精细化调整"。
+
+### 17.6 权限层级总览图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    系统管理员角色                             │
+│              （完全绕过所有权限检查）                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   系统角色权限 (RolePermission)              │
+│  page-view-all  page-view-own  page-create-all  ...         │
+│  （决定用户"能不能做某类事"的基础许可）                      │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  实体权限继承链 (EntityPermission)            │
+│  Book → Chapter → Page                                       │
+│  + 角色显式权限（就近覆盖）                                   │
+│  + Fallback 阻断（遇到即停）                                  │
+│  （对具体实体的精细化授权/拒绝）                              │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Owner 权限 (owned_by)                     │
+│  -xxx-view-own + 是所有者 → 允许                             │
+│  - 显式拒绝时 owner 权限无效                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 十八、权限变更的通知与同步机制
+
+### 18.1 权限变更的活动日志记录
+
+每次权限变更都会记录 `PERMISSIONS_UPDATE` 活动日志。
+
+触发位置：`app/Entities/Tools/PermissionsUpdater.php:40` 和 `:72`
+
+```php
+Activity::add(ActivityType::PERMISSIONS_UPDATE, $entity);
+```
+
+#### ActivityLogger 流水线
+
+位置：`app/Activity/Tools/ActivityLogger.php:27`
+
+```
+Activity::add(type, detail)
+        │
+        ├─► 1. 写入 activities 表
+        │     ├─► type（如 permissions_update）
+        │     ├─► user_id（操作者）
+        │     ├─► ip（IP 地址）
+        │     ├─► detail（实体描述）
+        │     └─► loggable_id / loggable_type（关联实体，多态）
+        │
+        ├─► 2. setNotification() —— 前端 Flash 提示
+        │     └─► session()->flash('success', '权限更新成功')
+        │
+        ├─► 3. dispatchWebhooks() —— Webhook 分发
+        │     └─► 异步 DispatchWebhookJob
+        │
+        ├─► 4. NotificationManager::handle() —— 内部通知
+        │     └─► 根据活动类型查找对应的 Handler
+        │
+        └─► 5. Theme::dispatch(ACTIVITY_LOGGED) —— 主题事件钩子
+```
+
+### 18.2 权限变更的通知：没有内置通知
+
+**重要发现**：`NotificationManager` 的默认 Handler 列表中，**没有** `PERMISSIONS_UPDATE` 对应的通知处理器。
+
+位置：`app/Activity/Notifications/NotificationManager.php:47`
+
+```php
+public function loadDefaultHandlers(): void
+{
+    $this->registerHandler(ActivityType::PAGE_CREATE, PageCreationNotificationHandler::class);
+    $this->registerHandler(ActivityType::PAGE_UPDATE, PageUpdateNotificationHandler::class);
+    $this->registerHandler(ActivityType::COMMENT_CREATE, CommentCreationNotificationHandler::class);
+    $this->registerHandler(ActivityType::COMMENT_CREATE, CommentMentionNotificationHandler::class);
+    $this->registerHandler(ActivityType::COMMENT_UPDATE, CommentMentionNotificationHandler::class);
+    // ❌ 没有 PERMISSIONS_UPDATE 的 Handler！
+}
+```
+
+这意味着：
+- ✅ 权限变更会写入活动日志（可在审计日志中查看）
+- ✅ 权限变更会触发 Webhook（如果配置了 `all` 或 `permissions_update` 事件）
+- ❌ 权限变更**不会**发送邮件通知给关注者或相关用户
+- ❌ 权限变更**不会**产生站内通知
+
+**为什么不通知？**
+权限变更通常是低频的管理操作，且影响范围可能很大（如修改 Book 权限影响所有子页面），如果给每个受影响用户都发通知，可能造成通知风暴。
+
+### 18.3 Watch（关注）系统的继承机制
+
+虽然权限变更没有通知，但 Watch 系统本身也有一套类似的**继承机制**，值得对照理解。
+
+#### Watch 级别
+
+位置：`app/Activity/WatchLevels.php:9`
+
+| 级别 | 值 | 含义 |
+|------|-----|------|
+| `DEFAULT` | -1 | 默认（未设置，不存储） |
+| `IGNORE` | 0 | 忽略所有通知（不接收） |
+| `NEW` | 1 | 仅新内容通知 |
+| `UPDATES` | 2 | 新内容 + 更新通知 |
+| `COMMENTS` | 3 | 新内容 + 更新 + 评论通知 |
+
+#### Watch 的继承链评估
+
+位置：`app/Activity/Tools/EntityWatchers.php:64`
+
+```php
+protected function getRelevantWatches(): array
+{
+    $entitiesInvolved = array_filter([
+        $this->entity,                    // 自身
+        $this->entity instanceof BookChild ? $this->entity->book : null,    // 所属 Book
+        $this->entity instanceof Page ? $this->entity->chapter : null,     // 所属 Chapter
+    ]);
+    // 查询这些实体上的所有 Watch 记录
+}
+```
+
+和权限继承链完全一致：`Page → Chapter → Book`
+
+#### Watch 的"就近覆盖"规则
+
+位置：`app/Activity/Tools/EntityWatchers.php:44`
+
+```php
+// 按 entity_type 排序：book -> chapter -> page
+// （因为类型名字母序：book < chapter < page）
+usort($watches, function (Watch $watchA, Watch $watchB) {
+    $entityTypeDiff = $watchA->watchable_type <=> $watchB->watchable_type;
+    // ...
+});
+
+// De-dupe by user id → 后面的覆盖前面的
+// （因为 page 在排序后最后，所以 page 级别的 watch 会覆盖 book/chapter 级别的）
+$levelByUserId = [];
+foreach ($watches as $watch) {
+    $levelByUserId[$watch->user_id] = $watch->level;
+}
+```
+
+**和权限继承的异同**：
+
+| 特性 | 权限继承 | Watch 继承 |
+|------|----------|------------|
+| 继承链 | Page → Chapter → Book | 相同 |
+| 方向 | 自身优先（子覆盖父） | 相同（后遍历的覆盖先遍历的，page 最后） |
+| 多角色 | 或运算 | 不涉及（每个用户一条 watch 记录） |
+| Fallback 阻断 | 有（遇到 role_id=0 就停） | 无（总是查完整链） |
+| IGNORE 级别 | 无对应概念 | 有（显式忽略，优先级最高） |
+
+#### Watch 与权限的交互
+
+位置：`app/Activity/Notifications/Handlers/BaseNotificationHandler.php:19`
+
+发送通知前会做权限检查：
+
+```php
+// 防止发送给没有内容访问权限的用户
+$permissions = new PermissionApplicator($user);
+if (!$permissions->checkOwnableUserAccess($relatedModel, 'view')) {
+    continue;  // 没有权限 → 不发通知
+}
+```
+
+**保证**：用户不会收到自己无权查看的内容的通知。这是权限系统和通知系统的关键交汇点。
+
+### 18.4 Webhook 同步机制
+
+权限变更可以通过 Webhook 实现**实时外部同步**。
+
+位置：`app/Activity/Tools/ActivityLogger.php:85`
+
+```php
+protected function dispatchWebhooks(string $type, string|Loggable $detail): void
+{
+    $webhooks = Webhook::query()
+        ->whereHas('trackedEvents', function (Builder $query) use ($type) {
+            $query->where('event', '=', $type)->orWhere('event', '=', 'all');
+        })
+        ->where('active', '=', true)
+        ->get();
+
+    foreach ($webhooks as $webhook) {
+        dispatch(new DispatchWebhookJob($webhook, $type, $detail));
+    }
+}
+```
+
+#### Webhook 事件类型
+
+`ActivityType` 中所有常量都可以作为 Webhook 事件，包括：
+- `permissions_update` —— 实体权限变更
+- `role_create` / `role_update` / `role_delete` —— 角色变更
+- `user_create` / `user_update` / `user_delete` —— 用户变更
+
+#### DispatchWebhookJob
+
+位置：`app/Activity/DispatchWebhookJob.php`
+
+- 异步队列执行（不阻塞主请求）
+- 失败后自动重试（默认 Laravel 队列配置）
+- 包含实体完整数据（含权限变更内容）
+
+**这是权限变更实时同步到外部系统的唯一官方通道**。
+
+### 18.5 权限缓存与数据一致性
+
+权限变更后的"同步"主要是指 **JointPermission 缓存表的重建**，这在第十一章已有详述。此处补充几个关键的一致性保证：
+
+#### 事务内一致性
+
+权限更新操作在 `DatabaseTransaction` 中执行时：
+- EntityPermission 的 delete + create
+- JointPermission 的 delete + insert
+- Activity 日志写入
+
+以上操作在**同一个数据库事务**中，保证原子性。
+
+#### 最终一致性场景
+
+以下场景可能出现短暂的不一致窗口：
+
+| 场景 | 不一致窗口 | 原因 |
+|------|-----------|------|
+| 全量重建 | 几秒~几分钟 | TRUNCATE 后逐块插入，中间状态表不完整 |
+| 实体移动（如 Page 换 Chapter） | 毫秒级 | 先更新 parent_id，再重建权限，中间有时间差 |
+| 批量书架下发 | 每个 Book 之间 | 循环处理，前一个已提交，后一个还未开始 |
+| 角色删除 | 毫秒级 | 先删 role_user，再删 jointPermissions |
+
+这些窗口都很小（除了全量重建），且都是"最终一致"的。
+
+### 18.6 权限变更的审计追踪
+
+所有权限相关的操作都有活动日志记录，可用于审计：
+
+| 操作 | 活动类型 | 关联实体 |
+|------|----------|----------|
+| 实体权限变更 | `permissions_update` | 该实体 |
+| 角色创建 | `role_create` | - |
+| 角色更新 | `role_update` | - |
+| 角色删除 | `role_delete` | - |
+| 用户创建 | `user_create` | - |
+| 用户更新 | `user_update` | - |
+| 用户删除 | `user_delete` | - |
+| 系统设置更新 | `settings_update` | - |
+
+这些日志包含操作者、IP 地址、时间戳，满足基本的审计需求。
+
+---
+
+## 十九、最终设计要点总览
+
+1. **自底向上就近优先**：继承链从自身开始向上查找，离得越近优先级越高
+2. **角色显式覆盖父级**：同一角色的权限，子级设置覆盖父级设置
+3. **Fallback 阻断机制**：遇到"其他所有人"设置后，停止向上查找
+4. **多角色或运算**：用户拥有的多个角色中，任一角色显式允许即可通过
+5. **预计算缓存加速**：JointPermission 表将继承计算物化，查询只需 JOIN + GROUP BY
+6. **管理员例外**：系统管理员角色跳过所有权限检查
+7. **Owner 权限独立**：xxx-view-own 权限在非显式拒绝情况下对所有者生效
+8. **书架独立于继承链**：书架和书是多对多关系，不自动参与继承，需手动下发
+9. **预计算缓存的写时更新**：JointPermission 不设 TTL，由业务代码在权限变更后显式触发重建
+10. **READ COMMITTED 隔离级别**：避免权限重建时读取到过时的快照数据，保证并发场景下的数据新鲜度
+11. **Last Writer Wins 并发策略**：无悲观锁，依赖事务的原子性保证单次操作的完整性
+12. **全量重建的不可回滚风险**：TRUNCATE 是 DDL 操作，一旦执行无法回滚，需谨慎使用
+13. **API 路径的事务缺口**：`ContentPermissionApiController::update()` 未包裹事务，存在部分提交风险
+14. **单实体 vs 列表查询的分流**：列表查询走预计算表（一次 SQL），单实体检查走实时评估（灵活但多查询）
+15. **MassEntityPermissionEvaluator 的批量优化**：重建时预加载所有权限到内存，避免逐实体查询的 N+1 问题
+16. **非多租户架构**：无 tenant_id，通过角色 + EntityPermission + Owner 实现软隔离
+17. **Public 角色的特殊地位**：实现公开/私密内容区分，是未登录用户的唯一身份
+18. **系统权限与实体权限正交**：两套体系独立运作，EntityPermission 可双向覆盖系统权限
+19. **角色无继承关系**：多角色权限是或叠加，没有父子角色模板继承
+20. **权限变更无内置通知**：只有活动日志和 Webhook，没有邮件/站内通知
+21. **Watch 系统的类似继承**：关注关系也遵循 Page→Chapter→Book 的就近覆盖规则
+22. **通知的权限校验**：发送通知前检查接收者是否有内容访问权限，防止信息泄露
+23. **Webhook 是外部同步的主通道**：异步队列执行，支持所有活动类型事件
+

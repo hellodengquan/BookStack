@@ -933,6 +933,421 @@ $entityQuery->orderBy('score', 'desc');  // app/Search/SearchRunner.php:185
 
 ---
 
+### 3.9 搜索词频调整缓存与失效策略
+
+#### 3.9.1 唯一的缓存：词频调整系数缓存
+
+BookStack 全文搜索中**只有一处缓存**：词频稀有度调整系数的请求内缓存。
+
+文件：`app/Search/SearchRunner.php:24-35`
+
+```php
+/**
+ * Retain a cache of score-adjusted terms for specific search options.
+ */
+protected WeakMap $termAdjustmentCache;
+
+public function __construct(
+    protected EntityProvider $entityProvider,
+    protected EntityQueries $entityQueries,
+    protected EntityHydrator $entityHydrator,
+) {
+    $this->termAdjustmentCache = new WeakMap();
+}
+```
+
+缓存使用的是 PHP 原生的 `WeakMap`，以 `SearchOptions` 对象作为 key。
+
+#### 3.9.2 缓存读取与写入
+
+文件：`app/Search/SearchRunner.php:222-251`
+
+```php
+protected function getTermAdjustments(SearchOptions $options): array
+{
+    if (isset($this->termAdjustmentCache[$options])) {
+        return $this->termAdjustmentCache[$options];
+    }
+
+    $termQuery = SearchTerm::query()->toBase();
+    // ... 组装 WHERE 条件 ...
+    $termCounts = $termQuery->pluck('count', 'term')->toArray();
+    $adjusted = $this->rawTermCountsToAdjustments($termCounts);
+
+    $this->termAdjustmentCache[$options] = $adjusted;
+
+    return $this->termAdjustmentCache[$options];
+}
+```
+
+**缓存内容**：每个搜索词对应的稀有度调整系数（float 值）
+
+**缓存 key**：`SearchOptions` 对象实例
+
+#### 3.9.3 缓存的作用范围
+
+| 维度 | 说明 |
+|------|------|
+| **生命周期** | 请求级（单次 HTTP 请求内有效） |
+| **存储位置** | PHP 内存（`WeakMap` 对象） |
+| **缓存粒度** | 以 `SearchOptions` 对象为粒度 |
+| **缓存命中** | 同一请求中相同搜索选项重复调用时命中 |
+
+**为什么只有请求级缓存？**
+- `SearchRunner` 是单例（或服务容器中的共享实例）
+- 但 PHP 是共享-nothing 架构，请求结束后所有内存释放
+- 没有使用 Redis / Memcached / 文件缓存等跨请求缓存
+
+#### 3.9.4 WeakMap 的特性与失效机制
+
+`WeakMap` 是 PHP 8.0+ 引入的弱引用 Map：
+
+- **弱引用 key**：当 `SearchOptions` 对象没有其他引用时，会被垃圾回收，对应条目自动从 Map 中移除
+- **内存自动管理**：不需要手动清理缓存
+- **对象相等性**：使用对象身份（`===`）作为 key，不是值相等
+
+**潜在问题**：
+- 相同的搜索字符串，如果创建了两个不同的 `SearchOptions` 对象，缓存不会命中
+- 但 `SearchOptions::fromString()` / `fromRequest()` 每次调用都返回新对象
+- 实际上在 `searchEntities()` 方法中，`buildQuery()` 会调用一次 `getTermAdjustments()`，如果没有其他地方重复调用，缓存命中率可能很低
+
+#### 3.9.5 没有缓存的部分
+
+以下内容**完全没有缓存**，每次搜索都实时计算：
+
+| 组件 | 是否缓存 | 计算成本 |
+|------|---------|---------|
+| 词频调整系数 | ⚠️ 请求内 WeakMap | 中等（search_terms 表 GROUP BY 查询） |
+| 搜索结果总数 | ❌ 无 | 高（需要 COUNT 全表扫描 JOIN） |
+| 搜索结果列表 | ❌ 无 | 高（倒排索引 JOIN + 排序 + 分页） |
+| 结果高亮与摘要 | ❌ 无 | 低（PHP 字符串处理） |
+| 搜索建议 | ❌ 无 | 中（走正常搜索逻辑） |
+
+#### 3.9.6 缓存失效策略
+
+由于只有请求级缓存，**没有专门的失效策略**：
+
+- **请求结束**：PHP 进程释放内存，缓存自然失效
+- **对象销毁**：`SearchOptions` 对象被 GC 时，WeakMap 条目自动移除
+- **索引更新**：不需要考虑，因为每次请求都是独立的，新请求会重新查询
+
+**缺失的缓存场景**：
+- 热门搜索词结果缓存（如首页展示"热门搜索"）
+- 相同搜索词的结果缓存（多人搜索相同内容）
+- 搜索建议缓存
+- 标签/作者聚合数据缓存
+
+#### 3.9.7 设计权衡
+
+| 优点 | 缺点 |
+|------|------|
+| 实现简单，零外部依赖 | 缓存效率低（仅同请求内有效） |
+| 无需考虑缓存失效逻辑 | 热门搜索词无法复用结果 |
+| 数据始终最新，无一致性问题 | 高并发场景下数据库压力大 |
+| WeakMap 自动内存管理 | 相同搜索字符串但不同对象不命中 |
+
+> 这是**极简缓存策略**，符合 BookStack "部署简便、零依赖"的设计哲学。对于中小规模知识库，数据库查询通常不是瓶颈。
+
+---
+
+### 3.10 搜索结果聚合（分面搜索）能力分析
+
+#### 3.10.1 核心事实：无动态分面聚合
+
+BookStack 的搜索结果页面**没有分面搜索（Faceted Search）**功能，即不会根据当前搜索结果动态统计并展示：
+- 按标签聚合（每个标签有多少结果）
+- 按作者聚合（每个作者有多少结果）
+- 按实体类型聚合（每个类型有多少结果）
+- 按日期聚合（时间分布）
+
+侧边栏的高级搜索选项是**静态过滤条件**，不是**动态聚合结果**。
+
+#### 3.10.2 侧边栏高级搜索 vs 分面搜索
+
+| 特性 | 侧边栏高级搜索 | 分面搜索（Faceted Search） |
+|------|-------------|------------------------|
+| **数据来源** | 静态表单选项 | 从当前搜索结果动态统计 |
+| **计数显示** | 无（只显示选项名） | 有（每个选项后显示结果数） |
+| **动态更新** | 否（选项固定） | 是（每次搜索后重新统计） |
+| **用户交互** | 选择条件 → 搜索 | 搜索 → 看到各维度分布 → 点击筛选 |
+| **示例** | 类型：页面 书籍 章节 书架 | 类型：页面(120) 书籍(45) 章节(38) 书架(12) |
+
+搜索页面侧边栏（`resources/views/search/all.blade.php`）提供的选项：
+
+```
+高级搜索
+├─ 搜索词 [输入框]
+├─ 内容类型 [x] 页面 [x] 章节 [x] 书籍 [x] 书架
+├─ 精确匹配 [添加]
+├─ 标签 [添加]
+├─ 搜索选项
+│   ├─ [ ] 我看过的
+│   ├─ [ ] 我没看过的
+│   ├─ [ ] 有权限限制的
+│   ├─ [ ] 我创建的
+│   ├─ [ ] 我更新的
+│   └─ [ ] 我拥有的
+└─ 日期选项
+    ├─ 更新于之后
+    ├─ 更新于之前
+    ├─ 创建于之后
+    └─ 创建于之前
+```
+
+这些都是**输入控件**，不是**结果聚合统计**。
+
+#### 3.10.3 已有的标签聚合能力（非搜索场景）
+
+虽然搜索结果没有聚合，但 `TagRepo` 提供了标签使用统计功能（用于标签列表页）：
+
+文件：`app/Activity/TagRepo.php:24-79`
+
+```php
+public function queryWithTotalsForList(SimpleListOptions $listOptions, string $nameFilter): Builder
+{
+    $query = $this->baseQueryWithTotals($nameFilter, $searchTerm)
+        ->orderBy($sort, $listOptions->getOrder());
+
+    return $this->permissions->restrictEntityRelationQuery($query, 'tags', 'entity_id', 'entity_type');
+}
+```
+
+统计维度包括：
+- `usages`：总使用次数
+- `page_count`：页面使用次数
+- `chapter_count`：章节使用次数
+- `book_count`：书籍使用次数
+- `shelf_count`：书架使用次数
+- `values`：不同值的数量
+
+**但这些是全局统计，不是针对当前搜索结果的聚合。**
+
+#### 3.10.4 标签建议功能
+
+`TagRepo` 还提供标签名称和值的建议（用于标签输入时的自动补全）：
+
+文件：`app/Activity/TagRepo.php:85-127`
+
+```php
+public function getNameSuggestions(string $searchTerm): Collection
+{
+    $query = Tag::query()
+        ->select('*', DB::raw('count(*) as count'))
+        ->groupBy('name');
+
+    if ($searchTerm) {
+        $query = $query->where('name', 'LIKE', $searchTerm . '%')->orderBy('name', 'asc');
+    } else {
+        $query = $query->orderBy('count', 'desc')->take(50);
+    }
+    // ... 权限过滤
+    return $query->pluck('name');
+}
+```
+
+- 有搜索词时：前缀匹配 + 按名称排序
+- 无搜索词时：按使用次数降序取前 50（热门标签）
+- 都经过权限过滤（只统计用户可见实体的标签）
+
+#### 3.10.5 缺失的聚合能力清单
+
+| 聚合维度 | 实现状态 | 业务价值 |
+|---------|---------|---------|
+| 按实体类型聚合 | ❌ 未实现 | 中（快速了解结果分布） |
+| 按标签聚合 | ❌ 未实现 | 高（标签云、标签筛选） |
+| 按作者聚合 | ❌ 未实现 | 中（找到领域专家） |
+| 按创建/更新时间聚合 | ❌ 未实现 | 低（时间分布） |
+| 按书架/书籍聚合 | ❌ 未实现 | 中（定位到具体书籍） |
+
+#### 3.10.6 设计权衡与扩展思路
+
+**为什么不做分面搜索？**
+- 实现复杂：每个维度都需要额外的 GROUP BY 查询
+- 性能开销大：搜索本来就慢，再加多个聚合查询更慢
+- 需求不强：知识库搜索通常关键词足够精准
+- 已有替代：侧边栏的静态过滤器 + 标签搜索语法 `[tag=value]`
+
+**如果需要实现分面搜索，扩展思路**：
+
+```php
+// 伪代码：在 searchEntities() 中增加聚合查询
+$facets = [
+    'types'  => $searchQuery->clone()->groupBy('type')->select('type', DB::raw('count(*) as count'))->pluck('count', 'type'),
+    'tags'   => $searchQuery->clone()->with('tags')->groupBy('tags.name')->...  // 更复杂
+    'authors' => $searchQuery->clone()->groupBy('created_by')->select('created_by', DB::raw('count(*) as count'))->...
+];
+```
+
+更推荐的方案是集成专用搜索引擎（ES/Meilisearch），它们原生支持分面聚合。
+
+---
+
+### 3.11 权限过滤与结果裁剪的协同作用
+
+#### 3.11.1 权限过滤的位置：前置过滤
+
+BookStack 的搜索权限过滤是**前置的**（在评分和排序之前），而不是后置的（查出结果后再过滤）。
+
+```
+搜索执行顺序：
+1. 基础权限过滤（visibleForList）   ← 先过滤掉无权查看的实体
+2. 倒排索引评分（applyTermSearch）    ← 只对有权限的实体评分
+3. 其他过滤条件（exacts / tags / filters）
+4. 排序（ORDER BY score DESC）
+5. 分页（LIMIT / OFFSET）
+6. 结果高亮与格式化
+```
+
+**入口点**：
+
+文件：`app/Search/SearchRunner.php:110-113`
+
+```php
+protected function buildQuery(SearchOptions $searchOpts, array $entityTypes): EloquentBuilder
+{
+    $entityQuery = $this->entityQueries->visibleForList()
+        ->whereIn('type', $entityTypes);
+    // ...
+}
+```
+
+`visibleForList()` 返回的是已经应用了 `visible` scope 的查询。
+
+#### 3.11.2 `visible` scope 的实现
+
+文件：`app/Entities/Models/EntityTable.php:29-32`
+
+```php
+public function scopeVisible(Builder $query): Builder
+{
+    return app()->make(PermissionApplicator::class)->restrictEntityQuery($query);
+}
+```
+
+#### 3.11.3 `restrictEntityQuery()` 权限过滤逻辑
+
+文件：`app/Permissions/PermissionApplicator.php:99-111`
+
+```php
+public function restrictEntityQuery(Builder $query): Builder
+{
+    return $query->where(function (Builder $parentQuery) {
+        $parentQuery->whereHas('jointPermissions', function (Builder $permissionQuery) {
+            $permissionQuery->select(['entity_id', 'entity_type'])
+                ->selectRaw('max(owner_id) as owner_id')
+                ->selectRaw('max(status) as status')
+                ->whereIn('role_id', $this->getCurrentUserRoleIds())
+                ->groupBy(['entity_type', 'entity_id'])
+                ->havingRaw('(status IN (1, 3) or (owner_id = ? and status != 2))', [$this->currentUser()->id]);
+        });
+    });
+}
+```
+
+**核心逻辑**：
+- 通过 `joint_permissions` 表（预计算的联合权限表）进行权限过滤
+- 只返回用户角色有权限查看的实体
+- 考虑了"所有者"权限（自己创建的内容即使角色无权限也能看到）
+
+#### 3.11.4 联合权限表（joint_permissions）
+
+`joint_permissions` 是预计算的权限表，将角色权限、继承权限、所有者权限等预先计算好，避免每次查询都递归计算。
+
+**权限继承链**：
+```
+书架 → 书籍 → 章节 → 页面
+```
+
+页面的权限受以下层级影响（优先级从高到低）：
+1. 页面自身的显式权限
+2. 章节的权限（继承）
+3. 书籍的权限（继承）
+4. 书架的权限（继承）
+5. 角色的默认权限
+
+`EntityPermissionEvaluator` 负责单实体的权限评估，而 `joint_permissions` 表是预计算结果，用于列表查询时的快速过滤。
+
+#### 3.11.5 草稿页面的特殊处理
+
+除了通用的实体权限过滤，页面还有草稿状态的额外过滤：
+
+文件：`app/Permissions/PermissionApplicator.php:117-126`
+
+```php
+public function restrictDraftsOnPageQuery(Builder $query): Builder
+{
+    return $query->where(function (Builder $query) {
+        $query->where('draft', '=', false)
+            ->orWhere(function (Builder $query) {
+                $query->where('draft', '=', true)
+                    ->where('owned_by', '=', $this->currentUser()->id);
+            });
+    });
+}
+```
+
+规则：
+- 非草稿页面：所有人可见（受通用权限约束）
+- 草稿页面：只有所有者可见
+
+#### 3.11.6 软删除的过滤
+
+Entity 模型使用了 `SoftDeletes` trait，默认查询会自动过滤已软删除的实体：
+
+文件：`app/Entities/Models/EntityTable.php:22`
+
+```php
+use SoftDeletes;
+```
+
+这意味着：
+- 回收站中的实体默认不出现在搜索结果中
+- 除非显式调用 `withTrashed()`
+
+但在索引重建时，`indexAllEntities()` 使用了 `withTrashed()`，也就是说**回收站中的实体也在索引中**。但搜索查询时 `SoftDeletes` 全局 scope 会自动过滤掉，所以用户看不到。
+
+#### 3.11.7 权限过滤对结果的影响
+
+**权限过滤与搜索结果裁剪的协同作用**体现在以下方面：
+
+| 维度 | 影响 |
+|------|------|
+| **总数统计** | `COUNT(*)` 是权限过滤后的数量，用户看到的是"我能看到的结果数"，不是系统总结果数 |
+| **评分排序** | 只对有权限的实体评分排序，不会出现"高相关度但无权限"的结果排在前面 |
+| **分页** | 分页也是基于有权限的结果集，不会出现整页无权限的空页 |
+| **索引大小** | 索引包含所有实体（包括无权和已删除的），但查询时过滤 |
+| **性能** | 权限 JOIN 增加了查询复杂度，但比分页后再过滤高效得多 |
+
+#### 3.11.8 前置过滤 vs 后置过滤对比
+
+| 方案 | BookStack 当前（前置） | 后置过滤（先查后过滤） |
+|------|---------------------|-------------------|
+| **性能** | 较好（数据库层面过滤，可利用索引） | 差（查出很多无权限结果后丢弃） |
+| **分页准确性** | 好（基于过滤后的结果分页） | 差（可能某一页过滤后为空） |
+| **总数准确性** | 好（COUNT 就是过滤后的数量） | 差（总数可能远大于实际可见数） |
+| **评分公平性** | 好（只在有权限的结果中评分排序） | 差（高相关但无权限的条目会占用排名） |
+| **实现复杂度** | 较高（需要权限 JOIN） | 低（查出后循环判断） |
+| **深翻页性能** | 较好 | 很差（可能需要翻很多页才能凑够一页有效结果） |
+
+BookStack 选择前置过滤是正确的设计，保证了搜索结果的可用性和性能。
+
+#### 3.11.9 特殊过滤器与权限的交互
+
+一些过滤器与权限系统有关联：
+
+- **`{is_restricted}`**：筛选有权限限制的实体（即显式设置过权限的）
+- **`{created_by:me}` / `{owned_by:me}`**：筛选自己创建/拥有的实体
+- **`{viewed_by_me}`**：筛选自己看过的实体
+
+这些过滤器与权限过滤是 **AND 关系**，在权限过滤的基础上进一步缩小范围。
+
+例如搜索 `{is_restricted} 文档` 的逻辑是：
+```
+我有权限查看的  AND  设置了权限限制的  AND  包含"文档"关键词
+```
+
+---
+
 ## 四、完整流程时序图
 
 ### 4.1 写入路径

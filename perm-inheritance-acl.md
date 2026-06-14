@@ -1722,7 +1722,641 @@ protected function dispatchWebhooks(string $type, string|Loggable $detail): void
 
 ---
 
-## 十九、最终设计要点总览
+## 十九、权限审计日志与合规报告链路
+
+### 19.1 Activity 审计日志表结构
+
+位置：`app/Activity/Models/Activity.php:26`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | int | 主键 |
+| `type` | string | 活动类型（如 `permissions_update`, `role_create`），参见 ActivityType 常量 |
+| `user_id` | int | 操作者 ID |
+| `detail` | string | 详细描述（如实体的 `logDescriptor()`） |
+| `ip` | string | 操作者 IP 地址 |
+| `loggable_type` | string | 关联实体类型（多态），如 `page`, `book`, `chapter` |
+| `loggable_id` | int | 关联实体 ID（多态） |
+| `created_at` | timestamp | 操作时间 |
+
+### 19.2 权限相关的活动类型
+
+定义于 `app/Activity/ActivityType.php:5`
+
+**实体级权限操作**：
+- `PERMISSIONS_UPDATE = 'permissions_update'` —— 实体权限变更（最核心）
+
+**角色权限操作**：
+- `ROLE_CREATE = 'role_create'`
+- `ROLE_UPDATE = 'role_update'`
+- `ROLE_DELETE = 'role_delete'`
+
+**用户权限相关**：
+- `USER_CREATE = 'user_create'`
+- `USER_UPDATE = 'user_update'`
+- `USER_DELETE = 'user_delete'`
+- `AUTH_LOGIN = 'auth_login'`
+
+**系统级权限**：
+- `SETTINGS_UPDATE = 'settings_update'` —— 包括 Public 开关等系统设置
+- `API_TOKEN_CREATE / UPDATE / DELETE` —— API 令牌管理
+
+### 19.3 审计日志的写入链路
+
+```
+权限更新操作（PermissionsUpdater）
+        │
+        └─► Activity::add(ActivityType::PERMISSIONS_UPDATE, $entity)
+                │
+                └─► ActivityLogger::add() 位置：app/Activity/Tools/ActivityLogger.php:27
+                        │
+                        ├─► 1. 构造 Activity 对象
+                        │     ├─► type = strtolower(...)
+                        │     ├─► user_id = user()->id
+                        │     ├─► ip = IpFormatter::fromCurrentRequest()
+                        │     ├─► detail = $entity->logDescriptor()
+                        │     └─► loggable_id / loggable_type = 实体多态关联
+                        │
+                        ├─► 2. $activity->save()  ← 写入 activities 表
+                        │
+                        ├─► 3. setNotification() —— 前端 Flash 提示（非持久）
+                        │
+                        ├─► 4. dispatchWebhooks() —— 异步 Webhook
+                        │
+                        ├─► 5. NotificationManager::handle() —— 通知（权限变更无内置处理器）
+                        │
+                        └─► 6. Theme::dispatch(ACTIVITY_LOGGED) —— 主题扩展钩子
+```
+
+**关键保证**：
+- 审计日志写入和权限数据更新在**同一个数据库事务**中（见第十四章）
+- 事务回滚时，审计日志也会回滚，保证日志的真实性
+- IP 地址从请求上下文中提取，无法被操作者伪造
+
+### 19.4 审计日志的查询接口
+
+#### Web 后台审计日志页面
+
+位置：`app/Activity/Controllers/AuditLogController.php:15`
+
+```
+审计日志查询：
+  ├─► 访问权限：需要 SettingsManage + UsersManage 双权限
+  ├─► 支持过滤：
+  │     ├─► event（活动类型）
+  │     ├─► user（操作者ID）
+  │     ├─► date_from / date_to（时间范围）
+  │     └─► ip（IP 地址前缀匹配）
+  ├─► 支持排序：created_at 或 type，升序/降序
+  ├─► 分页：每页 100 条
+  └─► 关联加载：loggable（含软删实体 withTrashed）+ user
+```
+
+#### API 审计日志端点
+
+位置：`app/Activity/Controllers/AuditLogApiController.php:18`
+
+```
+GET /api/audit-log
+  ├─► 权限要求：SettingsManage + UsersManage
+  ├─► 返回字段：id, type, detail, user_id, loggable_id, loggable_type, ip, created_at
+  └─► 支持标准 API 分页、排序、过滤
+```
+
+#### 实体维度的活动查询
+
+位置：`app/Activity/ActivityQueries.php:47`
+
+```php
+public function entityActivity(Entity $entity, int $count = 20, int $page = 1): array
+{
+    // Book：查询书本身 + 其下所有章节 + 所有页面的活动
+    // Chapter：查询章节本身 + 其下所有页面的活动
+    // Page：仅查询页面的活动
+    // 自动关联权限过滤（restrictEntityRelationQuery）
+}
+```
+
+这意味着查看某本书的活动历史时，权限变更记录会自动包含在内。
+
+### 19.5 审计日志的权限约束（可见性控制）
+
+审计日志本身也是**受权限过滤**的，防止用户通过审计日志看到自己无权访问的实体：
+
+位置：`app/Activity/ActivityQueries.php:30`
+
+```php
+public function latest(int $count = 20, int $page = 0): array
+{
+    $activityList = $this->permissions
+        ->restrictEntityRelationQuery(Activity::query(), 'activities', 'loggable_id', 'loggable_type')
+        // ...
+}
+```
+
+**原理**：审计日志中的 `loggable_type/loggable_id` 通过 JOIN `joint_permissions` 过滤，用户只能看到自己有权限访问的实体的活动记录。
+
+**例外**：审计日志后台（AuditLogController）不受此限制，但需要管理员权限（SettingsManage + UsersManage）。这是管理员合规审计的需要。
+
+### 19.6 合规报告的构建能力
+
+BookStack 没有内置的"合规报告"功能，但审计日志 + API 提供了构建合规报告所需的所有基础数据：
+
+| 合规需求 | 数据源 | 可用性 |
+|----------|--------|--------|
+| 谁在什么时候改了什么权限 | `activities` 表 type=permissions_update | ✅ 完整 |
+| 角色权限变更历史 | `activities` 表 type=role_create/update/delete | ✅ 完整 |
+| 访问控制列表（ACL）快照 | `entity_permissions` + `joint_permissions` 表 | ✅ 当前状态 |
+| 登录审计（成功/失败） | `activities` 表 auth_login + 失败登录日志通道 | ⚠️ 仅成功登录有完整日志 |
+| 权限过权限矩阵导出 | `role_permissions` + `permission_role` 关联表 | ✅ 当前状态 |
+| 用户-角色-权限的历史回溯 | ❌ 无版本化快照，仅能看到变更事件，看不到变更前状态 | ⚠️ 需自行实现 |
+
+### 19.7 审计日志的生命周期管理
+
+#### 清理命令
+
+位置：`app/Console/Commands/ClearActivityCommand.php:28`
+
+```php
+public function handle(): int
+{
+    Activity::query()->truncate();  // 清空所有活动日志
+    return 0;
+}
+```
+
+命令：`php artisan bookstack:clear-activity`
+
+**⚠️ 合规风险**：此命令直接清空所有审计日志，没有任何备份或归档机制。在合规严格的环境中，建议：
+- 禁用或限制此命令的执行权限
+- 在日志清理前先定期备份 `activities` 表
+- 可通过主题系统 hook `ACTIVITY_LOGGED` 将日志同步到外部 SIEM 系统
+
+#### 无自动轮转
+
+BookStack **没有**内置的审计日志自动轮转/归档/过期机制。对于长期运行的大实例，建议：
+- 定期备份 `activities` 表到冷存储
+- 自行实现按时间分区或归档策略
+
+---
+
+## 二十、外部身份源（LDAP/SAML/OIDC）的权限同步策略
+
+### 20.1 三种外部身份源的统一同步架构
+
+BookStack 支持三种外部身份认证：LDAP、SAML 2.0、OIDC（OpenID Connect）。它们共享同一套**用户-角色同步机制**，核心是 `GroupSyncService`。
+
+```
+┌────────────┐    ┌─────────────┐    ┌────────────┐
+│   LDAP     │    │   SAML 2.0  │    │    OIDC    │
+└──────┬─────┘    └──────┬──────┘    └──────┬─────┘
+       │                 │                  │
+       │ getUserGroups() │ getUserGroups()  │ groups claim
+       ▼                 ▼                  ▼
+┌───────────────────────────────────────────────────┐
+│            GroupSyncService（统一角色匹配器）      │
+│  • 外部组名 → BookStack 角色名匹配                 │
+│  • external_auth_id 精确匹配或多值逗号分隔匹配     │
+│  • sync(替换模式) 或 syncWithoutDetaching(追加模式) │
+└───────────────────────┬───────────────────────────┘
+                        │
+                        ▼
+            ┌────────────────────────┐
+            │  role_user 关联表更新  │
+            │  + attachDefaultRole() │
+            └────────────────────────┘
+                        │
+                        ▼
+            ┌────────────────────────┐
+            │  JointPermission 生效  │
+            │  （依赖下次权限重建）   │
+            └────────────────────────┘
+```
+
+### 20.2 GroupSyncService 角色匹配算法
+
+位置：`app/Access/GroupSyncService.php:73`
+
+#### 匹配优先级
+
+外部组名与 BookStack 角色的匹配按以下优先级进行：
+
+```
+外部组名（如 "IT_部门_管理员"）
+        │
+        ├─► 优先级 1：Role.external_auth_id 精确匹配
+        │     └─► 支持多值逗号分隔（如 "IT_Admin,LDAP_Admins"）
+        │         └─► 逗号前有反斜杠转义时保留为字面逗号
+        │
+        └─► 优先级 2：Role.display_name 标准化匹配
+              └─► 规则：trim → tolower → 空格替换为连字符
+              └─► 例："系统管理员" → "系统管理员"（ASCII 范围内才转）
+```
+
+**匹配代码**：`app/Access/GroupSyncService.php:15`
+
+```php
+protected function roleMatchesGroupNames(Role $role, array $groupNames): bool
+{
+    // 优先级 1：external_auth_id 匹配
+    if ($role->external_auth_id) {
+        return $this->externalIdMatchesGroupNames($role->external_auth_id, $groupNames);
+    }
+    // 优先级 2：display_name 标准化后匹配
+    $roleName = str_replace(' ', '-', trim(strtolower($role->display_name)));
+    return in_array($roleName, $groupNames);
+}
+```
+
+**external_auth_id 的多值解析**：
+位置：`app/Access/GroupSyncService.php:40`
+
+```php
+protected function parseRoleExternalAuthId(string $externalId): array
+{
+    // 按逗号分割，逗号前有反斜杠转义时保留
+    // 例："RoleA,RoleB\,with\,commas,RoleC"
+    // → ["RoleA", "RoleB,with,commas", "RoleC"]
+}
+```
+
+### 20.3 两种同步模式：替换 vs 追加
+
+`GroupSyncService::syncUserWithFoundGroups()` 的 `$detachExisting` 参数决定同步模式：
+
+| 模式 | $detachExisting 值 | 行为 | 配置来源 |
+|------|---------------------|------|----------|
+| **替换模式（Mirror）** | `true` | `roles()->sync(matches)` + 附加默认注册角色 | `remove_from_groups` 配置为 true |
+| **追加模式（Additive）** | `false` | `roles()->syncWithoutDetaching(matches)` | `remove_from_groups` 配置为 false |
+
+#### 替换模式（Mirror）
+
+```php
+if ($detachExisting) {
+    $user->roles()->sync($groupsAsRoles);   // 完全替换为匹配到的角色
+    $user->attachDefaultRole();             // 附加默认注册角色（如果有）
+}
+```
+
+**效果**：
+- 用户在 BookStack 中的角色 = 外部身份源匹配到的角色 ∪ {默认注册角色}
+- 外部删除组 → 下次登录 BookStack 对应角色被移除
+- 适合：完全托管角色，外部身份源是权威
+
+#### 追加模式（Additive）
+
+```php
+$user->roles()->syncWithoutDetaching($groupsAsRoles);  // 只追加，不移除
+```
+
+**效果**：
+- 用户角色是单调递增的，只会增加不会减少
+- 外部删除组 → BookStack 角色**不变**（保留历史授权）
+- 适合：外部只是初始分配，管理员可能手动追加角色
+
+### 20.4 各身份源的实现细节
+
+#### LDAP 同步流程
+
+位置：`app/Access/LdapService.php:339`
+
+```
+LDAP 登录时同步：
+  ├─► 查询用户的 group 属性（配置项：group_attribute）
+  ├─► 提取用户直接所属的组 DNs
+  ├─► getGroupsRecursive() 递归查询父组（嵌套组）
+  ├─► extractGroupNamesFromLdapGroupDns() 从 DN 中提取 CN
+  ├─► 去重后得到组名数组
+  └─► 调用 syncUserWithFoundGroups(user, groups, remove_from_groups)
+```
+
+**特殊点**：
+- LDAP 支持**嵌套组递归解析**（`getGroupsRecursive`），SAML/OIDC 需要外部 IdP 先做扁平化
+- `dump_user_groups` 配置可开启调试，查看解析前后的组数据
+- 触发时机：每次 LDAP 登录时（`LdapSessionGuard`）
+
+#### SAML 2.0 同步流程
+
+位置：`app/Access/Saml2Service.php:343`
+
+```
+SAML ACS 回调同步：
+  ├─► getUserGroups() 从 SAML Attributes 提取组声明
+  │     └─► 属性名由 saml2.group_attribute 配置
+  ├─► processLoginCallback() 中调用 findOrRegister() 找到/创建用户
+  └─► shouldSyncGroups() 为真则调用 syncUserWithFoundGroups
+```
+
+**特殊点**：
+- 组由 IdP 直接提供，不做嵌套解析（IdP 应已扁平化）
+- `dump_user_details` 配置可查看原始 SAML 属性 + 解析结果
+- 触发时机：SAML 登录回调（`/saml2/acs`）
+
+#### OIDC 同步流程
+
+位置：`app/Access/Oidc/OidcService.php:236`
+
+```
+OIDC 授权回调同步：
+  ├─► OidcUserDetails::fromTokenResponse() 从 ID Token / UserInfo 提取 groups claim
+  ├─► groups_claim 配置指定 claim 路径（支持嵌套 JSON 点路径）
+  ├─► findOrRegister() 找到/创建用户
+  └─► shouldSyncGroups() 为真则调用 syncUserWithFoundGroups
+```
+
+**特殊点**：
+- group_sync_active 为真但 groups claim 缺失/为空时，会抛出认证错误（防止权限意外丢失）
+- OIDC 元数据发现结果缓存 15 分钟（`Cache::remember`）
+- 触发时机：OIDC 授权回调
+
+### 20.5 外部同步后的 JointPermission 生效机制
+
+**重要**：外部组同步只更新了 `role_user` 表（用户-角色关联），**不会自动触发 `JointPermission` 重建**。
+
+```
+同步后权限生效路径：
+
+方式 1：下次请求自然生效（绝大多数场景）
+  └─► 列表查询走 WHERE EXISTS (joint_permissions ...)
+      └─► role_id IN (用户角色IDs)
+      └─► 由于 joint_permissions 是按角色预计算的，所以 role_user 更新后立即生效
+      └─► ✅ 无需任何额外操作
+
+方式 2：用户系统权限变更（RolePermission 表）
+  └─► 管理员在后台改了角色权限（如给编辑角色加了 page-create-all）
+  └─► 需要 JointPermissionBuilder::rebuildForRole($role) 重建
+  └─► PermissionsRepo::updateRole() 已自动处理 ✅
+
+方式 3：EntityPermission 变更
+  └─► 管理员修改了实体权限
+  └─► PermissionsUpdater 已自动触发 rebuildPermissions() ✅
+```
+
+**为什么用户-角色关联变更不需要重建 JointPermission？**
+
+因为 `joint_permissions` 表是按 `(entity_id, entity_type, role_id)` 三元组存的，**每个角色对每个实体都有完整的一行**。用户换角色只是改变了查询时的 `role_id IN (...)` 集合，不需要改表。
+
+### 20.6 默认注册角色的兜底机制
+
+位置：`app/Users/Models/User.php:145`
+
+```php
+public function attachDefaultRole(): void
+{
+    $roleId = intval(setting('registration-role'));
+    if ($roleId && $this->roles()->where('id', '=', $roleId)->count() === 0) {
+        $this->roles()->attach($roleId);
+    }
+}
+```
+
+**在外部身份源同步中的作用**：
+- 在替换模式（Mirror）中，即使外部组匹配不到任何角色，`attachDefaultRole()` 也会保证用户至少有一个基础角色
+- 防止外部组误配导致用户登录后变成"无角色"状态而无法访问任何内容
+- `registration-role` 配置项是用户注册时的默认角色，也被外部同步复用
+
+### 20.7 外部同步的安全边界与风险
+
+| 风险场景 | 影响 | 防护措施 |
+|----------|------|----------|
+| 外部组名被恶意修改 | 用户可能获得超出预期的角色 | 使用 `external_auth_id` 做精确匹配，而非依赖 display_name |
+| remove_from_groups=true 时外部组被清空 | 用户所有角色被移除（只剩默认） | 确保默认注册角色配置正确；生产环境建议先启用追加模式观察 |
+| 外部 IdP 注入特殊组名 | display_name 标准化后可能误匹配 | 使用 `external_auth_id` 精确匹配，避免 display_name 自动匹配 |
+| LDAP 嵌套组递归过深 | 登录超时或栈溢出 | 控制 LDAP 嵌套层级；`dump_user_groups` 先观察 |
+| OIDC groups claim 为空 | 用户角色被清空 | `OidcUserDetails::valid()` 做了校验，claim 缺失时抛错 |
+| 替换模式 + 手动分配角色冲突 | 下次登录手动分配的角色被清 | 使用追加模式；或通过 external_auth_id 让外部组覆盖所有需要的角色 |
+
+---
+
+## 二十一、高并发场景下的缓存击穿与防雪崩
+
+### 21.1 权限系统的缓存体系总览
+
+BookStack 的权限性能优化分为**三层缓存/预计算**，每一层解决不同的问题：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 1：请求内进程级静态缓存                                │
+│ • User::permissions() 属性缓存                               │
+│ • Role::getSystemRole() static $cache                       │
+│ • MassEntityPermissionEvaluator::$permissionMapCache        │
+│ 作用：避免同一次请求内重复查询相同数据                        │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 2：数据库级预计算表（写时更新）                        │
+│ • joint_permissions 表（核心）                              │
+│ 作用：将 O(N) 的继承链评估转化为 O(1) 的 SQL 子查询          │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 3：批量操作分块处理                                    │
+│ • 重建时按 Book 分块（5 本/块全量，10 本/块按角色）          │
+│ • 按 Shelf 分块（50 个/块全量，100 个/块按角色）             │
+│ • INSERT/DELETE 分块（1000 条/块）                          │
+│ 作用：避免内存溢出、长事务锁、瞬时大 SQL 压垮数据库          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 21.2 缓存击穿风险点：请求内静态缓存
+
+#### User::permissions() 的请求内缓存
+
+位置：`app/Users/Models/User.php:165`
+
+```php
+protected function permissions(): Collection
+{
+    if (isset($this->permissions)) {
+        return $this->permissions;  // 同请求内直接返回
+    }
+
+    $this->permissions = $this->newQuery()->getConnection()
+        ->table('role_user', 'ru')
+        ->select('role_permissions.name as name')->distinct()
+        ->leftJoin('permission_role', ...)
+        ->leftJoin('role_permissions', ...)
+        ->where('ru.user_id', '=', $this->id)
+        ->pluck('name');
+
+    return $this->permissions;
+}
+```
+
+**缓存击穿风险（低）**：
+- 同请求内多次 `$user->can()` 调用不会重复查库
+- 风险为 **0**：一次请求内用户权限不会变（事务已提交）
+- 但**跨请求不共享**：不使用 Redis/文件缓存，每次请求至少查一次
+
+#### Role::getSystemRole() 的进程级缓存
+
+位置：`app/Users/Models/Role.php:114`
+
+```php
+public static function getSystemRole(string $systemName): ?self
+{
+    static $cache = [];          // PHP 进程级 static 缓存
+    if (!isset($cache[$systemName])) {
+        $cache[$systemName] = static::query()
+            ->where('system_name', '=', $systemName)
+            ->first();
+    }
+    return $cache[$systemName];
+}
+```
+
+**缓存击穿风险（中）**：
+- `static $cache` 是进程级的，在 PHP-FPM 模式下**每个工作进程独立缓存**
+- 系统角色很少变动，所以实际风险低
+- 但如果管理员修改了 public 角色的权限，老进程的缓存不会失效
+- **缓解**：public 角色的系统权限查询也会走 role_permissions 表的实际关联，static 缓存只存 Role 对象本身（主要是 ID）
+
+#### MassEntityPermissionEvaluator 的批量缓存
+
+位置：`app/Permissions/MassEntityPermissionEvaluator.php:54`
+
+```php
+protected function getPermissionMapByTypeIdAndRoleForAllInvolved(): array
+{
+    if (isset($this->permissionMapCache)) {
+        return $this->permissionMapCache;  // 同批重建内共享
+    }
+    // 一次查询所有相关 EntityPermission
+    $permissionMap = $this->getPermissionsMapByTypeId($entityTypeIdChain, []);
+    // ... 重新组织为 [typeId][roleId] = EntityPermission[]
+    $this->permissionMapCache = $permissionMap;
+    return $this->permissionMapCache;
+}
+```
+
+**缓存击穿风险（高）**：
+- 这是全量重建时的**核心优化点**：没有这个缓存，1000 个实体 × 10 个角色 = 10000 次查询
+- 有了缓存后，1 次查询 + 内存分组即可
+- 风险为 **0**：缓存只在单次重建流程内有效，重建结束对象释放
+
+### 21.3 缓存雪崩风险点：JointPermission 全量重建
+
+#### 全量重建（rebuildForAll）的雪崩压力
+
+位置：`app/Permissions/JointPermissionBuilder.php:32`
+
+```php
+public function rebuildForAll(): void
+{
+    JointPermission::query()->truncate();  // ★ 瞬间清空所有缓存！
+
+    $roles = Role::query()->with('permissions')->get();
+
+    $this->bookFetchQuery()->chunk(5, function (EloquentCollection $books) use ($roles) {
+        $books->loadMissing(['chapters', 'pages']);
+        $this->buildJointPermissionsForBooks($books, $roles->all(), true);
+    });
+
+    Bookshelf::query()->chunk(50, function ($shelves) use ($roles) {
+        $this->createManyJointPermissions($shelves->all(), $roles->all());
+    });
+}
+```
+
+**缓存雪崩场景**：
+1. 管理员运行 `bookstack:regenerate-permissions`
+2. `TRUNCATE` 瞬间清空 `joint_permissions`
+3. 在重建完成前，所有用户的列表查询 `WHERE EXISTS (joint_permissions ...)` 返回 0 行
+4. **结果：全站所有实体"消失"不可见，直到重建完成**
+
+#### 雪崩缓解措施（已实现的）
+
+1. **分块重建**：每 5 本书 + 每 50 个书架一批，不是一次性 INSERT 所有行
+2. **INSERT 分块**：`array_chunk($jointPermissions, 1000)`，每 1000 条 INSERT 一次，避免大 SQL
+3. **DELETE 分块**：`array_chunk($ids, 1000)` 分批删除，避免长事务锁
+
+#### 雪崩缓解措施（缺失但可改进的）
+
+| 优化方向 | BookStack 现状 | 潜在改进 |
+|----------|---------------|---------|
+| **热切换重建** | ❌ TRUNCATE 后重建 | 建 `joint_permissions_new` 表，重建完后 `RENAME TABLE` 原子切换 |
+| **重建时服务降级** | ❌ 无 | 重建过程中对读请求走实时评估（`EntityPermissionEvaluator`） |
+| **增量重建避免全量** | ✅ 99% 场景都是增量 | 继续保持增量优先，全量仅作最后手段 |
+| **重建并发控制** | ❌ 无锁防重复执行 | 使用 Laravel Cache 原子锁：`Cache::lock('perm-rebuild')->get()` |
+
+### 21.4 缓存穿透风险点：无权限的热门实体
+
+**缓存穿透定义**：查询一个必然不存在的数据（如已删除的实体），导致每次都绕过缓存查数据库。
+
+BookStack 的权限系统中的穿透风险：
+- ❌ `joint_permissions` 只存"存在的实体 × 角色"组合，不存在的实体不会有空行
+- ❌ 查询不存在的实体 ID 时，`WHERE EXISTS` 子查询也会执行一次
+- ✅ **缓解**：软删除的实体在查询时通过 `scopes('visible')` 先过滤，不会走到 joint_permissions 检查
+
+**穿透影响评估（低）**：
+- 即使穿透，子查询也只是 `joint_permissions` 的按 (entity_id, entity_type) 索引查找，极快
+- 不像缓存穿透那样打到后端数据源
+
+### 21.5 热点 Key：MassEntityPermissionEvaluator 的分块评估策略
+
+对于大型实例（10万+页面），单次重建的内存压力是最大的挑战。BookStack 通过以下方式缓解：
+
+#### 1. 按 Book 分块，避免一次性加载所有实体
+
+```php
+// 全量重建：5 本书/块
+$this->bookFetchQuery()->chunk(5, function ($books) {...});
+
+// 按角色重建：10 本书/块
+$this->bookFetchQuery()->chunk(10, function ($books) {...});
+```
+
+每块独立处理，处理完释放内存：
+- Book + chapters + pages 的模型对象释放
+- MassEntityPermissionEvaluator 对象释放 → $permissionMapCache 释放
+- $jointPermissions 数组释放
+
+#### 2. EntityPermission 查询的 IN 分块
+
+位置：`app/Permissions/EntityPermissionEvaluator.php:96`
+
+```php
+$idsChunked = array_chunk($ids, 10000);  // 防止 IN 子句过长
+```
+
+超过 10000 个 ID 时，分多段 `WHERE ... IN (...)` 用 `OR` 连接。
+
+#### 3. JointPermission INSERT 的分块
+
+```php
+foreach (array_chunk($jointPermissions, 1000) as $jointPermissionChunk) {
+    DB::table('joint_permissions')->insert($jointPermissionChunk);
+}
+```
+
+**为什么是 1000？**
+- MySQL `max_allowed_packet` 默认 4MB~64MB
+- 每条约 50 字节（4 int + 2 varchar），1000 条约 50KB，远低于限制
+- 平衡了"减少 round-trip 次数"和"单条 SQL 复杂度"
+
+### 21.6 无分布式缓存：单实例架构的简单性
+
+BookStack 的权限缓存**完全不使用 Redis/Memcached 等外部缓存**，这是有意的设计选择：
+
+| 设计选择 | 理由 |
+|----------|------|
+| **不用 Redis 存权限结果** | JointPermission 表已经是持久化缓存，再加一层 Redis 只是重复 |
+| **不用分布式锁防并发重建** | 权限更新是低频操作，并发冲突极罕见；Last Writer Wins 可接受 |
+| **进程级 static 缓存** | 只缓存 public/admin 等少数系统角色的 ID，量极小 |
+| **请求内属性缓存** | 避免同请求重复查询，简单且零额外依赖 |
+
+**这种设计的代价**：
+- 多实例部署时，每个 PHP-FPM 进程都要独立查询（`Role::getSystemRole` 的 static 缓存不共享）
+- 无法通过 TTL 自动过期，必须依赖显式 `rebuildXxx()` 触发
+- 全量重建期间没有"降级缓存"可用
+
+**评估**：对于 BookStack 定位的中小团队 Wiki 场景，这种设计是合理的权衡——简单性优先于极致的高并发性能。
+
+---
+
+## 二十二、最终设计要点总览
 
 1. **自底向上就近优先**：继承链从自身开始向上查找，离得越近优先级越高
 2. **角色显式覆盖父级**：同一角色的权限，子级设置覆盖父级设置
@@ -1747,4 +2381,16 @@ protected function dispatchWebhooks(string $type, string|Loggable $detail): void
 21. **Watch 系统的类似继承**：关注关系也遵循 Page→Chapter→Book 的就近覆盖规则
 22. **通知的权限校验**：发送通知前检查接收者是否有内容访问权限，防止信息泄露
 23. **Webhook 是外部同步的主通道**：异步队列执行，支持所有活动类型事件
+24. **审计日志的事务性**：Activity 日志与权限变更在同一事务中，回滚时日志也回滚
+25. **审计日志的可见性过滤**：非管理员只能看到自己有权限访问的实体的活动记录
+26. **审计日志无自动轮转**：需自行备份或定期清理，`bookstack:clear-activity` 会清空所有
+27. **外部身份源统一通过 GroupSyncService**：LDAP/SAML/OIDC 共用一套角色匹配算法
+28. **两种同步模式**：替换模式（Mirror）和追加模式（Additive），由 `remove_from_groups` 控制
+29. **角色匹配两级优先级**：先匹配 external_auth_id（支持多值逗号分隔），再匹配标准化的 display_name
+30. **外部同步无需重建 JointPermission**：role_user 关联变更不影响预计算缓存，下次查询自然生效
+31. **默认注册角色兜底**：替换模式下匹配不到任何角色时，`attachDefaultRole()` 防止用户无任何角色
+32. **三层缓存体系**：请求内静态缓存 + 数据库级 JointPermission 预计算表 + 批量操作分块处理
+33. **全量重建的雪崩风险**：TRUNCATE 后重建期间全站不可见，建议在低峰期执行或考虑热切换方案
+34. **分块参数设计**：5/10 本图书/块、50/100 个书架/块、1000 行 SQL/块，平衡内存、锁、吞吐量
+35. **不引入 Redis**：对中小团队场景做了简单性优先的权衡，JointPermission 表本身就是持久化缓存
 

@@ -188,6 +188,110 @@ public static string $softDelimiters = ".-";
 
 ---
 
+### 2.5 索引重建与增量更新的差异化策略
+
+BookStack 提供了三种索引更新方式，分别适用于不同场景：
+
+#### 2.5.1 三种更新方式对比
+
+| 方式 | 入口方法 | 适用场景 | 策略 | 性能特点 |
+|------|---------|---------|------|---------|
+| **单实体增量更新** | `indexEntity()` | 单个实体创建/更新/恢复版本时 | DELETE + INSERT（先删后写） | 实时、同步执行 |
+| **多实体批量索引** | `indexEntities()` | 批量导入、批量操作 | 先收集所有词数据，再统一批量 INSERT（chunk 500） | 减少数据库交互次数 |
+| **全量重建** | `indexAllEntities()` | 首次部署、数据迁移、索引损坏 | TRUNCATE 全表 + 逐实体遍历（chunk 250） + 批量 INSERT | 耗时长、一次性清空 |
+
+#### 2.5.2 单实体增量更新（`indexEntity`）
+
+文件：`app/Search/SearchIndex.php:35-40`
+
+```php
+public function indexEntity(Entity $entity): void
+{
+    $this->deleteEntityTerms($entity);      // DELETE FROM search_terms WHERE entity_id = ? AND entity_type = ?
+    $terms = $this->entityToTermDataArray($entity);
+    $this->insertTerms($terms);              // INSERT 多条
+}
+```
+
+**设计权衡**：
+- ✅ 实现简单，无需判断哪些词新增/删除
+- ✅ 保证索引与内容完全一致
+- ❌ 每次更新都有 DELETE + 两次 SELECT（加载 tags）+ INSERT 的开销
+- ❌ 更新过程中存在短暂的"索引空窗期"（但在事务内不可见）
+
+#### 2.5.3 多实体批量索引（`indexEntities`）
+
+文件：`app/Search/SearchIndex.php:47-56`
+
+```php
+public function indexEntities(array $entities): void
+{
+    $terms = [];
+    foreach ($entities as $entity) {
+        $entityTerms = $this->entityToTermDataArray($entity);
+        array_push($terms, ...$entityTerms);
+    }
+    $this->insertTerms($terms);
+}
+```
+
+**注意**：批量索引方法**不会自动删除旧索引**，调用方需要自己确保实体是新的或已手动清理。这在 `indexAllEntities()` 中通过先 TRUNCATE 来保证。
+
+#### 2.5.4 全量重建（`indexAllEntities`）
+
+文件：`app/Search/SearchIndex.php:68-95`
+
+```php
+public function indexAllEntities(?callable $progressCallback = null): void
+{
+    SearchTerm::query()->truncate();          // 清空整张表
+
+    foreach ($this->entityProvider->all() as $entityModel) {
+        // Page 使用 html 字段，其他使用 description 字段
+        $indexContentField = $entityModel instanceof Page ? 'html' : 'description';
+        
+        // 预加载 tags 关联，避免 N+1 查询
+        $entityModel->newQuery()
+            ->select($selectFields)
+            ->with(['tags:id,name,value,entity_id,entity_type'])
+            ->withTrashed()                    // 包含已软删除的实体
+            ->chunk(250, function (Collection $entities) use (...$chunkCallback) {
+                $this->indexEntities($entities->all());  // 批量写入
+                // ... 进度回调
+            });
+    }
+}
+```
+
+**关键设计细节**：
+- **TRUNCATE 而非逐行 DELETE**：速度快，重置自增 ID
+- **250 实体 / chunk**：平衡内存占用与数据库交互频率
+- **预加载 tags**：使用 `with(['tags'])` 避免 N+1 查询
+- **包含软删除实体**：`withTrashed()` 确保回收站中的内容也能被搜索到（但权限过滤后用户可能看不到）
+- **字段差异化**：Page 索引 `html`，其他实体索引 `description`
+- **回调报告进度**：支持传入 `$progressCallback`，命令行场景下用于输出进度
+
+#### 2.5.5 写入批处理（`insertTerms`）
+
+文件：`app/Search/SearchIndex.php:110-116`
+
+```php
+protected function insertTerms(array $terms): void
+{
+    $chunkedTerms = array_chunk($terms, 500);
+    foreach ($chunkedTerms as $termChunk) {
+        SearchTerm::query()->insert($termChunk);
+    }
+}
+```
+
+**为什么是 500 条？**
+- MySQL 的 `max_allowed_packet` 默认 4MB，500 条 INSERT 语句的数据量远低于此限制
+- 单条 INSERT 多条数据比多条 INSERT 单条数据快 5-10 倍
+- 500 是经验值，兼顾性能与数据库锁持有时间
+
+---
+
 ## 三、查询路径：用户输入 → 返回结果
 
 ### 3.1 路由入口
@@ -371,6 +475,124 @@ protected function getTermAdjustments(SearchOptions $options): array
 
 这是一种简化版的 **IDF（逆文档频率）** 实现：稀有词获得更高权重。
 
+#### 3.5.4 `selectForScoredTerms()` — IF 链构建原理
+
+文件：`app/Search/SearchRunner.php:196-213`
+
+这个方法负责构建评分计算的 SQL 表达式，使用了**反向构建 IF 链**的巧妙设计。
+
+```php
+protected function selectForScoredTerms(array $scoredTerms): array
+{
+    $ifChain = '0';
+    $bindings = [];
+    foreach ($scoredTerms as $term => $score) {
+        $ifChain = 'IF(term like ?, score * ' . (float) $score . ', ' . $ifChain . ')';
+        $bindings[] = $term . '%';
+    }
+
+    return [
+        'statement' => 'SUM(' . $ifChain . ') as score',
+        'bindings'  => array_reverse($bindings),
+    ];
+}
+```
+
+**构建过程示例**（搜索词：`cat`、`dog`，稀有度系数分别为 1.2、0.8）：
+
+初始：`$ifChain = '0'`
+
+第 1 轮（term=cat, score=1.2）：
+```
+$ifChain = 'IF(term like "cat%", score * 1.2, 0)'
+```
+
+第 2 轮（term=dog, score=0.8）：
+```
+$ifChain = 'IF(term like "dog%", score * 0.8, IF(term like "cat%", score * 1.2, 0))'
+```
+
+最终 SQL：
+```sql
+SUM(
+    IF(term like "dog%", score * 0.8, 
+    IF(term like "cat%", score * 1.2, 0))
+) as score
+```
+
+**为什么反向构建？**
+- 每个 term 行只会匹配第一个符合条件的 IF 分支（因为 IF 是短路求值的）
+- 但实际上每个 term 只匹配一个搜索词前缀，所以顺序不影响结果
+- 使用 IF 链而不是 CASE WHEN 的原因是：MySQL 中 IF 嵌套在某些场景下性能略好，且代码构建更简洁
+
+**绑定参数反转**：
+- 构建时是正向遍历（cat → dog），但最内层 IF 先绑定 cat
+- 所以 `$bindings` 需要 `array_reverse`，使绑定顺序与 SQL 中 `?` 出现顺序一致（dog → cat）
+
+#### 3.5.5 相关度评分公式详解
+
+最终相关度分数由三部分相乘得到：
+
+```
+最终得分 = Σ(基础分 × 位置权重 × 词频稀有度系数)
+```
+
+**1. 基础分（索引时计算，存入 search_terms.score）**
+
+| 来源 | 计算公式 | 示例 |
+|------|---------|------|
+| 名称 | 词出现次数 × 40 × searchFactor | "Cat cat" 在 name 中 → 2 × 40 = 80 |
+| 标签名 | 词出现次数 × 3 | 标签名 "Category" → 1 × 3 = 3 |
+| 标签值 | 词出现次数 × 5 | 标签值 "cats" → 1 × 5 = 5 |
+| H1 标题 | 词出现次数 × 10 | `<h1>Cat page</h1>` → 1 × 10 = 10 |
+| H2 标题 | 词出现次数 × 5 | `<h2>Cat info</h2>` → 1 × 5 = 5 |
+| 普通正文 | 词出现次数 × 1 | `<p>cat cat cat</p>` → 3 × 1 = 3 |
+| 容器描述 | 词出现次数 × 1 × searchFactor | Book 的 description |
+
+**2. 词频稀有度系数（查询时计算，动态调整）**
+
+```
+系数 = 1.3 - (该词匹配的 term 行数 / 最大匹配行数)
+```
+
+- 最稀有词：系数 ≈ **1.3**（几乎只出现一次）
+- 最常见词：系数 ≈ **0.3**（出现次数最多）
+- 作用范围：0.3 ~ 1.3，相差约 4.3 倍
+
+**3. 匹配方式**
+
+采用**前缀匹配**（`term LIKE 'xxx%'`）而非精确匹配：
+- 搜索 `cat` 可以匹配到 `cat`、`cats`、`category`、`cat-like` 等
+- 这也是软分隔符组合词（如 `user-friendly`）能被搜索到的原因
+- 前缀匹配可以利用数据库索引，速度快于 `%xxx%` 的中缀匹配
+
+#### 3.5.6 排序规则
+
+**默认排序**：相关度降序（`ORDER BY score DESC`）
+
+文件：`app/Search/SearchRunner.php:185`
+```php
+$entityQuery->orderBy('score', 'desc');
+```
+
+**自定义排序**：通过 `{sort_by:xxx}` 过滤器指定
+
+目前仅支持一种自定义排序：
+- `{sort_by:last_commented}` — 按最后评论时间排序
+
+文件：`app/Search/SearchRunner.php:431-440`
+```php
+protected function sortByLastCommented(EloquentBuilder $query, bool $negated)
+{
+    // 自连接找出每个实体的最新评论
+    $commentQuery = DB::raw('(SELECT c1.commentable_id, ...) as comments');
+    $query->join($commentQuery, ...)
+          ->orderBy('last_commented', $negated ? 'asc' : 'desc');
+}
+```
+
+> **注意**：当使用 `sort_by` 时，会覆盖默认的相关度排序。目前没有"相关度 + 时间"的组合排序。
+
 ---
 
 ### 3.6 支持的过滤器
@@ -478,3 +700,143 @@ SearchResultsFormatter::format()  → 关键词高亮 + 摘要生成
 6. **权限前置**：使用 `visibleForList()` scope，在评分前先做权限过滤
 7. **批量处理**：索引写入按 500 条 chunk，全量重建按 250 实体 chunk，防止内存和 SQL 超限
 8. **先删后写**：单实体索引更新采用 DELETE + INSERT 策略，简单可靠
+
+---
+
+## 六、中文分词与英文 token 化的混合处理
+
+### 6.1 核心事实：无专用中文分词器
+
+BookStack 的搜索系统**没有集成任何中文分词库**（如 Jieba、IK Analyzer、SCWS 等），采用的是**基于分隔符的统一 token 化方案**，对中英文混合内容做相同处理。
+
+文件：`app/Search/SearchTextTokenizer.php:22`
+```php
+$this->length = strlen($this->text);  // 使用字节长度 strlen，而非 mb_strlen
+```
+
+### 6.2 英文处理：标准空格分词
+
+对于英文等空格分隔语言，分词效果良好：
+
+**输入**：`The quick brown fox jumps over the lazy dog`
+
+**索引结果**：
+```
+the (2次)、quick (1次)、brown (1次)、fox (1次)、jumps (1次)、over (1次)、lazy (1次)、dog (1次)
+```
+
+**软分隔符处理**（`user-friendly design`）：
+- 拆出：`user`、`friendly`、`design`
+- 额外保留：`user-friendly`
+- 兼顾前缀匹配的模糊搜索和组合词的精确搜索
+
+### 6.3 中文处理：按字符边界，实为"整段索引"
+
+对于中文（以及日文、韩文等无空格语言），由于没有空格作为分隔符，分词器会将**一整段连续中文视为一个超长的"词"**。
+
+**输入**：`这是一段中文测试文本`
+
+**索引结果**：
+```
+这是一段中文测试文本 (1次)  ← 整段作为一个词
+```
+
+**原因**：
+- 分隔符列表中没有中文字符
+- `SearchTextTokenizer` 逐字符遍历，遇到分隔符才切分
+- 连续中文字符之间没有分隔符，所以不会被切开
+
+### 6.4 中文搜索的实际效果
+
+#### 6.4.1 前缀匹配机制
+
+由于查询使用 `term LIKE '关键词%'` 前缀匹配，中文搜索仍然**可用**，但粒度很粗：
+
+**搜索**：`中文`
+
+**匹配逻辑**：
+```sql
+WHERE term LIKE '中文%'
+```
+
+可以匹配到：
+- `中文测试文本` ✓（整段以"中文"开头）
+- `中文文档` ✓
+- `中文字符` ✓
+
+无法匹配到：
+- `测试中文` ✗（"中文"不在开头）
+- `这是中文的测试` ✗（"中文"在中间）
+
+#### 6.4.2 实际可用性分析
+
+| 场景 | 效果 | 说明 |
+|------|------|------|
+| 搜索标题中的中文词 | 较好 | 标题通常较短，且以目标词开头的概率较高 |
+| 搜索正文中的中文词 | 较差 | 正文段落长，词通常不在段落开头 |
+| 精确短语匹配 | 可以用 `"..."` | 使用精确匹配语法，走 LIKE '%...%' |
+| 多词组合搜索 | 很差 | 无法按词切分，多个中文词会被当作一个整体 |
+
+### 6.5 中英文混合内容的处理
+
+**输入**：`BookStack 是一个开源的文档管理系统`
+
+**索引结果**：
+```
+BookStack (1次)         ← 英文部分，空格切分
+是一个开源的文档管理系统 (1次)  ← 中文部分，整段作为一个词
+```
+
+**搜索测试**：
+
+| 搜索词 | 能否匹配 | 原因 |
+|-------|---------|------|
+| `BookStack` | ✓ | 精确匹配英文词 |
+| `Book` | ✓ | 前缀匹配 BookStack |
+| `是一个` | ✓ | 前缀匹配中文整段 |
+| `文档管理` | ✗ | 不在中文段开头 |
+| `"文档管理"` | ✓ | 精确匹配语法走 LIKE '%文档管理%' |
+
+### 6.6 结果高亮与多字节处理
+
+虽然分词对中文不友好，但**结果高亮和摘要功能对中文支持良好**，因为使用了 `mb_*` 多字节函数：
+
+文件：`app/Search/SearchResultsFormatter.php`
+```php
+$pos = mb_strpos($text, $term, $offset);      // 多字节字符串查找
+$end = $pos + mb_strlen($term);                // 多字节长度计算
+$content = mb_substr($content, 0, ...);        // 多字节截取
+```
+
+这意味着：
+- 即使中文词是通过精确匹配（`LIKE '%...%'`）找到的
+- 结果页面仍然可以正确高亮显示匹配的中文字符
+- 摘要截取不会出现乱码或半个汉字的问题
+
+### 6.7 提高中文搜索效果的替代方案
+
+如果需要更好的中文搜索体验，可以使用以下方式绕过分词限制：
+
+1. **使用精确匹配语法**：用双引号包裹搜索词 `"<中文关键词>"`，走 `LIKE '%...%'` 全匹配
+   - 缺点：无法利用倒排索引，性能较差，且没有相关度评分
+
+2. **使用标签辅助搜索**：给文档打上中文标签，通过 `[标签名]` 语法搜索
+   - 标签名索引权重为 ×3，标签值权重为 ×5，比正文更容易搜到
+
+3. **在名称中包含关键词**：名称权重最高（×40），且通常较短，前缀匹配效果较好
+
+4. **部署时集成外部搜索引擎**：如 Elasticsearch + 中文分词插件（IK Analysis）
+   - 需要二次开发，替换 `SearchIndex` 和 `SearchRunner` 的实现
+
+### 6.8 设计权衡
+
+BookStack 选择"无专用分词器"的方案，主要基于以下考虑：
+
+| 优点 | 缺点 |
+|------|------|
+| 实现简单，零依赖 | 中文/日文等无空格语言搜索效果差 |
+| 数据库直接支持，部署门槛低 | 多词组合搜索在中文场景下不可用 |
+| 对英文/拼音等空格分隔语言效果良好 | 搜索粒度粗，查准率和查全率都较低 |
+| 性能可预测（SQL LIKE + 索引） | 长文本中文搜索基本只能靠精确匹配 |
+
+> 这是一种典型的**"为部署简便性牺牲多语言搜索质量"**的设计取舍。对于以英文内容为主的知识库，这套方案足够高效；对于中文为主的场景，可能需要考虑扩展方案。

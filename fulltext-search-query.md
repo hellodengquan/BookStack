@@ -621,20 +621,315 @@ protected function sortByLastCommented(EloquentBuilder $query, bool $negated)
 
 ---
 
-### 3.7 SearchResultsFormatter — 结果高亮
+### 3.7 SearchResultsFormatter — 结果高亮与片段提取
 
 文件：`app/Search/SearchResultsFormatter.php`
 
-对搜索结果做以下处理：
+#### 3.7.1 整体处理流程
 
-1. **关键词定位**：在实体名称和正文中查找所有搜索词的出现位置（最多 25 处）
-2. **位置合并**：对重叠或相邻的匹配区域进行合并
-3. **摘要截取**：
-   - 名称：完整显示，不截断（targetLength=0）
-   - 正文：截取约 260 字符，以第一个匹配为中心，前后各留 32 字符上下文
-4. **HTML 高亮**：将匹配词用 `<strong>` 标签包裹
-5. **省略号**：截断处用 `...` 标示
-6. **标签高亮**：如果标签名或值匹配搜索词，打上 `highlight_name` / `highlight_value` 属性
+```
+format($results, $options)
+        ↓
+setSearchPreview($entity, $options)
+  ├─ getMatchPositions()           → 找出所有匹配位置
+  ├─ sortAndMergeMatchPositions()  → 排序并合并重叠/相邻的匹配
+  └─ formatTextUsingMatchPositions() → 生成高亮摘要
+        ↓
+highlightTagsContainingTerms()     → 标签高亮标记
+```
+
+#### 3.7.2 `getMatchPositions()` — 关键词定位
+
+文件：`app/Search/SearchResultsFormatter.php:85-103`
+
+```php
+protected function getMatchPositions(string $text, array $terms): array
+{
+    $matchRefs = [];
+    $text = mb_strtolower($text);
+
+    foreach ($terms as $term) {
+        $offset = 0;
+        $term = mb_strtolower($term);
+        $pos = mb_strpos($text, $term, $offset);
+        while ($pos !== false && count($matchRefs) < 25) {
+            $end = $pos + mb_strlen($term);
+            $matchRefs[$pos] = $end;
+            $offset = $end;
+            $pos = mb_strpos($text, $term, $offset);
+        }
+    }
+
+    return $matchRefs;
+}
+```
+
+**核心要点**：
+- **大小写不敏感**：先将文本和搜索词都转为小写
+- **多字节安全**：全程使用 `mb_strpos`、`mb_strlen`，支持中文等多字节字符
+- **位置数组格式**：`[startIndex => endIndex]`，键是起始位置，值是结束位置
+- **最多 25 个匹配**：防止长文本中匹配过多导致性能问题
+- **遍历所有搜索词**：精确匹配词（exacts）和普通搜索词（searches）都会被查找
+
+#### 3.7.3 `sortAndMergeMatchPositions()` — 位置合并
+
+文件：`app/Search/SearchResultsFormatter.php:113-132`
+
+```php
+protected function sortAndMergeMatchPositions(array $matchPositions): array
+{
+    ksort($matchPositions);
+    $mergedRefs = [];
+    $lastStart = 0;
+    $lastEnd = 0;
+
+    foreach ($matchPositions as $start => $end) {
+        if ($start > $lastEnd) {
+            $mergedRefs[$start] = $end;       // 不重叠，新增
+            $lastStart = $start;
+            $lastEnd = $end;
+        } elseif ($end > $lastEnd) {
+            $mergedRefs[$lastStart] = $end;   // 重叠/相邻，合并（扩展结束位置）
+            $lastEnd = $end;
+        }
+    }
+
+    return $mergedRefs;
+}
+```
+
+**合并逻辑示例**：
+
+假设搜索词为 `cat` 和 `category`，在文本中的匹配位置：
+```
+"the cat category"
+      ↑   ↑
+      4-7 (cat)
+          8-16 (category)
+```
+
+合并前：`[4 => 7, 8 => 16]`
+合并后：`[4 => 16]`（相邻，合并为一个高亮区域）
+
+**三种情况处理**：
+1. `start > lastEnd` → 不重叠，新增区域
+2. `start <= lastEnd && end > lastEnd` → 部分重叠或相邻，扩展当前区域
+3. `end <= lastEnd` → 完全包含，忽略
+
+#### 3.7.4 `formatTextUsingMatchPositions()` — 核心片段提取与高亮
+
+文件：`app/Search/SearchResultsFormatter.php:143-236`
+
+这是整个格式化最复杂的函数，单次遍历所有匹配位置，时间复杂度 O(n)。
+
+**关键参数**：
+
+| 参数 | 名称 | 值（名称） | 值（正文） | 说明 |
+|------|------|-----------|-----------|------|
+| `$targetLength` | 目标长度 | 0（完整显示） | 260 | 0 表示不截断 |
+| `$contextLength` | 上下文长度 | 0 | 32 | 每个匹配前后保留的字符数 |
+| `$fetchAll` | 是否获取全部 | true | false | 由 targetLength === 0 决定 |
+
+**执行流程**：
+
+```
+1. 初始化变量
+   ├─ maxEnd = 文本总长度
+   ├─ fetchAll = (targetLength === 0)
+   └─ contextLength = fetchAll ? 0 : 32
+
+2. 遍历每个匹配位置：
+   对每个 [start => end]：
+   ├─ 计算上下文范围：
+   │   contextStart = max(start - contextLength, 0, lastEnd)
+   │   contextEnd   = min(end + contextLength, maxEnd)
+   │
+   ├─ 处理重叠（如果当前匹配与上一个重叠）：
+   │   回退已生成的内容，避免重复
+   │
+   ├─ 添加省略号或填充间隙：
+   │   - fetchAll=false 且有间隙 → 添加 " ..."
+   │   - fetchAll=true → 填充间隙文本（完整保留）
+   │
+   ├─ 拼接内容：
+   │   上下文前缀（普通文本） + <strong>匹配文本</strong> + 上下文后缀（普通文本）
+   │   所有普通文本都经过 e() 转义，防止 XSS
+   │
+   ├─ 更新 lastEnd = contextEnd
+   │
+   └─ 达到目标长度（targetLength - 10）时 break
+
+3. 后处理：
+   ├─ 如果没有匹配 → 截取前 targetLength 字符
+   ├─ 末尾长度不足 → 向后补充（padEndLength）
+   ├─ 长度仍不足且不是开头 → 向前补充（padStart），前面加 "..."
+   └─ 不是末尾 → 结尾加 "..."
+```
+
+**前后补全策略**：
+
+当高亮内容总长度不足 260 字符时，按以下优先级补全：
+1. 优先**向后补全**（向文本末尾方向扩展）
+2. 仍然不足时**向前补全**（向文本开头方向扩展）
+3. 向前补全时，如果不是从文本开头开始，前面加 `...`
+
+**示例**（目标长度 260，实际高亮内容 200 字符）：
+```
+向后补 40 字符 → 还缺 20 字符 → 向前补 20 字符
+结果："...[向前20字符]...[高亮200字符][向后40字符]..."
+```
+
+#### 3.7.5 XSS 防护细节
+
+所有普通文本输出都经过 Laravel 的 `e()` 函数（即 `htmlspecialchars`）转义：
+
+```php
+$content .= e(mb_substr($originalText, $contextStart, $start - $contextStart));
+$content .= '<strong>' . e(mb_substr($originalText, $start, $end - $start)) . '</strong>';
+```
+
+**注意**：`<strong>` 标签是硬编码的，不经过转义，这是有意的设计。最终返回的字符串用 `HtmlString` 包装，告知 Blade 模板不要再次转义：
+
+```php
+$entity->setAttribute($attributeName, new HtmlString($formatted));
+```
+
+#### 3.7.6 标签高亮
+
+文件：`app/Search/SearchResultsFormatter.php:58-76`
+
+```php
+protected function highlightTagsContainingTerms(array $tags, array $terms): void
+{
+    foreach ($tags as $tag) {
+        $tagName = mb_strtolower($tag->name);
+        $tagValue = mb_strtolower($tag->value);
+
+        foreach ($terms as $term) {
+            $termLower = mb_strtolower($term);
+            if (mb_strpos($tagName, $termLower) !== false) {
+                $tag->setAttribute('highlight_name', true);
+            }
+            if (mb_strpos($tagValue, $termLower) !== false) {
+                $tag->setAttribute('highlight_value', true);
+            }
+        }
+    }
+}
+```
+
+- 检查标签名和标签值是否包含搜索词（任意位置，非前缀）
+- 设置 `highlight_name` / `highlight_value` 属性供前端样式使用
+- 使用 `mb_strpos` 支持中文匹配
+
+---
+
+### 3.8 分页实现与游标稳定性
+
+#### 3.8.1 分页参数解析
+
+文件：`app/Search/SearchController.php:23-45`
+
+```php
+public function search(Request $request, SearchResultsFormatter $formatter)
+{
+    $page = intval($request->input('page', '0')) ?: 1;
+    $count = setting()->getInteger('lists-page-count-search', 18, 1, 1000);
+    
+    $results = $this->searchRunner->searchEntities($searchOpts, 'all', $page, $count);
+    // ...
+}
+```
+
+**参数说明**：
+- `page`：从 query string 读取，默认 1（0 会被转为 1）
+- `count`：从系统设置读取，默认 18，范围 1-1000，可在后台配置
+- 总数统计独立查询，用于生成分页器
+
+#### 3.8.2 SQL 分页实现
+
+文件：`app/Search/SearchRunner.php:94-104`
+
+```php
+protected function getPageOfDataFromQuery(EloquentBuilder $query, int $page, int $count): Collection
+{
+    $entities = $query->clone()
+        ->skip(($page - 1) * $count)
+        ->take($count)
+        ->get();
+
+    $hydrated = $this->entityHydrator->hydrate($entities->all(), true, true);
+    return collect($hydrated);
+}
+```
+
+**生成的 SQL**：
+```sql
+SELECT ... ORDER BY score DESC LIMIT 18 OFFSET 0;    -- 第1页
+SELECT ... ORDER BY score DESC LIMIT 18 OFFSET 18;   -- 第2页
+SELECT ... ORDER BY score DESC LIMIT 18 OFFSET 36;   -- 第3页
+```
+
+这是标准的 **LIMIT + OFFSET** 分页，不是游标（cursor）分页。
+
+#### 3.8.3 分页器构建
+
+文件：`app/Search/SearchController.php:32-34`
+
+```php
+$paginator = new LengthAwarePaginator($results['results'], $results['total'], $count, $page);
+$paginator->setPath(url('/search'));
+$paginator->appends($request->except('page'));  // 保留其他查询参数
+```
+
+使用 Laravel 的 `LengthAwarePaginator`，需要提前知道总数，所以会执行两次查询：
+1. `SELECT COUNT(*) ...` — 统计总数
+2. `SELECT ... LIMIT ... OFFSET ...` — 获取当前页数据
+
+#### 3.8.4 游标稳定性问题
+
+**游标稳定性**（Cursor Stability）是指：当用户在分页浏览时，如果数据库中的数据发生变化（新增、删除、修改分数），后续页面的结果是否会出现**重复**或**遗漏**。
+
+BookStack 的分页**存在游标稳定性问题**，具体表现：
+
+| 场景 | 问题表现 | 原因 |
+|------|---------|------|
+| **新增高相关度实体** | 翻页时第2页开头可能重复第1页末尾的条目 | 新实体挤入第1页，原有条目整体后移一位 |
+| **删除已浏览的实体** | 翻页时第2页跳过一条本该出现的条目 | 被删条目消失，后续条目整体前移一位 |
+| **实体分数变化** | 条目可能从第1页跳到第3页，或反之 | ORDER BY score 的排序顺序变化 |
+| **并发索引更新** | 同一实体可能在两页重复出现，或完全消失 | 先删后写的索引更新过程中，评分排序不稳定 |
+
+**为什么没有稳定排序？**
+
+为了游标稳定，通常需要增加**二级排序键**（如 `ORDER BY score DESC, id ASC`），保证相同分数的条目顺序固定。但 BookStack 目前只有：
+
+```php
+$entityQuery->orderBy('score', 'desc');  // app/Search/SearchRunner.php:185
+```
+
+**缺少二级排序键**。如果两条结果分数相同，数据库返回顺序是不确定的（取决于查询计划、索引、数据物理存储顺序等），可能在不同分页查询中返回不同顺序。
+
+#### 3.8.5 各接口的分页差异
+
+| 接口 | 分页方式 | 分页大小 | 说明 |
+|------|---------|---------|------|
+| `/search`（全站） | LIMIT/OFFSET | 配置值（默认18） | 支持翻页 |
+| `/search/book/{id}`（书内） | LIMIT/OFFSET | 固定 20 | 取第1页，不支持翻页 |
+| `/search/chapter/{id}`（章节内） | LIMIT/OFFSET | 固定 20 | 取第1页，不支持翻页 |
+| `/search/suggest`（搜索建议） | LIMIT/OFFSET | 固定 5 | 取第1页，然后在 PHP 中再 `slice(0, 5)` |
+| `/api/search`（API） | LIMIT/OFFSET | 配置值（默认20） | 支持翻页 |
+
+#### 3.8.6 游标分页 vs 偏移分页对比
+
+| 维度 | BookStack 当前方案（OFFSET） | 游标分页（WHERE id > ?） |
+|------|---------------------------|----------------------|
+| **实现复杂度** | 简单 | 需要稳定排序 + 游标编码 |
+| **深翻页性能** | 差（OFFSET 10000 需要扫描 10000 行） | 好（直接从游标位置开始） |
+| **游标稳定性** | 差（并发更新时重复/丢失） | 好（基于上次看到的最后一条） |
+| **跳页支持** | 支持（直接跳第N页） | 不支持（只能上一页/下一页） |
+| **总数获取** | 需要（LengthAwarePaginator） | 不需要（只需知道是否有下一页） |
+
+**设计权衡**：BookStack 选择偏移分页，主要因为实现简单、支持跳页，且知识库搜索场景下深翻页需求不多（用户通常只看前几页）。
 
 ---
 
@@ -840,3 +1135,251 @@ BookStack 选择"无专用分词器"的方案，主要基于以下考虑：
 | 性能可预测（SQL LIKE + 索引） | 长文本中文搜索基本只能靠精确匹配 |
 
 > 这是一种典型的**"为部署简便性牺牲多语言搜索质量"**的设计取舍。对于以英文内容为主的知识库，这套方案足够高效；对于中文为主的场景，可能需要考虑扩展方案。
+
+---
+
+## 七、同义词、拼写纠正与模糊匹配功能
+
+### 7.1 核心事实：三项功能均未内置
+
+经过代码全面排查，BookStack 的全文搜索系统**没有内置**以下三项高级查询功能：
+
+| 功能 | 英文名 | 实现状态 | 常见实现方式 |
+|------|--------|---------|-------------|
+| **同义词扩展** | Synonym Expansion | ❌ 未实现 | 同义词表映射、查询重写 |
+| **拼写纠正** | Spell Correction | ❌ 未实现 | 编辑距离、N-gram、查询日志 |
+| **模糊匹配** | Fuzzy Matching | ⚠️ 部分实现 | 只有前缀匹配，无编辑距离匹配 |
+
+相关代码中**完全没有**出现：
+- 同义词映射表或配置
+- `levenshtein()`、`similar_text()`、`metaphone()`、`soundex()` 等模糊匹配函数
+- "Did you mean"、"你是不是想找" 等拼写建议逻辑
+- N-gram 索引或查询
+
+### 7.2 已有的"模糊匹配"能力
+
+BookStack 仅有的模糊匹配能力是**前缀匹配**和**精确匹配语法的中缀匹配**：
+
+#### 7.2.1 前缀匹配（默认行为）
+
+```sql
+WHERE term LIKE 'cat%'
+```
+
+可以匹配：
+- `cat` ✓（完全匹配）
+- `cats` ✓（前缀匹配）
+- `category` ✓（前缀匹配）
+- `cat-like` ✓（前缀匹配）
+
+**不可以**匹配：
+- `wildcat` ✗（中缀）
+- `bobcat` ✗（中缀）
+- `cut` ✗（字符差异）
+- `cta` ✗（拼写错误）
+
+这本质上是**右模糊**匹配，利用数据库 B-tree 索引的有序性实现。
+
+#### 7.2.2 精确匹配语法的中缀匹配
+
+使用 `"..."` 语法时，走 `LIKE '%...%'` 中缀匹配：
+
+```sql
+WHERE name LIKE '%document%' 
+   OR description LIKE '%document%'
+   OR text LIKE '%document%'
+```
+
+- 可以匹配任意位置的出现
+- 但**不使用倒排索引**，直接在实体表上做全表扫描
+- 性能较差，且没有相关度评分
+
+### 7.3 同义词扩展缺失分析
+
+#### 7.3.1 实际搜索行为
+
+假设索引了文档：
+- 文档 A："The domestic cat is a small furry animal"
+- 文档 B："Felines are obligate carnivores"
+
+用户搜索 `cat`：
+- ✅ 匹配文档 A（`cat` 在索引中）
+- ❌ **不匹配**文档 B（`felines` 不在索引中，也不会自动扩展为 `cat`）
+
+用户必须手动输入所有同义词：
+```
+cat feline kitty
+```
+
+#### 7.3.2 多搜索词的逻辑关系
+
+需要注意：BookStack 多个搜索词之间是 **AND 关系**，不是 OR 关系。
+
+搜索 `cat feline kitty` 的实际逻辑是：
+```
+实体必须同时包含 cat AND feline AND kitty
+```
+
+这意味着用户**不能**通过输入多个同义词来达到同义词扩展的效果，反而会导致搜索结果为 0。
+
+> **隐含设计**：从代码看，多个搜索词生成的是多个 `term LIKE 'xxx%'` 条件，它们在 WHERE 子句中是 AND 关系。没有 OR 逻辑的搜索语法。
+
+#### 7.3.3 扩展方案
+
+如果需要同义词功能，需要二次开发：
+
+```php
+// 伪代码：在 SearchOptions 解析后扩展同义词
+$synonymMap = [
+    'cat' => ['cat', 'feline', 'kitty'],
+    'vm'  => ['vm', 'virtual', 'virtual machine'],
+];
+
+foreach ($searchOpts->searches as $term) {
+    if (isset($synonymMap[$term->value])) {
+        foreach ($synonymMap[$term->value] as $synonym) {
+            $searchOpts->searches->add(new TermSearchOption($synonym, false));
+        }
+    }
+}
+```
+
+但需要修改查询逻辑，将同一概念的同义词改为 OR 关系。
+
+### 7.4 拼写纠正缺失分析
+
+#### 7.4.1 实际搜索行为
+
+用户搜索 `dpcument`（拼写错误）：
+- ❌ 不返回任何结果（`dpcument%` 没有匹配的 term）
+- ❌ 不会提示"你是不是想找 document？"
+- ❌ 不会自动重试正确拼写的查询
+
+#### 7.4.2 缺失的实现组件
+
+完整的拼写纠正系统需要：
+
+1. **词典**：所有已索引词的集合（`search_terms` 表的 `term` 字段去重）
+2. **候选生成**：找出与输入词编辑距离最小的候选词
+3. **候选排序**：结合词频、上下文等因素排序候选
+4. **用户体验**：展示建议，但不强制修改查询
+
+#### 7.4.3 潜在的低成本实现
+
+不引入外部服务的前提下，可以基于现有 `search_terms` 表实现基础拼写纠正：
+
+```php
+// 伪代码：查询无结果时尝试拼写纠正
+if ($total === 0 && $searchOpts->searches->count() > 0) {
+    foreach ($searchOpts->searches as $term) {
+        $suggestions = DB::select("
+            SELECT term 
+            FROM (
+                SELECT DISTINCT term 
+                FROM search_terms 
+                WHERE term LIKE ? OR term LIKE ?
+            ) candidates
+            WHERE levenshtein(term, ?) <= 2
+            ORDER BY levenshtein(term, ?) ASC, term ASC
+            LIMIT 5
+        ", [
+            $term[0] . '%',
+            '%' . substr($term, -1),
+            $term, $term
+        ]);
+    }
+}
+```
+
+> **注意**：MySQL 5.7+ 内置 `levenshtein()` 函数，但需要开启；PostgreSQL 需要安装 fuzzystrmatch 扩展。
+
+### 7.5 搜索建议 vs 拼写纠正
+
+前端全局搜索框有一个"搜索建议"功能，但它**不是拼写纠正**：
+
+文件：`resources/js/components/global-search.js`
+
+```javascript
+async updateSuggestions(search) {
+    const {data: results} = await window.$http.get('/search/suggest', {term: search});
+    // ... 显示前5条匹配实体
+}
+```
+
+后端接口 `searchSuggestions`：
+
+文件：`app/Search/SearchController.php:120-132`
+
+```php
+public function searchSuggestions(Request $request)
+{
+    $searchTerm = $request->input('term', '');
+    $entities = $this->searchRunner->searchEntities(
+        SearchOptions::fromString($searchTerm), 
+        'all', 1, 5
+    )['results'];
+    
+    // 清空预览内容，只返回标题列表
+    foreach ($entities as $entity) {
+        $entity->setAttribute('preview_content', '');
+    }
+    
+    return view('search.parts.entity-suggestion-list', [
+        'entities' => $entities->slice(0, 5)
+    ]);
+}
+```
+
+**两者区别**：
+
+| 特性 | 搜索建议（Suggestions） | 拼写纠正（Did You Mean） |
+|------|------------------------|-------------------------|
+| **触发时机** | 输入时实时触发（200ms debounce） | 查询无结果或低相关度时 |
+| **返回内容** | 匹配的实体列表（标题+类型） | 推荐的搜索词修正建议 |
+| **依赖** | 搜索索引（正常搜索逻辑） | 词典 + 编辑距离算法 |
+| **目的** | 快速到达目标文档 | 帮助修正拼写错误 |
+| **当前状态** | ✅ 已实现 | ❌ 未实现 |
+
+前端 debounce 200ms，避免频繁请求。
+
+### 7.6 设计权衡
+
+BookStack 选择不内置这些高级功能，主要基于以下考虑：
+
+**不做同义词**：
+- 同义词维护成本高（不同领域同义词不同）
+- 多语言同义词更加复杂
+- 误扩展可能引入不相关结果，降低查准率
+- 知识库搜索场景下，用户通常知道精确术语
+
+**不做拼写纠正**：
+- 实现复杂（需要词典、候选生成、排序）
+- 依赖数据库函数（levenshtein）可能不可用
+- 性能开销大（每个无结果查询需要额外的词典扫描）
+- 用户复制粘贴搜索占比高，拼写错误场景相对较少
+
+**不做高级模糊匹配**：
+- 前缀匹配 + 精确匹配语法已覆盖多数场景
+- 编辑距离匹配性能差
+- 增加复杂性但收益有限
+
+**扩展建议**：
+如果确实需要这些功能，推荐方案是**替换搜索引擎层**，而不是在现有代码上修补：
+
+1. **Meilisearch** / **Typesense**：轻量级、易部署、内置同义词、拼写纠正、模糊匹配
+2. **Elasticsearch** / **OpenSearch**：功能强大但运维复杂
+3. 集成后只需替换 `SearchIndex`（写入）和 `SearchRunner`（查询）两个类的实现
+
+### 7.7 现有搜索语法能力清单
+
+作为对比，总结 BookStack 已有的搜索语法：
+
+| 语法 | 示例 | 功能 |
+|------|------|------|
+| 普通词 | `cat dog` | AND 关系，前缀匹配倒排索引 |
+| 精确匹配 | `"cat dog"` | LIKE '%cat dog%'，走实体表扫描 |
+| 标签搜索 | `[priority=high]` | 关联 tags 表查询 |
+| 过滤器 | `{created_by:me}` | 17 种内置过滤条件 |
+| 否定前缀 | `-cat` | NOT 逻辑，适用于所有语法 |
+| 类型过滤 | `{type:page}` | 限制实体类型 |
+| 自定义排序 | `{sort_by:last_commented}` | 按最后评论时间排序 |

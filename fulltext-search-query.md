@@ -1348,6 +1348,538 @@ BookStack 选择前置过滤是正确的设计，保证了搜索结果的可用�
 
 ---
 
+### 3.12 搜索性能监控与慢查询追踪
+
+#### 3.12.1 核心事实：无内置搜索专用监控
+
+BookStack 全文搜索系统**没有专门针对搜索的性能监控指标**，也没有内置的慢查询追踪机制。所有监控能力依赖于外部调试工具和 Laravel 框架自带的日志。
+
+#### 3.12.2 可用的调试工具
+
+BookStack 集成了两个可选的调试/监控工具：
+
+| 工具 | 启用方式 | 说明 |
+|------|---------|------|
+| **Clockwork** | `CLOCKWORK_ENABLE=true` | 开发者工具扩展，提供请求级详细性能分析 |
+| **Laravel Debugbar** | `APP_DEBUG=true` | 调试栏，显示查询、内存、时间等 |
+
+**Clockwork 配置**（`app/Config/clockwork.php`）：
+
+```php
+'enable' => env('CLOCKWORK_ENABLE', false),
+
+'features' => [
+    'database' => [
+        'enabled'            => true,
+        'collect_queries'    => true,
+        'slow_threshold'     => null,    // 慢查询阈值（ms），null 不标记
+        'slow_only'          => false,   // 只收集慢查询
+        'detect_duplicate_queries' => false,  // 检测 N+1 查询
+    ],
+    'cache' => [
+        'enabled'         => true,
+        'collect_queries' => true,
+    ],
+    // ...
+],
+```
+
+**可收集的搜索相关指标**：
+- 每个搜索请求的总耗时
+- 搜索过程中执行的 SQL 查询数量和耗时
+- 重复查询检测（N+1 问题）
+- 缓存命中情况（目前搜索几乎不用缓存）
+- 内存使用量
+
+#### 3.12.3 搜索场景下的慢查询特征
+
+结合搜索 SQL 的特点，典型的慢查询场景包括：
+
+| 慢查询类型 | 触发条件 | 可能的 SQL |
+|-----------|---------|-----------|
+| **词频统计查询** | 搜索词多、且每个词匹配大量 term | `getTermAdjustments()` 中的 GROUP BY 查询 |
+| **倒排索引 JOIN** | 搜索词多、结果集大 | `applyTermSearch()` 中的 search_terms 子查询 JOIN |
+| **权限 COUNT** | 结果集大、权限复杂 | `COUNT(*)` 统计总数的查询 |
+| **精确匹配扫描** | 精确匹配词多、实体表大 | `LIKE '%xxx%'` 的全表扫描 |
+| **深翻页** | 页码很高 | `OFFSET 10000` 需要扫描 10000 行 |
+| **标签搜索** | 标签名模糊匹配 | `whereHas('tags', ...)` 关联查询 |
+
+#### 3.12.4 缺失的监控能力清单
+
+以下监控能力**完全缺失**，无法直接获得：
+
+| 监控指标 | 实现状态 | 业务价值 |
+|---------|---------|---------|
+| 搜索请求量（QPS） | ❌ 无 | 高（了解搜索使用频率） |
+| 搜索响应时间 P50/P95/P99 | ❌ 无 | 高（性能 SLA 监控） |
+| 零结果查询占比 | ❌ 无 | 高（发现同义词/拼写纠正需求） |
+| 慢查询 Top N | ❌ 无 | 高（性能优化优先级） |
+| 热门搜索词排行 | ❌ 无 | 中（内容运营参考） |
+| 搜索→点击转化率 | ❌ 无 | 高（评估搜索效果） |
+| 平均结果翻页数 | ❌ 无 | 中（评估排序质量） |
+
+#### 3.12.5 搜索查询日志的自定义扩展思路
+
+如果需要自定义搜索监控，可以通过 Laravel 事件系统扩展：
+
+```php
+// 伪代码：添加搜索事件监听
+// 在 SearchRunner::searchEntities() 前后添加
+DB::listen(function ($query) {
+    if (str_contains($query->sql, 'search_terms')) {
+        Log::channel('search')->info('search query', [
+            'sql'       => $query->sql,
+            'time_ms'   => $query->time,
+            'bindings'  => $query->bindings,
+        ]);
+    }
+});
+```
+
+**推荐记录的字段**：
+- 搜索字符串、用户 ID、IP 地址
+- 请求时间、响应时间（ms）
+- 返回结果总数、当前页码
+- 执行的 SQL 查询数量和总耗时
+- 是否命中缓存（目前全 miss）
+- 是否零结果
+
+#### 3.12.6 设计权衡
+
+| 选择不内置监控的原因 | 潜在代价 |
+|-------------------|---------|
+| 遵循"部署简便、零依赖"哲学 | 生产环境问题排查困难 |
+| 搜索不是高频核心功能（知识库） | 性能劣化后缺乏早期预警 |
+| 开发者调试用 Clockwork/Debugbar 已足够 | 运营数据缺失（热门搜索、零结果率） |
+| 监控通常是运维层职责（APM） | 需要额外部署 New Relic / Datadog / SkyWalking 等 |
+
+> 对于生产环境部署，建议在应用层之外接入 APM 工具（如 Sentry、APM）或数据库层的慢查询日志（MySQL slow_query_log）来覆盖搜索监控。
+
+---
+
+### 3.13 搜索语法解析链：boolean / phrase / wildcard 详解
+
+#### 3.13.1 两种入口：字符串输入 vs 表单输入
+
+搜索选项的解析有两条路径：
+
+```
+输入源
+  ├─ SearchOptions::fromString($search)     ← 字符串语法（简单搜索、URL 参数）
+  └─ SearchOptions::fromRequest($request)  ← 高级搜索表单 + extras 字符串
+        └─ 内部也会调用 fromString() 解析 extras
+```
+
+#### 3.13.2 `addOptionsFromString()` — 核心字符串解析链
+
+文件：`app/Search/SearchOptions.php:99-149`
+
+**整体流程**：
+
+```
+原始搜索字符串
+    ↓
+第一步：正则提取特殊语法（先处理特殊符号，避免后续误切分）
+    ├─ exacts   → /-?"((?:\\.|[^"\\])*)"/      → "..." 或 -"..."
+    ├─ tags     → /-?\[(.*?)\]/                 → [...] 或 -[...]
+    └─ filters  → /-?\{(.*?)\}/                 → {...} 或 -{...}
+    ↓
+第二步：从字符串中移除已提取的特殊语法
+    ↓
+第三步：处理反斜杠转义（decodeEscapes）
+    ↓
+第四步：解析剩余的普通词（parseStandardTermString）
+    ├─ 按空格切词
+    ├─ 含硬分隔符的词 → 转为 exacts
+    └─ 其他词 → 保留为 terms（普通搜索词）
+    ↓
+第五步：合并所有选项、限制数量（limitOptions）
+```
+
+#### 3.13.3 第一步：正则语法详解
+
+三组正则分别匹配 phrase、tags、filters：
+
+| 类别 | 正则 | 匹配示例 | 提取值 |
+|------|------|---------|-------|
+| **phrase (exact)** | `/-?"((?:\\.|[^"\\])*)"/` | `"hello world"` | `hello world` |
+| **否定 phrase** | 同上 | `-"old text"` | `old text`（negated=true） |
+| **tag** | `/-?\[(.*?)\]/` | `[priority=high]` | `priority=high` |
+| **否定 tag** | 同上 | `-[deprecated]` | `deprecated`（negated=true） |
+| **filter** | `/-?\{(.*?)\}/` | `{created_by:me}` | `created_by:me` |
+| **否定 filter** | 同上 | `-{is_restricted}` | `is_restricted`（negated=true） |
+
+**exact 正则的转义处理**：
+
+`((?:\\.|[^"\\])*)` 支持两种内容：
+- `\\.` — 反斜杠转义的任意字符（如 `\"`、`\\`）
+- `[^"\\]` — 除了引号和反斜杠的任意字符
+
+这允许在精确匹配中包含引号：`"He said \"hello\""`
+
+#### 3.13.4 否定前缀（boolean NOT）
+
+所有语法都支持否定前缀 `-`，表示排除（NOT 逻辑）：
+
+```
+cat -dog               → 包含 cat 但不包含 dog
+"user guide" -"old"    → 包含 "user guide" 精确短语但不包含 "old"
+[priority] -[archived] → 有 priority 标签但没有 archived 标签
+{created_by:me} -{draft} → 我创建的但排除草稿
+```
+
+**AND 关系默认隐含**：多个选项之间都是 AND 关系，没有 OR 语法。
+
+**没有的 boolean 逻辑**：
+- ❌ OR 语法（没有 `cat OR dog`）
+- ❌ 括号分组（没有 `(cat OR dog) AND book`）
+- ❌ 显式 AND 语法（`cat AND dog` = 两个普通词，效果与 `cat dog` 相同但多了一个词限制）
+
+#### 3.13.5 第三步：`decodeEscapes()` — 反斜杠转义解码
+
+文件：`app/Search/SearchOptions.php:173-190`
+
+```php
+protected static function decodeEscapes(string $input): string
+{
+    $decoded = "";
+    $escaping = false;
+    foreach (str_split($input) as $char) {
+        if ($escaping) {
+            $decoded .= $char;
+            $escaping = false;
+        } else if ($char === '\\') {
+            $escaping = true;
+        } else {
+            $decoded .= $char;
+        }
+    }
+    return $decoded;
+}
+```
+
+**转义示例**：
+
+| 输入 | 解码后 | 说明 |
+|------|-------|------|
+| `\"hello\"` | `"hello"` | 转义引号 |
+| `C:\\\\path` | `C:\\path` | 转义反斜杠本身 |
+| `no escape` | `no escape` | 无转义 |
+
+#### 3.13.6 第四步：`parseStandardTermString()` — 普通词解析
+
+文件：`app/Search/SearchOptions.php:201-220`
+
+```php
+protected static function parseStandardTermString(string $termString): array
+{
+    $terms = explode(' ', $termString);
+    // 硬分隔符 = 所有分隔符 - 软分隔符
+    $indexDelimiters = implode('', array_diff(
+        str_split(SearchIndex::$delimiters),
+        str_split(SearchIndex::$softDelimiters)
+    ));
+
+    foreach ($terms as $searchTerm) {
+        // 词中包含硬分隔符 → 转为精确匹配
+        $becomeExact = (strpbrk($searchTerm, $indexDelimiters) !== false);
+        $parsed[$becomeExact ? 'exacts' : 'terms'][] = $searchTerm;
+    }
+
+    return $parsed;
+}
+```
+
+**硬分隔符（触发转 exact 的符号）**：
+空格、换行、制表符、逗号、感叹号、问号、冒号、分号、括号、方括号、花括号、尖括号、反引号、单引号、双引号、书名号等
+
+**软分隔符（不触发转 exact 的符号）**：`.`、`-`
+
+**触发示例**：
+
+| 输入词 | 是否转 exact | 原因 |
+|-------|-------------|------|
+| `hello` | ❌ 不转 | 无硬分隔符 |
+| `user-friendly` | ❌ 不转 | `-` 是软分隔符 |
+| `v1.2.3` | ❌ 不转 | `.` 是软分隔符 |
+| `hello,world` | ✅ 转 exact | 含 `,` 硬分隔符 |
+| `cat!dog` | ✅ 转 exact | 含 `!` 硬分隔符 |
+| `what?` | ✅ 转 exact | 含 `?` 硬分隔符 |
+| `it's` | ✅ 转 exact | 含 `'` 硬分隔符 |
+
+**设计意图**：硬分隔符不会出现在倒排索引的 term 中（因为分词时会被切掉），所以包含硬分隔符的词必须走实体表的 `LIKE` 精确匹配才能找到。
+
+#### 3.13.7 Wildcard（通配符）支持
+
+BookStack 的搜索语法**没有显式的通配符语法**（如 `*`、`?`）。但实际上存在**隐式通配符**：
+
+| 场景 | 行为 | 相当于 |
+|------|------|-------|
+| 普通搜索词 | `term LIKE 'xxx%'` | 后缀通配符 `xxx*` |
+| 精确匹配语法 | `name LIKE '%xxx%'` | 双侧通配符 `*xxx*` |
+| tag 搜索 | `WHERE name = 'xxx'`（默认） | 精确匹配 |
+| tag like 操作符 | `WHERE name LIKE '%xxx%'` | 双侧通配符 `*xxx*` |
+
+**Tag 搜索的 7 种操作符**：
+
+文件：`app/Search/Options/TagSearchOption.php:12`
+
+```php
+protected array $queryOperators = ['<=', '>=', '=', '<', '>', 'like', '!='];
+```
+
+| tag 语法示例 | 实际 SQL |
+|-------------|---------|
+| `[priority]` | `tag.name = 'priority'`（默认 `=`） |
+| `[priority=high]` | `tag.name = 'priority' AND tag.value = 'high'` |
+| `[count>=100]` | `tag.name = 'count' AND tag.value >= '100'` |
+| `[name like test]` | `tag.name = 'name' AND tag.value LIKE '%test%'` |
+| `[status!=done]` | `tag.name = 'status' AND tag.value != 'done'` |
+
+**没有的 wildcard**：
+- ❌ `cat*` — 显式前缀通配符（已隐式支持）
+- ❌ `*cat` — 后缀通配符（中缀需要 exact 语法）
+- ❌ `c?t` — 单字符通配符
+- ❌ 正则表达式匹配
+
+#### 3.13.8 `fromRequest()` — 高级表单输入解析
+
+文件：`app/Search/SearchOptions.php:47-94`
+
+高级搜索表单的每个字段映射到对应的选项类型：
+
+| 表单字段 | 映射到 | 说明 |
+|---------|-------|------|
+| `search` | searches + exacts | 字符串 parseStandardTermString 拆分 |
+| `exact[]` | exacts | 多个精确匹配项 |
+| `tags[]` | tags | 多个标签项 |
+| `filters[xxx]` | filters | 每个过滤条件键值对 |
+| `types[]` | filters.type | 选择的类型合并为 `{type:page|book|...}` |
+| `extras` | 所有 | 额外的字符串语法，再走一遍 fromString 合并 |
+
+**types 字段处理逻辑**：如果选中少于 4 种类型（page/chapter/book/bookshelf），则自动添加 `{type:xxx|yyy}` 过滤器。
+
+#### 3.13.9 第五步：`limitOptions()` — 数量限制
+
+文件：`app/Search/SearchOptions.php:156-168`
+
+根据登录状态限制选项数量，防止滥用：
+
+| 选项类型 | 游客上限 | 登录用户上限 |
+|---------|---------|-------------|
+| searches（普通词） | 5 | 10 |
+| exacts（精确匹配） | 2 | 4 |
+| tags（标签） | 4 | 8 |
+| filters（过滤器） | 5 | 10 |
+
+超出部分会被静默截断（`array_slice`），不会报错。
+
+#### 3.13.10 `toString()` — 反向序列化
+
+文件：`app/Search/SearchOptions.php:235-247`
+
+将搜索选项反向编码回字符串，用于 URL 参数和分页：
+
+| 选项类型 | 编码格式 |
+|---------|---------|
+| TermSearchOption | `term` 或 `-term` |
+| ExactSearchOption | `"value"` 或 `-"value"`（自动转义 `"` 和 `\`） |
+| TagSearchOption | `[value]` 或 `-[value]` |
+| FilterSearchOption | `{key}` / `{key:value}` 或否定形式 |
+
+**编码示例**：
+
+```
+搜索：hello "world peace" [important] {created_by:me} -private
+searches:  hello
+exacts:    "world peace"
+tags:      [important]
+filters:   {created_by:me}
+negated:   -private
+
+toString() → 'hello "world peace" [important] {created_by:me} -private'
+```
+
+---
+
+### 3.14 搜索接口的限流与防爬虫策略
+
+#### 3.14.1 API 搜索接口的限流
+
+搜索 API 接口（`GET /api/search`）受到 API 组中间件的限流保护：
+
+**API 中间件链**（`app/Http/Kernel.php:40-46`）：
+
+```
+api 路由组中间件：
+1. ThrottleApiRequests     ← 限流（第1个执行）
+2. EncryptCookies
+3. StartSessionIfCookieExists
+4. ApiAuthenticate         ← 认证
+5. CheckEmailConfirmed
+```
+
+**限流中间件实现**（`app/Http/Middleware/ThrottleApiRequests.php`）：
+
+```php
+class ThrottleApiRequests extends Middleware
+{
+    protected function resolveMaxAttempts($request, $maxAttempts): int
+    {
+        return (int) config('api.requests_per_minute');
+    }
+}
+```
+
+**限流配置**（`app/Config/api.php:21`）：
+
+```php
+'requests_per_minute' => env('API_REQUESTS_PER_MIN', 180),
+```
+
+**关键参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| 每分钟请求数 | 180 | 可通过 `API_REQUESTS_PER_MIN` 环境变量调整 |
+| 时间窗口 | 60 秒 | Laravel ThrottleRequests 默认窗口 |
+| 限流粒度 | 以用户 ID + IP 为 key | 登录用户按用户限流，未登录按 IP 限流 |
+
+**限流后响应**：
+- HTTP 状态码：`429 Too Many Requests`
+- Response Headers：
+  - `X-RateLimit-Limit`：窗口内最大请求数
+  - `X-RateLimit-Remaining`：窗口内剩余请求数
+  - `X-RateLimit-Reset`：窗口重置时间戳
+  - `Retry-After`：建议重试等待秒数
+
+#### 3.14.2 Web 搜索接口的限流情况
+
+**Web 搜索路由（`routes/web.php:190-201`）**：
+
+```
+GET /search                              → SearchController@search
+GET /search/book/{bookId}                → SearchController@searchBook
+GET /search/chapter/{chapterId}          → SearchController@searchChapter
+GET /search/suggest                      → SearchController@searchSuggestions
+GET /search/entity-selector              → SearchController@searchForSelector
+GET /search/entity-selector-templates    → SearchController@templatesForSelector
+GET /search/entity/siblings              → SearchController@searchSiblings
+```
+
+这些路由属于 `web` 中间件组，**没有专门的限流中间件**。
+
+`web` 组中间件列表（`app/Http/Kernel.php:29-39`）：
+
+```
+web 路由组中间件：
+1. ApplyCspRules              ← CSP 安全头
+2. EncryptCookies
+3. AddQueuedCookiesToResponse
+4. StartSessionExtended       ← 会话
+5. ShareErrorsFromSession
+6. VerifyCsrfToken            ← CSRF 保护（部分接口）
+7. CheckEmailConfirmed
+8. RunThemeActions
+9. Localization
+```
+
+**Web 搜索的保护措施**：
+
+| 保护类型 | 实现状态 | 说明 |
+|---------|---------|------|
+| 速率限制（Rate Limiting） | ❌ 无 | 没有 throttle 中间件 |
+| CSRF 保护 | ❌ 无 | GET 请求不需要 CSRF |
+| 搜索选项数量限制 | ✅ 有 | 游客 5 个词 / 登录 10 个词 |
+| 分页大小限制 | ✅ 有 | 默认 18，范围 1-1000 |
+| 会话身份识别 | ✅ 有 | session 可用于后续自定义限流 |
+
+**风险点**：Web 搜索接口可以被脚本无限次调用，可能造成数据库压力。实际场景中可以：
+- 在 Nginx 层配置速率限制
+- 自定义中间件添加搜索接口限流
+- 利用搜索结果缓存降低 DB 压力
+
+#### 3.14.3 搜索建议接口的前端节流
+
+虽然后端没有限流，但前端搜索建议有**客户端 debounce**：
+
+文件：`resources/js/components/global-search.js:24-36`
+
+```javascript
+const updateSuggestionsDebounced = debounce(this.updateSuggestions.bind(this), 200, false);
+
+this.input.addEventListener('input', () => {
+    const {value} = this.input;
+    if (value.length > 0) {
+        updateSuggestionsDebounced(value);  // 200ms 防抖
+    } else {
+        this.hideSuggestions();
+    }
+});
+```
+
+**前端防护措施**：
+- 200ms debounce：输入停顿 200ms 后才发送请求
+- 输入长度 > 0 才请求（但空输入只清空，不请求）
+- 透明的 UI 状态：请求中显示 loading，结果区半透明
+
+这有效减少了快速输入时的请求爆炸，但客户端防护对恶意爬虫无效。
+
+#### 3.14.4 API 认证 vs 匿名访问
+
+`/api/search` 认证方式（`ApiAuthenticate` 中间件）：
+
+| 认证方式 | 限流粒度 | 说明 |
+|---------|---------|------|
+| API Token（请求头） | 用户 ID | `Authorization: Bearer TOKEN` |
+| Session Cookie | 会话用户 | 如果已登录 Web 端 |
+| 无认证（匿名） | IP 地址 | 公开访问的实例 |
+
+所有认证方式都使用**相同的限流额度**（默认 180/min），没有对匿名用户降低额度。
+
+#### 3.14.5 爬虫识别与防护措施
+
+BookStack 目前**没有专门的爬虫识别和防护机制**，例如：
+
+| 防护能力 | 实现状态 | 常见方案 |
+|---------|---------|---------|
+| User-Agent 黑名单 | ❌ 无 | Nginx 层拦截常见爬虫 UA |
+| 验证码（Captcha） | ❌ 无 | 搜索频率过高时触发 |
+| 请求行为分析 | ❌ 无 | 短时间内大量不同关键词搜索判定为爬虫 |
+| 蜜罐（Honeypot） | ❌ 无 | 隐藏的搜索框陷阱 |
+| IP 黑名单 | ❌ 无 | 运维层面封禁 |
+| 基于结果为空的检测 | ❌ 无 | 连续零结果查询可能是爬虫遍历 |
+
+#### 3.14.6 信息泄露防护
+
+**搜索结果裁剪**（SearchResultsFormatter）是信息防护的一环：
+- 正文只截取 ~260 字符摘要，防止通过搜索获取全文
+- 即使有权限查看，搜索结果也不暴露完整内容
+- 必须点击进入详情页才能看全文
+
+**权限过滤前置**也能防止"未授权逐词遍历"：
+- 用户只能搜索自己有权限查看的实体
+- 爬虫无法通过搜索枚举无权限内容中的关键词
+
+#### 3.14.7 设计权衡与加固建议
+
+**为什么 Web 搜索不限流？**
+- 知识库场景搜索频率不高
+- 限流可能影响正常用户体验
+- 搜索操作是只读的，不像写操作那样有直接的安全风险
+
+**推荐的加固方案**：
+
+| 层级 | 措施 | 实现难度 |
+|------|------|---------|
+| **基础设施层** | Nginx 配置 limit_req_zone 限制搜索 URL | 低 |
+| **应用层** | 为搜索路由添加自定义 throttle 中间件（如 60/min/IP） | 低 |
+| **应用层** | 对零结果查询记录日志并做频率检测 | 中 |
+| **缓存层** | 热门搜索词结果缓存（Redis），减少 DB 压力 | 中 |
+| **业务层** | 搜索贡献内容需要登录，游客仅搜索公开内容 | 低 |
+
+---
+
 ## 四、完整流程时序图
 
 ### 4.1 写入路径

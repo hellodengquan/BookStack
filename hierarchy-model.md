@@ -1344,9 +1344,837 @@ public function changes(string $bookSlug, string $pageSlug, int $revisionId)
 
 ---
 
-## 十、关键代码位置速查（补充）
+## 十一、全文搜索与索引链路（Search）
 
-### 10.1 权限相关
+### 11.1 搜索系统架构
+
+```
+实体变更（创建/更新/删除）
+    │
+    └─ Entity::indexForSearch()
+          │
+          └─ SearchIndex::indexEntity()
+                │
+                ├─ deleteEntityTerms()  // 先清除旧索引
+                ├─ entityToTermDataArray()  // 生成词项-分数映射
+                │     │
+                │     ├─ generateTermScoreMapFromText(name, ×40)
+                │     ├─ generateTermScoreMapFromHtml(description/html)
+                │     │     ├─ h1: ×10
+                │     │     ├─ h2: ×5
+                │     │     ├─ h3: ×4
+                │     │     ├─ h4: ×3
+                │     │     ├─ h5: ×2
+                │     │     ├─ h6: ×1.5
+                │     │     └─ 其他: ×1
+                │     └─ generateTermScoreMapFromTags()
+                │           ├─ tag name: ×3
+                │           └─ tag value: ×5
+                │
+                └─ insertTerms()  // 批量写入 search_terms 表
+
+用户搜索请求
+    │
+    └─ SearchController::search()
+          │
+          └─ SearchRunner::searchEntities()
+                │
+                ├─ buildQuery()
+                │     │
+                │     ├─ applyTermSearch()  // 词项搜索（TF-IDF 风格）
+                │     │     │
+                │     │     ├─ getTermAdjustments()  // 稀有词加权（越罕见分越高）
+                │     │     │     └─ multiplier = 1.3 - (term_count / max_count)
+                │     │     └─ selectForScoredTerms()  // 构建 SUM(IF(...)) 计算总分
+                │     │
+                │     ├─ applyTagSearch()  // 标签搜索
+                │     └─ 过滤器：exact / filters（updated_after 等）
+                │
+                └─ EntityHydrator::hydrate()  // 权限检查 + 预加载父级
+```
+
+### 11.2 核心类与职责
+
+#### 11.2.1 SearchIndex (`app/Search/SearchIndex.php`)
+
+**索引管理核心类**，负责实体的索引创建、更新、删除。
+
+**索引单个实体 `indexEntity()`**：
+
+```php
+public function indexEntity(Entity $entity): void
+{
+    $this->deleteEntityTerms($entity);  // 先删旧索引
+    $terms = $this->entityToTermDataArray($entity);  // 生成新词项
+    $this->insertTerms($terms);  // 写入数据库
+}
+```
+
+**词项分词规则 `textToTermCountMap()`**：
+
+```php
+// 硬分隔符：空格、换行、标点等
+public static string $delimiters = " \n\t.-,!?:;()[]{}<>`'\"«»";
+
+// 软分隔符：既保留完整词，也拆分后的词
+public static string $softDelimiters = ".-";
+
+// 例：输入 "my-app.v2.0"
+// 分词结果：my, my-app, my-app.v2, my-app.v2.0, app, app.v2, app.v2.0, v2, v2.0, 0
+```
+
+**各字段权重系数**：
+
+| 字段来源 | 权重系数 | 说明 |
+|---------|---------|------|
+| 实体名称（name） | `×40 × searchFactor` | 最高权重 |
+| 标签名（tag name） | `×3` | |
+| 标签值（tag value） | `×5` | |
+| H1 标题 | `×10` | |
+| H2 标题 | `×5` | |
+| H3 标题 | `×4` | |
+| H4 标题 | `×3` | |
+| H5 标题 | `×2` | |
+| H6 标题 | `×1.5` | |
+| 普通内容 / 描述 | `×1 × searchFactor` | 基础权重 |
+
+**全量重建索引 `indexAllEntities()`**：
+
+```php
+public function indexAllEntities(?callable $progressCallback = null): void
+{
+    SearchTerm::query()->truncate();  // 清空所有索引
+
+    foreach ($this->entityProvider->all() as $entityModel) {
+        // 分批处理，每批 250 条
+        $entityModel->newQuery()
+            ->select($selectFields)
+            ->with(['tags:id,name,value,entity_id,entity_type'])
+            ->chunk(250, $chunkCallback);
+    }
+}
+```
+
+#### 11.2.2 SearchTerm (`app/Search/SearchTerm.php`)
+
+搜索词项存储模型。
+
+**表结构**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  search_terms                    │
+├──────────────────┬──────────────────────────────┤
+│ id               │ 主键（自增）                 │
+│ term             │ 词项文本                     │
+│ entity_id        │ 实体ID                       │
+│ entity_type      │ 实体类型                     │
+│ score            │ 权重分数                     │
+└──────────────────┴──────────────────────────────┘
+```
+
+**索引**：`(term, entity_type, entity_id)` 复合索引用于快速查找
+
+#### 11.2.3 SearchRunner (`app/Search/SearchRunner.php`)
+
+**搜索查询执行器**，执行实际的搜索查询并返回结果。
+
+**词项搜索核心逻辑 `applyTermSearch()`**：
+
+```php
+protected function applyTermSearch(EloquentBuilder $entityQuery, SearchOptions $options, array $entityTypes): void
+{
+    // 1. 计算每个词的稀有度权重（稀有词得分更高）
+    $scoredTerms = $this->getTermAdjustments($options);
+    // multiplier = 1.3 - (term_count / max_count)
+    // 例：最常见词 ×0.3，最罕见词 ×1.3
+
+    // 2. 构建子查询：从 search_terms 计算每个实体的总分
+    $subQuery = DB::table('search_terms')->select([
+        'entity_id',
+        'entity_type',
+        DB::raw('SUM(IF(term like ?, score * ?, IF(...))) as score'),
+    ]);
+    $subQuery->groupBy('entity_type', 'entity_id');
+
+    // 3. 与 entities 表 JOIN，并按分数排序
+    $entityQuery->joinSub($subQuery, 's', function (JoinClause $join) {
+        $join->on('s.entity_id', '=', 'entities.id')
+            ->on('s.entity_type', '=', 'entities.type');
+    });
+    $entityQuery->orderBy('score', 'desc');
+}
+```
+
+**支持的搜索过滤器**：
+
+| 过滤器 | 说明 |
+|-------|------|
+| `{type}` | 按实体类型（page/chapter/book/bookshelf） |
+| `updated_after` | 更新时间晚于 |
+| `updated_before` | 更新时间早于 |
+| `created_after` | 创建时间晚于 |
+| `created_before` | 创建时间早于 |
+| `created_by` | 创建者 |
+| `updated_by` | 更新者 |
+| `owned_by` | 拥有者 |
+| `in_name` / `in_title` | 仅在名称中搜索 |
+| `in_body` | 仅在正文中搜索 |
+| `is_restricted` | 是否有自定义权限 |
+| `viewed_by_me` | 我看过的 |
+| `not_viewed_by_me` | 我没看过的 |
+| `is_template` | 是否为模板页 |
+| `sort_by_last_commented` | 按最后评论时间排序 |
+| `[tag=value]` | 标签搜索 |
+| `"exact phrase"` | 精确短语匹配 |
+
+#### 11.2.4 EntityHydrator (`app/Entities/Tools/EntityHydrator.php`)
+
+搜索结果后处理器：
+- 对结果执行权限检查
+- 预加载父级关联（book、chapter）
+- 避免 N+1 查询
+
+### 11.3 索引更新接入点
+
+索引通过 `Entity::indexForSearch()` 方法触发：
+
+```php
+// Entity.php:402-405
+public function indexForSearch(): void
+{
+    app()->make(SearchIndex::class)->indexEntity($this);
+}
+```
+
+**调用时机**：
+
+| 操作 | 触发位置 |
+|------|---------|
+| 创建实体 | `BaseRepo::create()`:65 |
+| 更新实体 | `BaseRepo::update()`:100 |
+| 恢复修订 | `PageRepo::restoreRevision()`:249 |
+| 删除实体 | 不直接调用，而是在永久删除时 `destroyCommonRelations()` 中 `$entity->searchTerms()->delete()` |
+
+**搜索接入点（查询）**：
+
+| 功能 | 位置 |
+|------|------|
+| 全局搜索 | `SearchController::search()` |
+| 册内搜索 | `SearchController::searchBook()` |
+| 章内搜索 | `SearchController::searchChapter()` |
+| 实体选择器搜索 | `SearchController::searchForSelector()` |
+| 模板选择器搜索 | `SearchController::templatesForSelector()` |
+| 搜索建议 | `SearchController::searchSuggestions()` |
+
+### 11.4 search_terms 表数据量估算
+
+假设：
+- 平均每个页提取 200 个唯一词项
+- 系统有 10,000 页 + 1,000 章 + 500 册 + 100 书架
+- 总词项记录约：10,600 × 200 = **2,120,000 条**
+
+---
+
+## 十二、导出转换链路（Export）
+
+### 12.1 导出系统架构
+
+```
+用户请求导出
+    │
+    └─ {Entity}ExportController::{format}()
+          │
+          ├─ Permission::ContentExport middleware  // 导出权限校验
+          ├─ throttle:exports middleware  // 限流
+          │
+          └─ ExportFormatter::{entity}To{Format}()
+                │
+                ├─ PageContent::render()  // 渲染页面内容（短代码、引用等）
+                │
+                ├─ 格式为 PDF：
+                │   └─ view('exports.{entity}') → containHtml() → PdfGenerator::fromHtml()
+                │         │
+                │         ├─ Engine: DomPDF（默认，PHP 实现）
+                │         ├─ Engine: WkHtml（需配置二进制路径）
+                │         └─ Engine: Command（自定义 shell 命令）
+                │
+                ├─ 格式为 HTML：
+                │   └─ view('exports.{entity}') → containHtml()
+                │         │
+                │         ├─ 图片转 base64 内嵌
+                │         └─ 相对链接转绝对 URL
+                │
+                ├─ 格式为 Markdown：
+                │   └─ 有 markdown → 直接使用
+                │   └─ 无 markdown → HtmlToMarkdown::convert()
+                │
+                ├─ 格式为 PlainText：
+                │   └─ HtmlToPlainText::convert()
+                │
+                └─ 格式为 ZIP：
+                      └─ ZipExportBuilder::buildFor{Entity}()
+                            │
+                            ├─ ZipExportFiles::generateFor{Entity}()
+                            ├─ 导出 Markdown 文件
+                            ├─ 导出图片（转本地文件）
+                            ├─ 导出附件
+                            ├─ 导出标签 JSON
+                            └─ 打包 index.json 元数据
+```
+
+### 12.2 核心类与职责
+
+#### 12.2.1 ExportFormatter (`app/Exports/ExportFormatter.php`)
+
+**导出格式化核心类**，提供各实体到各格式的转换方法。
+
+**支持的导出矩阵**：
+
+| | Page | Chapter | Book |
+|---|---|---|---|
+| PDF | `pageToPdf()` | `chapterToPdf()` | `bookToPdf()` |
+| HTML | `pageToContainedHtml()` | `chapterToContainedHtml()` | `bookToContainedHtml()` |
+| Markdown | `pageToMarkdown()` | `chapterToMarkdown()` | `bookToMarkdown()` |
+| PlainText | `pageToPlainText()` | `chapterToPlainText()` | `bookToPlainText()` |
+| ZIP | 独立构建器 | 独立构建器 | 独立构建器 |
+
+**HTML 自包含处理 `containHtml()`**：
+
+```php
+protected function containHtml(string $htmlContent): string
+{
+    // 1. 图片：src URL → base64 内嵌
+    // <img src="/uploads/xxx.png"> → <img src="data:image/png;base64,...">
+    foreach ($imageTagsOutput[0] as $index => $imgMatch) {
+        $imageEncoded = $this->imageService->imageUrlToBase64($srcString);
+        $htmlContent = str_replace($srcString, $imageEncoded, $htmlContent);
+    }
+
+    // 2. 链接：相对路径 → 绝对 URL
+    // <a href="/books/xxx"> → <a href="https://example.com/books/xxx">
+    foreach ($linksOutput[0] as $index => $linkMatch) {
+        if (!str_starts_with(trim($srcString), 'http')) {
+            $newSrcString = url($srcString);
+            $htmlContent = str_replace($oldLinkString, $newLinkString, $htmlContent);
+        }
+    }
+
+    return $htmlContent;
+}
+```
+
+**PDF 特殊处理**（在 `htmlToPdf()` 中）：
+
+```php
+protected function htmlToPdf(string $html): string
+{
+    $html = $this->containHtml($html);
+    $doc = new HtmlDocument();
+    $doc->loadCompleteHtml($html);
+
+    // 1. 将 iframe 替换为文本链接（PDF 不支持 iframe）
+    $this->replaceIframesWithLinks($doc);
+    // <iframe src="..."> → <p><a href="...">https://...</a></p>
+
+    // 2. 展开所有 <details> 元素（PDF 不支持折叠交互）
+    $this->openDetailElements($doc);
+    // <details> → <details open="open">
+
+    $cleanedHtml = $doc->getHtml();
+    return $this->pdfGenerator->fromHtml($cleanedHtml);
+}
+```
+
+**Markdown 转换规则**：
+
+```php
+public function pageToMarkdown(Page $page): string
+{
+    // 如果页面原生存储了 Markdown（用 Markdown 编辑器编辑的），直接使用
+    if ($page->markdown) {
+        return '# ' . $page->name . "\n\n" . $page->markdown;
+    }
+
+    // 否则从 HTML 转换
+    return '# ' . $page->name . "\n\n" . (new HtmlToMarkdown($page->html))->convert();
+}
+```
+
+**批量导出（Book/Chapter）**：
+
+```php
+// 导出册为 Markdown
+public function bookToMarkdown(Book $book): string
+{
+    $bookTree = (new BookContents($book))->getTree(false, true);
+    $text = '# ' . $book->name . "\n\n";
+
+    // 描述信息
+    $description = (new HtmlToMarkdown($book->descriptionInfo()->getHtml()))->convert();
+    if ($description) {
+        $text .= $description . "\n\n";
+    }
+
+    // 遍历章和页
+    foreach ($bookTree as $bookChild) {
+        if ($bookChild instanceof Chapter) {
+            $text .= $this->chapterToMarkdown($bookChild) . "\n\n";
+        } else {
+            $text .= $this->pageToMarkdown($bookChild) . "\n\n";
+        }
+    }
+
+    return trim($text);
+}
+```
+
+#### 12.2.2 PdfGenerator (`app/Exports/PdfGenerator.php`)
+
+**PDF 生成引擎选择器**，支持三种后端。
+
+**引擎选择优先级**：
+
+```php
+public function getActiveEngine(): string
+{
+    // 1. 配置了自定义命令 → 使用命令引擎
+    if (config('exports.pdf_command')) {
+        return self::ENGINE_COMMAND;
+    }
+
+    // 2. 配置了 wkhtmltopdf 且允许非信任服务端获取 → 使用 WkHtml
+    if ($this->getWkhtmlBinaryPath() && config('app.allow_untrusted_server_fetching') === true) {
+        return self::ENGINE_WKHTML;
+    }
+
+    // 3. 默认使用 DomPDF（纯 PHP 实现）
+    return self::ENGINE_DOMPDF;
+}
+```
+
+**三种引擎对比**：
+
+| 引擎 | 实现方式 | 优点 | 缺点 |
+|-----|---------|------|------|
+| DomPDF | PHP 库（默认） | 无需额外依赖、跨平台 | 复杂 CSS 支持有限、速度慢 |
+| WkHtml | wkhtmltopdf 二进制 | 渲染效果好、支持现代 CSS | 需要安装二进制文件 |
+| Command | 自定义 Shell 命令 | 完全灵活（可接 WeasyPrint 等） | 需要自行配置 |
+
+**DomPDF 自定义字体支持**：
+
+```php
+// 从 storage/fonts/dompdf/*.ttf 加载自定义字体
+// 字体文件命名规范：{FamilyName}-{Variation}.ttf
+// 例：NotoSansSC-Regular.ttf → family: noto sans sc, variation: normal
+protected function getUserDomPdfFontFamilies(): array
+{
+    $fontStore = storage_path('fonts/dompdf');
+    $fontFiles = glob($fontStore . DIRECTORY_SEPARATOR . '*.ttf');
+    // ... 自动生成 .ufm 字体度量文件并注册
+}
+```
+
+#### 12.2.3 导出控制器
+
+每个实体类型各有 Web 控制器和 API 控制器：
+
+| 实体 | Web 控制器 | API 控制器 |
+|------|-----------|-----------|
+| Page | `PageExportController` | `PageExportApiController` |
+| Chapter | `ChapterExportController` | `ChapterExportApiController` |
+| Book | `BookExportController` | `BookExportApiController` |
+
+**控制器通用模式**（以 Page 为例）：
+
+```php
+class PageExportController extends Controller
+{
+    public function __construct(
+        protected PageQueries $queries,
+        protected ExportFormatter $exportFormatter,
+    ) {
+        $this->middleware(Permission::ContentExport->middleware());  // 权限校验
+        $this->middleware('throttle:exports');  // 限流保护
+    }
+
+    public function pdf(string $bookSlug, string $pageSlug)
+    {
+        $page = $this->queries->findVisibleBySlugsOrFail($bookSlug, $pageSlug);
+        $page->html = (new PageContent($page))->render();  // 先渲染内容
+        $pdfContent = $this->exportFormatter->pageToPdf($page);
+        return $this->download()->directly($pdfContent, $pageSlug . '.pdf');
+    }
+
+    // html(), markdown(), plainText(), zip() 模式相同
+}
+```
+
+### 12.3 ZIP 导出结构
+
+```
+export.zip
+├── index.json          // 元数据（导出版本、实体类型、创建时间）
+├── book.json           // 册/章/页信息 JSON
+├── page-001.md         // 页面 Markdown
+├── page-002.md
+├── chapter-001/
+│   └── page-003.md
+├── images/
+│   ├── image-001.png
+│   └── image-002.jpg
+├── attachments/
+│   ├── file.pdf
+│   └── doc.xlsx
+└── tags.json           // 标签信息
+```
+
+---
+
+## 十三、Activity 审计链路
+
+### 13.1 审计系统架构
+
+```
+业务操作（创建/更新/删除/移动等）
+    │
+    └─ Activity::add(ActivityType::XXX, $entity)
+          │
+          └─ ActivityLogger::add()
+                │
+                ├─ 创建 Activity 记录
+                │     ├─ type: 活动类型
+                │     ├─ user_id: 当前用户
+                │     ├─ ip: 客户端 IP
+                │     ├─ detail: 描述信息
+                │     └─ loggable_id/loggable_type: 关联实体
+                │
+                ├─ setNotification()  // 闪存成功提示
+                ├─ dispatchWebhooks()  // 触发 Webhook 队列任务
+                ├─ NotificationManager::handle()  // 触发站内/邮件通知
+                └─ Theme::dispatch(ACTIVITY_LOGGED)  // 触发主题事件钩子
+```
+
+### 13.2 核心类与职责
+
+#### 13.2.1 ActivityType (`app/Activity/ActivityType.php`)
+
+**活动类型常量定义**，涵盖所有可审计操作。
+
+**四级实体相关的活动类型**：
+
+| 实体 | 创建 | 更新 | 删除 | 其他 |
+|-----|------|------|------|------|
+| Page | `PAGE_CREATE` | `PAGE_UPDATE` | `PAGE_DELETE` | `PAGE_RESTORE`, `PAGE_MOVE` |
+| Chapter | `CHAPTER_CREATE` | `CHAPTER_UPDATE` | `CHAPTER_DELETE` | `CHAPTER_MOVE` |
+| Book | `BOOK_CREATE`, `BOOK_CREATE_FROM_CHAPTER` | `BOOK_UPDATE` | `BOOK_DELETE` | `BOOK_SORT` |
+| Bookshelf | `BOOKSHELF_CREATE`, `BOOKSHELF_CREATE_FROM_BOOK` | `BOOKSHELF_UPDATE` | `BOOKSHELF_DELETE` | - |
+
+**其他活动类型**（节选）：
+
+- 评论：`COMMENTED_ON`, `COMMENT_CREATE`, `COMMENT_UPDATE`, `COMMENT_DELETE`
+- 权限：`PERMISSIONS_UPDATE`
+- 版本：`REVISION_RESTORE`, `REVISION_DELETE`
+- 回收站：`RECYCLE_BIN_EMPTY`, `RECYCLE_BIN_RESTORE`, `RECYCLE_BIN_DESTROY`
+- 认证：`AUTH_LOGIN`, `AUTH_REGISTER`, `AUTH_PASSWORD_RESET_REQUEST`
+- 用户/角色/API Token：`USER_CREATE`, `ROLE_UPDATE`, `API_TOKEN_DELETE` 等
+- 设置：`SETTINGS_UPDATE`, `MAINTENANCE_ACTION_RUN`
+- Webhook：`WEBHOOK_CREATE`, `WEBHOOK_UPDATE`, `WEBHOOK_DELETE`
+- 导入：`IMPORT_CREATE`, `IMPORT_RUN`, `IMPORT_DELETE`
+- 排序规则：`SORT_RULE_CREATE`, `SORT_RULE_UPDATE`, `SORT_RULE_DELETE`
+
+#### 13.2.2 ActivityLogger (`app/Activity/Tools/ActivityLogger.php`)
+
+**审计日志核心写入器**。
+
+**主入口方法 `add()`**：
+
+```php
+public function add(string $type, string|Loggable $detail = ''): void
+{
+    // 1. 处理 detail 参数
+    $detailToStore = ($detail instanceof Loggable) ? $detail->logDescriptor() : $detail;
+
+    // 2. 创建活动记录
+    $activity = $this->newActivityForUser($type);
+    $activity->detail = $detailToStore;
+
+    // 3. 如果传入的是 Entity，关联到该实体
+    if ($detail instanceof Entity) {
+        $activity->loggable_id = $detail->id;
+        $activity->loggable_type = $detail->getMorphClass();
+    }
+
+    $activity->save();
+
+    // 4. 触发副作用
+    $this->setNotification($type);  // 前端 flash 消息
+    $this->dispatchWebhooks($type, $detail);  // Webhook（异步队列）
+    $this->notifications->handle($activity, $detail, user());  // 通知系统
+    Theme::dispatch(ThemeEvents::ACTIVITY_LOGGED, $type, $detail);  // 主题事件
+}
+```
+
+**创建活动实例 `newActivityForUser()`**：
+
+```php
+protected function newActivityForUser(string $type): Activity
+{
+    return (new Activity())->forceFill([
+        'type'     => strtolower($type),
+        'user_id'  => user()->id,
+        'ip'       => IpFormatter::fromCurrentRequest()->format(),  // IP 脱敏处理
+    ]);
+}
+```
+
+**实体删除后的日志清理 `removeEntity()`**：
+
+```php
+// 当实体被永久删除时，将其活动日志与实体解绑
+// 保留日志记录但不再关联到已删除的实体
+public function removeEntity(Entity $entity): void
+{
+    $entity->activity()->update([
+        'detail'         => $entity->name,    // 保留实体名作为文本描述
+        'loggable_id'    => null,             // 清除关联 ID
+        'loggable_type'  => null,             // 清除关联类型
+    ]);
+}
+```
+
+#### 13.2.3 Activity (`app/Activity/Models/Activity.php`)
+
+**活动记录模型**。
+
+**表结构**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   activities                     │
+├──────────────────┬──────────────────────────────┤
+│ id               │ 主键                         │
+│ type             │ 活动类型（page_create 等）   │
+│ detail           │ 描述文本                     │
+│ user_id          │ 操作用户ID                   │
+│ ip               │ 客户端 IP 地址               │
+│ loggable_id      │ 关联实体ID（多态）           │
+│ loggable_type    │ 关联实体类型（多态）         │
+│ created_at       │ 操作时间                     │
+│ updated_at       │ 更新时间                     │
+└──────────────────┴──────────────────────────────┘
+```
+
+**关联方法**：
+
+```php
+// 多态关联到被操作的实体
+public function loggable(): MorphTo
+{
+    return $this->morphTo('loggable');
+}
+
+// 关联到操作执行者
+public function user(): BelongsTo
+{
+    return $this->belongsTo(User::class);
+}
+
+// 权限过滤用：通过 joint_permissions 关联
+public function jointPermissions(): HasMany
+{
+    return $this->hasMany(JointPermission::class, 'entity_id', 'loggable_id')
+        ->whereColumn('activities.loggable_type', '=', 'joint_permissions.entity_type');
+}
+```
+
+**辅助方法**：
+
+```php
+// 获取活动的文本描述（从翻译文件查找）
+public function getText(): string
+{
+    return trans('activities.' . $this->type);
+}
+
+// 判断是否为实体相关活动
+public function isForEntity(): bool
+{
+    return Str::startsWith($this->type, [
+        'page_', 'chapter_', 'book_', 'bookshelf_',
+    ]);
+}
+```
+
+#### 13.2.4 NotificationManager (`app/Activity/Notifications/NotificationManager.php`)
+
+基于 Activity 的通知分发系统，支持：
+
+- **CommentCreationNotificationHandler** - 新评论通知（给页面作者）
+- **CommentMentionNotificationHandler** - 评论中 @ 提及通知（给被提及用户）
+- **PageCreationNotificationHandler** - 新页面创建通知（给关注者）
+- **PageUpdateNotificationHandler** - 页面更新通知（给关注者）
+
+#### 13.2.5 Webhook 分发
+
+```php
+protected function dispatchWebhooks(string $type, string|Loggable $detail): void
+{
+    // 查询所有跟踪该事件类型的活跃 Webhook
+    $webhooks = Webhook::query()
+        ->whereHas('trackedEvents', function (Builder $query) use ($type) {
+            $query->where('event', '=', $type)
+                ->orWhere('event', '=', 'all');  // 'all' 表示跟踪所有事件
+        })
+        ->where('active', '=', true)
+        ->get();
+
+    // 异步分发
+    foreach ($webhooks as $webhook) {
+        dispatch(new DispatchWebhookJob($webhook, $type, $detail));
+    }
+}
+```
+
+### 13.3 Activity 调用栈（以 Page 操作为例）
+
+#### 13.3.1 创建页（发布草稿）
+
+```
+PageController::store()
+└─ PageRepo::publishDraft()
+      ├─ BaseRepo::update()
+      │    ├─ 保存实体
+      │    ├─ rebuildPermissions()
+      │    └─ indexForSearch()
+      ├─ RevisionRepo::storeNewForPage()  // 保存版本
+      └─ Activity::add(PAGE_CREATE, $draft)
+            └─ ActivityLogger::add()
+                  ├─ Activity::save()
+                  ├─ setNotification()
+                  ├─ dispatchWebhooks()
+                  ├─ NotificationManager::handle()
+                  └─ Theme::dispatch(ACTIVITY_LOGGED)
+```
+
+#### 13.3.2 更新页
+
+```
+PageController::update()
+└─ PageRepo::update()
+      ├─ BaseRepo::update()
+      │    ├─ 保存实体
+      │    └─ indexForSearch()
+      ├─ RevisionRepo::storeNewForPage()  // 保存新版本
+      └─ Activity::add(PAGE_UPDATE, $page)
+```
+
+#### 13.3.3 删除页（软删除）
+
+```
+PageController::destroy()
+└─ PageRepo::destroy()
+      ├─ TrashCan::softDestroyPage()
+      │    ├─ ensureDeletable()
+      │    ├─ Deletion::createForEntity()
+      │    └─ $page->delete()  // 软删除
+      ├─ Activity::add(PAGE_DELETE, $page)
+      └─ TrashCan::autoClearOld()
+```
+
+#### 13.3.4 移动页
+
+```
+PageController::move()
+└─ PageRepo::move()
+      ├─ ParentChanger::changeBook()
+      ├─ rebuildPermissions()
+      └─ Activity::add(PAGE_MOVE, $page)
+```
+
+#### 13.3.5 恢复修订
+
+```
+PageRepo::restoreRevision()
+├─ 恢复内容到页面
+├─ indexForSearch()
+├─ RevisionRepo::storeNewForPage()  // 保存恢复操作的新版本
+├─ Activity::add(PAGE_RESTORE, $page)
+└─ Activity::add(REVISION_RESTORE, $revision)
+```
+
+### 13.4 Entity 模型中的 Activity 接入点
+
+```php
+// Entity.php:214-217
+public function activity(): MorphMany
+{
+    return $this->morphMany(Activity::class, 'loggable')
+        ->orderBy('created_at', 'desc');
+}
+```
+
+所有四级实体都继承此方法，可以直接查询某个实体的活动历史：
+
+```php
+$activities = $page->activity()->take(10)->get();
+```
+
+### 13.5 审计日志查询入口
+
+| 功能 | 控制器 |
+|------|--------|
+| 审计日志页面 | `AuditLogController::index()` |
+| 审计日志 API | `AuditLogApiController::index()` |
+
+---
+
+## 十四、关键代码位置速查（完整）
+
+### 14.1 四级实体模型
+
+| 功能 | 文件位置 |
+|------|----------|
+| 实体基类 | `app/Entities/Models/Entity.php` |
+| BookChild 抽象类 | `app/Entities/Models/BookChild.php` |
+| 书架模型 | `app/Entities/Models/Bookshelf.php` |
+| 册模型 | `app/Entities/Models/Book.php` |
+| 章模型 | `app/Entities/Models/Chapter.php` |
+| 页模型 | `app/Entities/Models/Page.php` |
+| 内容数据表 | `app/Entities/Models/EntityPageData.php` |
+| 容器数据表 | `app/Entities/Models/EntityContainerData.php` |
+
+### 14.2 查询层
+
+| 功能 | 文件位置 |
+|------|----------|
+| 统一查询入口 | `app/Entities/Queries/EntityQueries.php` |
+| 书架查询 | `app/Entities/Queries/BookshelfQueries.php` |
+| 册查询 | `app/Entities/Queries/BookQueries.php` |
+| 章查询 | `app/Entities/Queries/ChapterQueries.php` |
+| 页查询 | `app/Entities/Queries/PageQueries.php` |
+
+### 14.3 Repository 层
+
+| 功能 | 文件位置 |
+|------|----------|
+| 基础 Repository | `app/Entities/Repos/BaseRepo.php` |
+| 书架 Repository | `app/Entities/Repos/BookshelfRepo.php` |
+| 册 Repository | `app/Entities/Repos/BookRepo.php` |
+| 章 Repository | `app/Entities/Repos/ChapterRepo.php` |
+| 页 Repository | `app/Entities/Repos/PageRepo.php` |
+| 修订 Repository | `app/Entities/Repos/RevisionRepo.php` |
+| 删除 Repository | `app/Entities/Repos/DeletionRepo.php` |
+
+### 14.4 辅助工具类
+
+| 功能 | 文件位置 |
+|------|----------|
+| 书籍内容树 | `app/Entities/Tools/BookContents.php` |
+| 混合实体加载器 | `app/Entities/Tools/MixedEntityListLoader.php` |
+| 垃圾桶工具类 | `app/Entities/Tools/TrashCan.php` |
+
+### 14.5 权限相关
 
 | 功能 | 文件位置 |
 |------|----------|
@@ -1359,21 +2187,59 @@ public function changes(string $bookSlug, string $pageSlug, int $revisionId)
 | 实体权限模型 | `app/Permissions/Models/EntityPermission.php` |
 | 联合权限模型 | `app/Permissions/Models/JointPermission.php` |
 
-### 10.2 软删除相关
+### 14.6 软删除相关
 
 | 功能 | 文件位置 |
 |------|----------|
-| 垃圾桶工具类 | `app/Entities/Tools/TrashCan.php` |
 | 删除记录模型 | `app/Entities/Models/Deletion.php` |
 | 回收站控制器 | `app/Entities/Controllers/RecycleBinController.php` |
 | 回收站 API 控制器 | `app/Entities/Controllers/RecycleBinApiController.php` |
-| 删除 Repository | `app/Entities/Repos/DeletionRepo.php` |
 
-### 10.3 版本管理相关
+### 14.7 版本管理相关
 
 | 功能 | 文件位置 |
 |------|----------|
 | 页面修订模型 | `app/Entities/Models/PageRevision.php` |
-| 修订 Repository | `app/Entities/Repos/RevisionRepo.php` |
 | 修订查询类 | `app/Entities/Queries/PageRevisionQueries.php` |
 | 修订控制器 | `app/Entities/Controllers/PageRevisionController.php` |
+
+### 14.8 全文搜索相关
+
+| 功能 | 文件位置 |
+|------|----------|
+| 搜索索引管理 | `app/Search/SearchIndex.php` |
+| 搜索词项模型 | `app/Search/SearchTerm.php` |
+| 搜索执行器 | `app/Search/SearchRunner.php` |
+| 搜索控制器 | `app/Search/SearchController.php` |
+| 搜索 API 控制器 | `app/Search/SearchApiController.php` |
+| 搜索选项 | `app/Search/SearchOptions.php` |
+| 文本分词器 | `app/Search/SearchTextTokenizer.php` |
+| 搜索结果格式化 | `app/Search/SearchResultsFormatter.php` |
+
+### 14.9 导出转换相关
+
+| 功能 | 文件位置 |
+|------|----------|
+| 导出格式化器 | `app/Exports/ExportFormatter.php` |
+| PDF 生成器 | `app/Exports/PdfGenerator.php` |
+| 页面导出控制器 | `app/Exports/Controllers/PageExportController.php` |
+| 章导出控制器 | `app/Exports/Controllers/ChapterExportController.php` |
+| 册导出控制器 | `app/Exports/Controllers/BookExportController.php` |
+| ZIP 导出构建器 | `app/Exports/ZipExports/ZipExportBuilder.php` |
+| ZIP 导出文件处理 | `app/Exports/ZipExports/ZipExportFiles.php` |
+| HTML→Markdown 转换 | `app/Entities/Tools/Markdown/HtmlToMarkdown.php` |
+| HTML→纯文本转换 | `app/Util/HtmlToPlainText.php` |
+
+### 14.10 Activity 审计相关
+
+| 功能 | 文件位置 |
+|------|----------|
+| Activity 模型 | `app/Activity/Models/Activity.php` |
+| Activity 类型枚举 | `app/Activity/ActivityType.php` |
+| Activity 日志写入器 | `app/Activity/Tools/ActivityLogger.php` |
+| Activity 查询类 | `app/Activity/ActivityQueries.php` |
+| IP 格式化器 | `app/Activity/Tools/IpFormatter.php` |
+| 通知管理器 | `app/Activity/Notifications/NotificationManager.php` |
+| Webhook 分发任务 | `app/Activity/DispatchWebhookJob.php` |
+| 审计日志控制器 | `app/Activity/Controllers/AuditLogController.php` |
+| 审计日志 API | `app/Activity/Controllers/AuditLogApiController.php` |

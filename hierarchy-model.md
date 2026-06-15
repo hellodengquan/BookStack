@@ -3103,3 +3103,1154 @@ public function __construct(...)
 | 复数选择器（非标准 Locale） | `app/Translation/MessageSelector.php` |
 | 翻译服务提供商 | `app/App/Providers/TranslationServiceProvider.php` |
 | Locale 配置 | `config/app.php` |
+
+---
+
+## 二十、SAML 与 OIDC 外部认证集成
+
+### 20.1 外部认证架构总览
+
+```
+┌───────────────────────────────────────────────────────────┐
+│              外部认证体系                                   │
+├───────────────────────────────────────────────────────────┤
+│                                                           │
+│  ① SocialAuth（OAuth 社交登录）                           │
+│     Google / GitHub / Facebook / Twitter / Azure          │
+│     Okta / GitLab / Slack / Twitch / Discord              │
+│                                                           │
+│  ② SAML 2.0 企业认证                                      │
+│     基于 onelogin/php-saml 库                             │
+│                                                           │
+│  ③ OpenID Connect (OIDC)                                  │
+│     基于 league/oauth2-client + 自定义 JWT 验证           │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
+      │
+      ▼
+  RegistrationService::findOrRegister()  // 查找或创建用户
+      │
+      └─ LoginService::login()  // 统一登录入口
+            │
+            ├─ MFA 检查（needsMfaVerification）
+            ├─ 邮箱确认检查（awaitingEmailConfirmation）
+            └─ Activity::add(AUTH_LOGIN)
+```
+
+### 20.2 SocialAuth 社交认证
+
+#### 20.2.1 SocialDriverManager - 驱动管理器
+
+```php
+// app/Access/SocialDriverManager.php
+class SocialDriverManager
+{
+    // 内置支持 10 种驱动
+    protected array $validDrivers = [
+        'google', 'github', 'facebook', 'slack', 'twitter',
+        'azure', 'okta', 'gitlab', 'twitch', 'discord',
+    ];
+
+    // 检查驱动是否配置（client_id + client_secret + callback_url）
+    protected function checkDriverConfigured(string $driver): bool { ... }
+
+    // 每个驱动的配置选项
+    public function isAutoRegisterEnabled(string $driver): bool { ... }
+    public function isAutoConfirmEmailEnabled(string $driver): bool { ... }
+
+    // 支持通过 addSocialDriver() 动态添加自定义驱动
+    // 常用于主题/模块扩展
+    public function addSocialDriver(string $driverName, array $config, ...) { ... }
+}
+```
+
+#### 20.2.2 SocialController - 社交认证控制器
+
+```php
+// app/Access/Controllers/SocialController.php
+
+// 登录入口 → 重定向到认证服务
+public function login(string $socialDriver)
+{
+    session()->put('social-callback', 'login');
+    return $this->socialAuthService->startLogIn($socialDriver);
+}
+
+// 注册入口 → 重定向到认证服务
+public function register(string $socialDriver)
+{
+    $this->registrationService->ensureRegistrationAllowed();
+    session()->put('social-callback', 'register');
+    return $this->socialAuthService->startRegister($socialDriver);
+}
+
+// 回调处理
+public function callback(Request $request, string $socialDriver)
+{
+    $action = session()->pull('social-callback');
+    $socialUser = $this->socialAuthService->getSocialUser($socialDriver);
+
+    if ($action === 'login') {
+        try {
+            return $this->socialAuthService->handleLoginCallback($socialDriver, $socialUser);
+        } catch (SocialSignInAccountNotUsed $exception) {
+            // 如果开启自动注册，失败后自动走注册流程
+            if ($this->socialAuthService->drivers()->isAutoRegisterEnabled($socialDriver)) {
+                return $this->socialRegisterCallback($socialDriver, $socialUser);
+            }
+            throw $exception;
+        }
+    }
+}
+```
+
+#### 20.2.3 SocialAuthService - 核心服务
+
+**登录回调的 5 种场景处理**：
+
+| 场景 | 登录状态 | SocialAccount 存在 | 用户匹配 | 处理 |
+|------|---------|-------------------|---------|------|
+| ① | 未登录 | ✅ | - | 直接登录 |
+| ② | 已登录 | ❌ | - | 绑定到当前用户 |
+| ③ | 已登录 | ✅ | 当前用户 | 提示已绑定 |
+| ④ | 已登录 | ✅ | 其他用户 | 报错：已被其他账号绑定 |
+| ⑤ | 未登录 | ❌ | - | 报错：无对应账号（可配置自动注册） |
+
+```php
+// app/Access/SocialAuthService.php
+public function handleLoginCallback(string $socialDriver, SocialUser $socialUser)
+{
+    $socialAccount = SocialAccount::where('driver_id', '=', $socialUser->getId())->first();
+    $isLoggedIn = auth()->check();
+
+    // 场景 ①：未登录 + 账号存在 → 直接登录
+    if (!$isLoggedIn && $socialAccount !== null) {
+        $this->loginService->login($socialAccount->user, $socialDriver);
+        return redirect()->intended('/');
+    }
+
+    // 场景 ②：已登录 + 账号不存在 → 绑定
+    if ($isLoggedIn && $socialAccount === null) {
+        $account = $this->newSocialAccount($socialDriver, $socialUser);
+        $currentUser->socialAccounts()->save($account);
+        return redirect('/my-account/auth#social_accounts');
+    }
+
+    // ... 其他场景
+}
+```
+
+### 20.3 SAML 2.0 认证
+
+#### 20.3.1 Saml2Service - SAML 服务
+
+```php
+// app/Access/Saml2Service.php
+class Saml2Service
+{
+    // 基于 onelogin/php-saml 库实现
+    // 支持：SP 元数据、SSO、SLO、ACS、SLS
+
+    /**
+     * 发起登录：返回 IdP 登录 URL
+     */
+    public function login(): array
+    {
+        $toolKit = $this->getToolkit();
+        return [
+            'url' => $toolKit->login($returnRoute, [], false, false, true),
+            'id'  => $toolKit->getLastRequestID(),
+        ];
+    }
+
+    /**
+     * 处理 ACS 响应（IdP 回调）
+     */
+    public function processAcsResponse(?string $requestId, string $samlResponse): ?User
+    {
+        $_POST['SAMLResponse'] = $samlResponse;
+        $toolkit = $this->getToolkit();
+        $toolkit->processResponse($requestId);
+
+        if (!$toolkit->isAuthenticated()) {
+            return null;
+        }
+
+        $attrs = $toolkit->getAttributes();
+        $id = $toolkit->getNameId();
+        session()->put('saml2_session_index', $toolkit->getSessionIndex());
+
+        return $this->processLoginCallback($id, $attrs);
+    }
+
+    /**
+     * 处理登出（支持 SLO 单点登出）
+     */
+    public function logout(User $user): array { ... }
+
+    /**
+     * 生成 SP 元数据 XML
+     */
+    public function metadata(): string { ... }
+}
+```
+
+#### 20.3.2 SAML 用户属性映射
+
+```php
+// 从 SAML 响应提取用户信息
+protected function getUserDetails(string $samlID, $samlAttributes): array
+{
+    // external_id_attribute 配置项 → 外部唯一 ID
+    // display_name_attributes 配置项 → 显示名（可多属性拼接）
+    // email_attribute 配置项 → 邮箱
+    // group_attribute 配置项 → 用户组（用于角色同步）
+
+    return [
+        'external_id' => $externalId,
+        'name'        => $displayName,
+        'email'       => $email,
+        'saml_id'     => $samlID,
+    ];
+}
+```
+
+#### 20.3.3 SAML 配置项
+
+| 配置项 | 说明 |
+|-------|------|
+| `saml2.onelogin.*` | onelogin/php-saml 库的原生配置 |
+| `saml2.autoload_from_metadata` | 自动从 IdP 元数据 URL 加载配置 |
+| `saml2.external_id_attribute` | 外部 ID 字段映射 |
+| `saml2.display_name_attributes` | 显示名字段（数组，可拼接） |
+| `saml2.email_attribute` | 邮箱字段映射 |
+| `saml2.group_attribute` | 用户组字段映射 |
+| `saml2.user_to_groups` | 是否启用组同步 |
+| `saml2.remove_from_groups` | 是否将用户从不存在的组中移除 |
+| `saml2.dump_user_details` | 调试模式：输出用户详情 |
+
+### 20.4 OpenID Connect (OIDC) 认证
+
+#### 20.4.1 OidcService - OIDC 服务
+
+```php
+// app/Access/Oidc/OidcService.php
+class OidcService
+{
+    /**
+     * 发起授权请求
+     * @return array{url: string, state: string}
+     */
+    public function login(): array
+    {
+        $settings = $this->getProviderSettings();
+        $provider = $this->getProvider($settings);
+
+        $url = $provider->getAuthorizationUrl();
+        session()->put('oidc_pkce_code', $provider->getPkceCode() ?? '');
+
+        // 主题钩子：允许修改重定向 URL
+        $returnUrl = Theme::dispatch(ThemeEvents::OIDC_AUTH_PRE_REDIRECT, $url);
+
+        return ['url' => $url, 'state' => $provider->getState()];
+    }
+
+    /**
+     * 处理授权回调
+     */
+    public function processAuthorizeResponse(?string $authorizationCode): User
+    {
+        $settings = $this->getProviderSettings();
+        $provider = $this->getProvider($settings);
+
+        // 验证 PKCE
+        $pkceCode = session()->pull('oidc_pkce_code', '');
+        $provider->setPkceCode($pkceCode);
+
+        // 用授权码换 Access Token
+        $accessToken = $provider->getAccessToken('authorization_code', [
+            'code' => $authorizationCode,
+        ]);
+
+        return $this->processAccessTokenCallback($accessToken, $settings);
+    }
+}
+```
+
+#### 20.4.2 ID Token 验证流程
+
+```php
+protected function processAccessTokenCallback(OidcAccessToken $accessToken, ...): User
+{
+    // 1. 解析 ID Token（JWT）
+    $idToken = new OidcIdToken($idTokenText, $settings->issuer, $settings->keys);
+
+    // 2. 主题钩子：允许修改 claims
+    $returnClaims = Theme::dispatch(ThemeEvents::OIDC_ID_TOKEN_PRE_VALIDATE, ...);
+    if (!is_null($returnClaims)) {
+        $idToken->replaceClaims($returnClaims);
+    }
+
+    // 3. 调试模式
+    if ($this->config()['dump_user_details']) {
+        throw new JsonDebugException($idToken->getAllClaims());
+    }
+
+    // 4. 验证 Token（issuer、audience、签名、过期时间等）
+    $idToken->validate($settings->clientId);
+
+    // 5. 提取用户详情（从 ID Token + userinfo endpoint）
+    $userDetails = $this->getUserDetailsFromToken($idToken, $accessToken, $settings);
+
+    // 6. 查找或注册用户
+    $user = $this->registrationService->findOrRegister(
+        $userDetails->name, $userDetails->email, $userDetails->externalId
+    );
+
+    // 7. 可选：头像同步
+    if ($this->config()['fetch_avatar'] && !$user->avatar()->exists() && $userDetails->picture) {
+        $this->userAvatars->assignToUserFromUrl($user, $userDetails->picture);
+    }
+
+    // 8. 可选：组同步
+    if ($this->shouldSyncGroups()) {
+        $this->groupService->syncUserWithFoundGroups($user, $userDetails->groups ?? [], ...);
+    }
+
+    // 9. 登录
+    $this->loginService->login($user, 'oidc');
+
+    return $user;
+}
+```
+
+#### 20.4.3 OIDC 配置项
+
+| 配置项 | 说明 |
+|-------|------|
+| `oidc.client_id` | 客户端 ID |
+| `oidc.client_secret` | 客户端密钥 |
+| `oidc.issuer` | Issuer URL |
+| `oidc.discover` | 是否启用 OIDC Discovery 自动发现 |
+| `oidc.authorization_endpoint` | 授权端点 |
+| `oidc.token_endpoint` | Token 端点 |
+| `oidc.userinfo_endpoint` | Userinfo 端点 |
+| `oidc.end_session_endpoint` | 登出端点（RP-initiated logout） |
+| `oidc.jwt_public_key` | JWT 签名公钥 |
+| `oidc.additional_scopes` | 额外 scope（逗号分隔） |
+| `oidc.external_id_claim` | 外部 ID claim 名 |
+| `oidc.display_name_claims` | 显示名 claim |
+| `oidc.groups_claim` | 用户组 claim |
+| `oidc.user_to_groups` | 是否启用组同步 |
+| `oidc.remove_from_groups` | 是否移除不在组中的用户角色 |
+| `oidc.fetch_avatar` | 是否同步头像 |
+| `oidc.dump_user_details` | 调试模式 |
+
+### 20.5 统一用户注册流程
+
+```php
+// RegistrationService::findOrRegister()
+public function findOrRegister(string $name, string $email, string $externalId): User
+{
+    // 1. 按 external_auth_id 查找用户
+    $user = User::query()->where('external_auth_id', '=', $externalId)->first();
+
+    if (is_null($user)) {
+        $userData = [
+            'name'             => $name,
+            'email'            => $email,
+            'password'         => Str::random(32),  // 随机密码，外部认证用户不使用
+            'external_auth_id' => $externalId,
+        ];
+        $user = $this->registerUser($userData, null, false);
+    }
+    return $user;
+}
+```
+
+### 20.6 GroupSyncService - 组同步
+
+SAML/OIDC 都支持用户组与系统角色的同步：
+
+```php
+// app/Access/GroupSyncService.php
+class GroupSyncService
+{
+    /**
+     * 将外部组映射到内部角色
+     */
+    public function syncUserWithFoundGroups(User $user, array $externalGroups, bool $detachExisting): void
+    {
+        $matchedRoleIds = $this->matchGroupsToRoles($externalGroups);
+
+        if ($detachExisting) {
+            // 全量同步：只保留匹配的角色
+            $user->roles()->sync($matchedRoleIds);
+        } else {
+            // 增量同步：添加匹配的角色
+            $user->roles()->attach($matchedRoleIds);
+        }
+
+        // 同步默认角色（如果用户没有任何角色）
+        if ($user->roles()->count() === 0) {
+            $user->attachDefaultRole();
+        }
+    }
+}
+```
+
+---
+
+## 二十一、API Token 生命周期
+
+### 21.1 API Token 架构
+
+```
+API 请求进入
+    │
+    └─ api middlewareGroup: ApiAuthenticate::handle()
+          │
+          ├─ 有 Session 会话？
+          │     ├─ 是 → 检查权限 + 只允许 GET 请求（便捷浏览）
+          │     └─ 否 → 切换到 api guard → ApiTokenGuard::authenticate()
+          │
+          └─ ApiTokenGuard
+                │
+                ├─ ① 解析 Authorization: Token {id}:{secret}
+                ├─ ② 按 token_id 查询 ApiToken
+                ├─ ③ Hash::check(secret, token.secret)
+                ├─ ④ 检查 expires_at 是否已过期
+                ├─ ⑤ 检查用户是否有 AccessApi 权限
+                └─ ⑥ 检查邮箱是否已确认
+```
+
+### 21.2 ApiToken 模型
+
+```php
+// app/Api/ApiToken.php
+class ApiToken extends Model implements Loggable
+{
+    protected $fillable = ['name', 'expires_at'];
+    protected $casts = ['expires_at' => 'date:Y-m-d'];
+
+    // 所属用户
+    public function user(): BelongsTo { ... }
+
+    // 默认过期时间：100 年后（即永不过期）
+    public static function defaultExpiry(): string
+    {
+        return Carbon::now()->addYears(100)->format('Y-m-d');
+    }
+}
+```
+
+**api_tokens 表结构**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  api_tokens                      │
+├──────────────────┬──────────────────────────────┤
+│ id               │ 主键                         │
+│ user_id          │ 所属用户ID                   │
+│ token_id         │ 公开 ID（用于查询）         │
+│ secret           │ 密钥哈希（Hash::make）       │
+│ name             │ Token 名称（用户自定义）     │
+│ expires_at       │ 过期时间                     │
+│ created_at       │ 创建时间                     │
+│ updated_at       │ 更新时间                     │
+└──────────────────┴──────────────────────────────┘
+```
+
+### 21.3 Token 创建流程
+
+```php
+// UserApiTokenController::store()
+public function store(Request $request, int $userId)
+{
+    // 1. 验证权限
+    $this->checkPermission(Permission::AccessApi);
+
+    // 2. 生成随机 ID 和密钥
+    $secret = Str::random(32);
+    $token = (new ApiToken())->forceFill([
+        'name'       => $request->input('name'),
+        'token_id'   => Str::random(32),  // 32 字符 ID
+        'secret'     => Hash::make($secret),  // 哈希存储
+        'user_id'    => $user->id,
+        'expires_at' => $request->input('expires_at') ?: ApiToken::defaultExpiry(),
+    ]);
+
+    // 3. 确保 token_id 唯一（极小概率冲突）
+    while (ApiToken::query()->where('token_id', '=', $token->token_id)->exists()) {
+        $token->token_id = Str::random(32);
+    }
+
+    $token->save();
+
+    // 4. secret 仅在创建后通过 session flash 显示一次
+    session()->flash('api-token-secret:' . $token->id, $secret);
+
+    return redirect($token->getUrl());
+}
+```
+
+> **安全要点**：
+> - `token_id` 是公开的（用于查询）
+> - `secret` 只在创建时显示一次，数据库中以哈希存储
+> - 请求格式：`Authorization: Token {token_id}:{secret}`
+
+### 21.4 Token 验证流程
+
+```php
+// ApiTokenGuard::getAuthorisedUserFromRequest()
+protected function getAuthorisedUserFromRequest(): Authenticatable
+{
+    // ① 解析请求头
+    $authToken = trim($this->request->headers->get('Authorization', ''));
+    $this->validateTokenHeaderValue($authToken);
+
+    // ② 拆分 id:secret
+    [$id, $secret] = explode(':', str_replace('Token ', '', $authToken));
+
+    // ③ 查询 Token（预加载 user）
+    $token = ApiToken::query()
+        ->where('token_id', '=', $id)
+        ->with(['user'])->first();
+
+    // ④ 验证（4 关）
+    $this->validateToken($token, $secret);
+    //   1. token 是否存在
+    //   2. secret 是否匹配（Hash::check）
+    //   3. 是否已过期（expires_at <= now）
+    //   4. 用户是否有 AccessApi 权限
+
+    // ⑤ 邮箱确认检查
+    if ($this->loginService->awaitingEmailConfirmation($token->user)) {
+        throw new ApiAuthException(trans('errors.email_confirmation_awaiting'));
+    }
+
+    return $token->user;
+}
+```
+
+### 21.5 ApiAuthenticate 中间件
+
+```php
+// app/Http/Middleware/ApiAuthenticate.php
+class ApiAuthenticate
+{
+    public function handle(Request $request, Closure $next)
+    {
+        $this->ensureAuthorizedBySessionOrToken($request);
+        return $next($request);
+    }
+
+    protected function ensureAuthorizedBySessionOrToken(Request $request): void
+    {
+        // ① 如果已有会话（Cookie 认证）
+        if (session()->isStarted()) {
+            // 有会话 → 只允许 GET 请求（方便在浏览器中直接浏览 API）
+            if ($request->method() !== 'GET') {
+                throw new ApiAuthException(trans('errors.api_cookie_auth_only_get'), 403);
+            }
+            if (!$this->sessionUserHasApiAccess()) {
+                throw new ApiAuthException(trans('errors.api_user_no_api_permission'), 403);
+            }
+            return;
+        }
+
+        // ② 无会话 → 切换到 api guard 用 Token 认证
+        auth()->shouldUse('api');
+        auth()->authenticate();
+    }
+}
+```
+
+### 21.6 Token 生命周期总结
+
+| 阶段 | 操作 | 位置 |
+|-----|------|------|
+| 创建 | 生成 token_id + secret + Hash 存储 | `UserApiTokenController::store()` |
+| 查看 | 仅显示基本信息，secret 不返回 | `UserApiTokenController::edit()` |
+| 更新 | 仅可修改 name 和 expires_at | `UserApiTokenController::update()` |
+| 删除 | 直接 delete | `UserApiTokenController::destroy()` |
+| 验证 | Authorization header → 4 步校验 | `ApiTokenGuard::validateToken()` |
+| 过期 | expires_at 字段自动判断 | `ApiTokenGuard::validateToken()` |
+
+---
+
+## 二十二、Notification 与邮件分发
+
+### 22.1 Notification 系统架构
+
+```
+Activity::add(type, entity)
+    │
+    └─ ActivityLogger::add()
+          │
+          └─ NotificationManager::handle()
+                │
+                └─ handlersByActivity[type]  // 按活动类型分发
+                      │
+                      ├─ PageCreationNotificationHandler  → 页面创建通知
+                      ├─ PageUpdateNotificationHandler    → 页面更新通知
+                      ├─ CommentCreationNotificationHandler → 评论创建通知
+                      └─ CommentMentionNotificationHandler  → 评论 @ 提及通知
+                            │
+                            └─ sendNotificationToUserIds()
+                                  │
+                                  ├─ 排除触发者本人
+                                  ├─ 检查 ReceiveNotifications 权限
+                                  ├─ 检查内容可见权限
+                                  └─ $user->notify(new XxxNotification(...))
+                                        │
+                                        └─ BaseActivityNotification
+                                              ├─ toArray() → 站内通知（database）
+                                              └─ toMail()  → 邮件通知
+                                                    │
+                                                    └─ MailNotification + Queueable
+                                                          └─ locale 切换
+```
+
+### 22.2 NotificationManager - 通知管理器
+
+```php
+// app/Activity/Notifications/NotificationManager.php
+class NotificationManager
+{
+    // 活动类型 → 处理器映射
+    protected array $handlersByActivity = [];
+
+    // 注册默认处理器
+    public function loadDefaultHandlers(): void
+    {
+        $this->registerHandler(ActivityType::PAGE_CREATE, PageCreationNotificationHandler::class);
+        $this->registerHandler(ActivityType::PAGE_UPDATE, PageUpdateNotificationHandler::class);
+        $this->registerHandler(ActivityType::COMMENT_CREATE, CommentCreationNotificationHandler::class);
+        $this->registerHandler(ActivityType::COMMENT_CREATE, CommentMentionNotificationHandler::class);
+        $this->registerHandler(ActivityType::COMMENT_UPDATE, CommentMentionNotificationHandler::class);
+    }
+
+    // 执行分发
+    public function handle(Activity $activity, string|Loggable $detail, User $user): void
+    {
+        $activityType = $activity->type;
+        $handlersToRun = $this->handlersByActivity[$activityType] ?? [];
+
+        foreach ($handlersToRun as $handlerClass) {
+            $handler = new $handlerClass();
+            $handler->handle($activity, $detail, $user);
+        }
+    }
+}
+```
+
+### 22.3 四类通知处理器
+
+#### 22.3.1 PageCreationNotificationHandler - 页面创建
+
+通知范围：关注该书籍的用户
+
+```php
+class PageCreationNotificationHandler extends BaseNotificationHandler
+{
+    public function handle(Activity $activity, ..., User $user): void
+    {
+        if (!($detail instanceof Page)) {
+            throw new \InvalidArgumentException(...);
+        }
+
+        // 获取所有关注者（关注 Book 或 Chapter 或 Page 的）
+        $watchers = new EntityWatchers($detail, WatchLevels::UPDATES);
+        $watcherIds = $watchers->getWatcherUserIds();
+
+        $this->sendNotificationToUserIds(
+            PageCreationNotification::class,
+            $watcherIds, $user, $detail, $detail
+        );
+    }
+}
+```
+
+#### 22.3.2 PageUpdateNotificationHandler - 页面更新
+
+通知范围：关注者 + 页面拥有者（根据偏好）
+
+```php
+class PageUpdateNotificationHandler extends BaseNotificationHandler
+{
+    public function handle(Activity $activity, ...): void
+    {
+        // 防抖：同一用户 15 分钟内的多次更新只发一次通知
+        $lastUpdate = $detail->activity()
+            ->where('type', '=', ActivityType::PAGE_UPDATE)
+            ->where('id', '!=', $activity->id)
+            ->latest('created_at')
+            ->first();
+
+        if ($lastUpdate && $lastUpdate->user_id === $user->id) {
+            if ($lastUpdate->created_at->gt(now()->subMinutes(15))) {
+                return;  // 15 分钟内同一用户更新 → 跳过
+            }
+        }
+
+        // 关注者
+        $watchers = new EntityWatchers($detail, WatchLevels::UPDATES);
+        $watcherIds = $watchers->getWatcherUserIds();
+
+        // 页面拥有者（根据通知偏好）
+        if ($detail->owned_by && !$watchers->isUserIgnoring($detail->owned_by)) {
+            $userNotificationPrefs = new UserNotificationPreferences($detail->ownedBy);
+            if ($userNotificationPrefs->notifyOnOwnPageChanges()) {
+                $watcherIds[] = $detail->owned_by;
+            }
+        }
+
+        $this->sendNotificationToUserIds(
+            PageUpdateNotification::class, $watcherIds, $user, $detail, $detail
+        );
+    }
+}
+```
+
+#### 22.3.3 CommentCreationNotificationHandler - 评论创建
+
+通知范围：页面作者（收到新评论通知）
+
+#### 22.3.4 CommentMentionNotificationHandler - @ 提及
+
+通知范围：被 @ 提及的用户
+
+### 22.4 通知发送过滤（BaseNotificationHandler）
+
+```php
+abstract class BaseNotificationHandler implements NotificationHandler
+{
+    protected function sendNotificationToUserIds(
+        string $notification, array $userIds,
+        User $initiator, string|Loggable $detail, Entity $relatedModel
+    ): void {
+        $users = User::query()->whereIn('id', array_unique($userIds))->get();
+
+        foreach ($users as $user) {
+            // ① 排除触发者自己
+            if ($user->id === $initiator->id) {
+                continue;
+            }
+
+            // ② 检查接收通知权限
+            if (!$user->can(Permission::ReceiveNotifications)) {
+                continue;
+            }
+
+            // ③ 检查内容可见权限（看不到内容就不通知）
+            $permissions = new PermissionApplicator($user);
+            if (!$permissions->checkOwnableUserAccess($relatedModel, 'view')) {
+                continue;
+            }
+
+            // ④ 发送通知
+            try {
+                $user->notify(new $notification($detail, $initiator));
+            } catch (\Exception $exception) {
+                Log::error("Failed to send email notification ...");
+            }
+        }
+    }
+}
+```
+
+### 22.5 BaseActivityNotification - 通知基类
+
+```php
+// app/Activity/Notifications/Messages/BaseActivityNotification.php
+abstract class BaseActivityNotification extends MailNotification
+{
+    use Queueable;  // 支持队列异步发送
+
+    public function __construct(
+        protected Loggable|string $detail,
+        protected User $user,  // 触发通知的用户
+    ) {}
+
+    // 站内通知数据
+    public function toArray($notifiable): array
+    {
+        return [
+            'activity_detail' => $this->detail,
+            'activity_creator' => $this->user,
+        ];
+    }
+
+    // 辅助：构建页面路径（Book > Chapter），考虑权限可见性
+    protected function buildPagePathLine(Page $page, User $notifiable): ?EntityPathMessageLine
+    {
+        $permissions = new PermissionApplicator($notifiable);
+        $path = array_filter([$page->book, $page->chapter], function (?Entity $entity) use ($permissions) {
+            return !is_null($entity) && $permissions->checkOwnableUserAccess($entity, 'view');
+        });
+        return empty($path) ? null : new EntityPathMessageLine($path);
+    }
+}
+```
+
+### 22.6 MailNotification - 邮件基类
+
+```php
+// app/App/MailNotification.php
+abstract class MailNotification extends Notification
+{
+    public function via($notifiable)
+    {
+        return ['mail', 'database'];  // 同时发邮件 + 站内通知
+    }
+
+    public function toMail($notifiable)
+    {
+        // 切换到接收者的语言环境
+        $locale = $notifiable->getLocale();
+        ...
+    }
+}
+```
+
+### 22.7 关注体系（Watch）
+
+```
+用户关注实体（Book / Chapter / Page）
+    │
+    ├─ 级别：不关注 / 关注更新 / 关注评论
+    │
+    └─ EntityWatchers - 计算关注者
+          │
+          ├─ 直接关注当前实体的用户
+          ├─ 关注父级（章 → 册）的用户（继承）
+          └─ 排除设置了忽略的用户
+```
+
+### 22.8 通知偏好设置
+
+```
+用户通知偏好（UserNotificationPreferences）
+    ├─ notifyOnOwnPageChanges()  // 自己的页面有更新时是否通知自己
+    └─ ... 其他偏好
+```
+
+---
+
+## 二十三、Attachment 附件资源接入
+
+### 23.1 Attachment 系统架构
+
+```
+页面附件管理
+    │
+    ├─ 上传文件 → AttachmentService::saveNewUpload()
+    │     │
+    │     ├─ 验证文件大小（upload_limit 配置）
+    │     ├─ FileStorage::uploadFile() 存储到磁盘
+    │     │     └─ 路径：uploads/files/YYYY-MM/{hash}.{ext}
+    │     └─ 创建 Attachment 记录
+    │
+    ├─ 上传链接 → AttachmentService::saveNewFromLink()
+    │     └─ external=true，path 存 URL
+    │
+    ├─ 访问附件 → AttachmentController::get()
+    │     ├─ 检查页面可见权限
+    │     ├─ external → 302 重定向
+    │     └─ 本地文件 → 流式下载 / 内联打开
+    │
+    └─ 删除附件 → AttachmentService::deleteFile()
+          ├─ external=false → FileStorage::delete()
+          └─ Attachment::delete()
+```
+
+### 23.2 Attachment 模型
+
+```php
+// app/Uploads/Attachment.php
+class Attachment extends Model implements OwnableInterface
+{
+    use HasCreatorAndUpdater;
+
+    protected $fillable = ['name', 'order'];
+    protected $hidden = ['path', 'page'];
+    protected $casts = ['external' => 'bool'];
+
+    // 所属页面
+    public function page(): BelongsTo
+    {
+        return $this->belongsTo(Page::class, 'uploaded_to');
+    }
+
+    // 通过 uploaded_to 关联页面权限（visibility 继承自页面）
+    public function jointPermissions(): HasMany
+    {
+        return $this->hasMany(JointPermission::class, 'entity_id', 'uploaded_to')
+            ->where('joint_permissions.entity_type', '=', 'page');
+    }
+
+    // 权限过滤作用域（继承页面权限）
+    public function scopeVisible(): Builder
+    {
+        $permissions = app()->make(PermissionApplicator::class);
+        return $permissions->restrictPageRelationQuery(
+            self::query(), 'attachments', 'uploaded_to'
+        );
+    }
+
+    // 下载文件名（如果 name 没扩展名就加上）
+    public function getFileName(): string { ... }
+
+    // 访问 URL（通过控制器中转，不暴露真实路径）
+    public function getUrl($openInline = false): string { ... }
+
+    // 编辑器插入内容（视频自动用 <video> 标签）
+    public function editorContent(): array {
+        $videoExtensions = ['mp4', 'webm', 'mkv', 'ogg', 'avi'];
+        if (in_array(strtolower($this->extension), $videoExtensions)) {
+            return ['text/html' => '<video src="..." controls>...</video>'];
+        }
+        return ['text/html' => $this->htmlLink(), 'text/plain' => $this->markdownLink()];
+    }
+}
+```
+
+**attachments 表结构**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  attachments                     │
+├──────────────────┬──────────────────────────────┤
+│ id               │ 主键                         │
+│ name             │ 显示名称                     │
+│ path             │ 存储路径（hidden）           │
+│ extension        │ 文件扩展名                   │
+│ uploaded_to      │ 所属页面 ID                 │
+│ external         │ 是否为外部链接               │
+│ order            │ 排序                         │
+│ created_by       │ 创建者ID                     │
+│ updated_by       │ 更新者ID                     │
+│ created_at       │ 创建时间                     │
+│ updated_at       │ 更新时间                     │
+└──────────────────┴──────────────────────────────┘
+```
+
+### 23.3 AttachmentService - 核心服务
+
+```php
+// app/Uploads/AttachmentService.php
+class AttachmentService
+{
+    public function __construct(protected FileStorage $storage) {}
+
+    /**
+     * 上传新文件
+     */
+    public function saveNewUpload(UploadedFile $uploadedFile, int $pageId): Attachment
+    {
+        $attachmentName = $uploadedFile->getClientOriginalName();
+        $attachmentPath = $this->putFileInStorage($uploadedFile);  // 存储到文件系统
+        $largestExistingOrder = Attachment::where('uploaded_to', '=', $pageId)->max('order');
+
+        return Attachment::forceCreate([
+            'name'        => $attachmentName,
+            'path'        => $attachmentPath,
+            'extension'   => $uploadedFile->getClientOriginalExtension(),
+            'uploaded_to' => $pageId,
+            'order'       => $largestExistingOrder + 1,
+            'created_by'  => user()->id,
+            'updated_by'  => user()->id,
+        ]);
+    }
+
+    /**
+     * 更新文件（重新上传）
+     */
+    public function saveUpdatedUpload(UploadedFile $uploadedFile, Attachment $attachment): Attachment
+    {
+        if (!$attachment->external) {
+            $this->deleteFileInStorage($attachment);  // 删除旧文件
+        }
+        // ... 保存新文件
+    }
+
+    /**
+     * 添加链接类型附件
+     */
+    public function saveNewFromLink(string $name, string $link, int $page_id): Attachment
+    {
+        return Attachment::forceCreate([
+            'name'        => $name,
+            'path'        => $link,
+            'external'    => true,
+            'extension'   => '',
+            'uploaded_to' => $page_id,
+            'order'       => $largestExistingOrder + 1,
+        ]);
+    }
+
+    /**
+     * 更新附件信息（名称/链接）
+     */
+    public function updateFile(Attachment $attachment, array $requestData): Attachment { ... }
+
+    /**
+     * 删除附件
+     */
+    public function deleteFile(Attachment $attachment)
+    {
+        if (!$attachment->external) {
+            $this->deleteFileInStorage($attachment);
+        }
+        $attachment->delete();
+    }
+
+    /**
+     * 更新排序
+     */
+    public function updateFileOrderWithinPage(array $attachmentOrder, string $pageId) { ... }
+
+    /**
+     * 流式读取
+     * @return resource|null
+     */
+    public function streamAttachmentFromStorage(Attachment $attachment)
+    {
+        return $this->storage->getReadStream($attachment->path);
+    }
+
+    /**
+     * 文件大小
+     */
+    public function getAttachmentFileSize(Attachment $attachment): int
+    {
+        return $this->storage->getSize($attachment->path);
+    }
+
+    // 文件验证规则：受 upload_limit 配置限制
+    public static function getFileValidationRules(): array
+    {
+        return ['file', 'max:' . (config('app.upload_limit') * 1000)];
+    }
+
+    // 存储路径：uploads/files/YYYY-MM-M/{hash}.{ext}
+    protected function putFileInStorage(UploadedFile $uploadedFile): string
+    {
+        $basePath = 'uploads/files/' . date('Y-m-M') . '/';
+        return $this->storage->uploadFile($uploadedFile, $basePath, $uploadedFile->getClientOriginalExtension(), '');
+    }
+}
+```
+
+### 23.4 AttachmentController - 控制器
+
+**路由与权限对应**：
+
+| 操作 | 权限 | 说明 |
+|-----|------|------|
+| upload | AttachmentCreateAll + PageUpdate | 上传新文件 |
+| uploadUpdate | PageUpdate + AttachmentUpdate | 更新文件 |
+| get | PageView（继承） | 查看/下载 |
+| listForPage | PageView | 附件列表 |
+| sortForPage | PageUpdate | 排序 |
+| delete | AttachmentDelete | 删除 |
+
+### 23.5 权限继承机制
+
+Attachment 不直接设置权限，而是**继承所属 Page 的权限**：
+
+```php
+// Attachment::scopeVisible()
+public function scopeVisible(): Builder
+{
+    $permissions = app()->make(PermissionApplicator::class);
+    return $permissions->restrictPageRelationQuery(
+        self::query(), 'attachments', 'uploaded_to'
+    );
+}
+```
+
+即：**能看到页面就能看到附件**。
+
+### 23.6 附件与页面删除的联动
+
+在 `TrashCan::destroyPage()` 中，永久删除页面时会清理附件：
+
+```php
+// TrashCan.php:destroyPage()
+protected function destroyPage(Page $page): int
+{
+    $this->destroyCommonRelations($page);
+
+    // 删除附件文件
+    $attachmentService = app()->make(AttachmentService::class);
+    foreach ($page->attachments as $attachment) {
+        $attachmentService->deleteFile($attachment);
+    }
+
+    // ... 其他清理
+    $page->forceDelete();
+    return 1;
+}
+```
+
+---
+
+## 二十四、完整代码位置速查表（终极版）
+
+### 24.1 SAML / OIDC / Social 认证
+
+| 功能 | 文件位置 |
+|------|----------|
+| 社交认证服务 | `app/Access/SocialAuthService.php` |
+| 社交驱动管理器 | `app/Access/SocialDriverManager.php` |
+| 社交认证控制器 | `app/Access/Controllers/SocialController.php` |
+| SAML 服务 | `app/Access/Saml2Service.php` |
+| SAML 控制器 | `app/Access/Controllers/Saml2Controller.php` |
+| OIDC 服务 | `app/Access/Oidc/OidcService.php` |
+| OIDC OAuth Provider | `app/Access/Oidc/OidcOAuthProvider.php` |
+| OIDC ID Token | `app/Access/Oidc/OidcIdToken.php` |
+| OIDC 用户详情 | `app/Access/Oidc/OidcUserDetails.php` |
+| OIDC 配置 | `app/Access/Oidc/OidcProviderSettings.php` |
+| OIDC 控制器 | `app/Access/Controllers/OidcController.php` |
+| 登录服务 | `app/Access/LoginService.php` |
+| 注册服务 | `app/Access/RegistrationService.php` |
+| 组同步服务 | `app/Access/GroupSyncService.php` |
+| 社交账号模型 | `app/Access/SocialAccount.php` |
+
+### 24.2 API Token
+
+| 功能 | 文件位置 |
+|------|----------|
+| ApiToken 模型 | `app/Api/ApiToken.php` |
+| API Token Guard | `app/Api/ApiTokenGuard.php` |
+| API 认证中间件 | `app/Http/Middleware/ApiAuthenticate.php` |
+| API Token 控制器 | `app/Api/UserApiTokenController.php` |
+| API 认证异常 | `app/Exceptions/ApiAuthException.php` |
+
+### 24.3 Notification 通知
+
+| 功能 | 文件位置 |
+|------|----------|
+| 通知管理器 | `app/Activity/Notifications/NotificationManager.php` |
+| 通知处理器接口 | `app/Activity/Notifications/Handlers/NotificationHandler.php` |
+| 基础通知处理器 | `app/Activity/Notifications/Handlers/BaseNotificationHandler.php` |
+| 页面创建通知 | `app/Activity/Notifications/Handlers/PageCreationNotificationHandler.php` |
+| 页面更新通知 | `app/Activity/Notifications/Handlers/PageUpdateNotificationHandler.php` |
+| 评论创建通知 | `app/Activity/Notifications/Handlers/CommentCreationNotificationHandler.php` |
+| @ 提及通知 | `app/Activity/Notifications/Handlers/CommentMentionNotificationHandler.php` |
+| 基础活动通知 | `app/Activity/Notifications/Messages/BaseActivityNotification.php` |
+| 邮件通知基类 | `app/App/MailNotification.php` |
+| 用户通知偏好 | `app/Settings/UserNotificationPreferences.php` |
+| 实体关注器 | `app/Activity/Tools/EntityWatchers.php` |
+| 关注级别 | `app/Activity/WatchLevels.php` |
+
+### 24.4 Attachment 附件
+
+| 功能 | 文件位置 |
+|------|----------|
+| Attachment 模型 | `app/Uploads/Attachment.php` |
+| Attachment 服务 | `app/Uploads/AttachmentService.php` |
+| 附件控制器 | `app/Uploads/Controllers/AttachmentController.php` |
+| 文件存储抽象 | `app/Uploads/FileStorage.php` |

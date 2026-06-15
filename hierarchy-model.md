@@ -2243,3 +2243,863 @@ $activities = $page->activity()->take(10)->get();
 | Webhook 分发任务 | `app/Activity/DispatchWebhookJob.php` |
 | 审计日志控制器 | `app/Activity/Controllers/AuditLogController.php` |
 | 审计日志 API | `app/Activity/Controllers/AuditLogApiController.php` |
+
+---
+
+## 十五、API 限流与 Throttle 链路
+
+### 15.1 限流系统架构
+
+```
+HTTP 请求进入
+    │
+    ├─ Kernel $middlewareAliases 注册 throttle 别名
+    │     └─ ThrottleRequests::class
+    │
+    ├─ RouteServiceProvider::configureRateLimiting()
+    │     │
+    │     ├─ RateLimiter::for('api', ...)        // API 路由
+    │     ├─ RateLimiter::for('public', ...)     // 公开路由
+    │     └─ RateLimiter::for('exports', ...)    // 导出路由
+    │
+    ├─ 路由 / 控制器 middleware 声明
+    │     ├─ 'api' middlewareGroup → ThrottleApiRequests::class
+    │     └─ 手动指定 → 'throttle:exports'
+    │
+    └─ 业务场景内的手动限流（trait）
+          ├─ ThrottlesLogins trait（登录限流）
+          └─ MfaVerificationLimiter（MFA 验证限流）
+```
+
+### 15.2 中间件注册与配置
+
+#### 15.2.1 Kernel 中间件注册 (`app/Http/Kernel.php`)
+
+```php
+// 路由中间件组
+protected $middlewareGroups = [
+    'web' => [
+        // ... CSP、Cookie、Session、CSRF、EmailCheck、Theme、Localization
+    ],
+    'api' => [
+        \BookStack\Http\Middleware\ThrottleApiRequests::class,  // ① API 限流
+        \BookStack\Http\Middleware\EncryptCookies::class,
+        \BookStack\Http\Middleware\StartSessionIfCookieExists::class,
+        \BookStack\Http\Middleware\ApiAuthenticate::class,
+        \BookStack\Http\Middleware\CheckEmailConfirmed::class,
+    ],
+];
+
+// 中间件别名（可在路由中通过字符串引用）
+protected $middlewareAliases = [
+    'auth'       => Authenticate::class,
+    'can'        => CheckUserHasPermission::class,
+    'throttle'   => \Illuminate\Routing\Middleware\ThrottleRequests::class,  // ② 通用限流
+    'mfa-setup'  => AuthenticatedOrPendingMfa::class,
+];
+```
+
+#### 15.2.2 RouteServiceProvider 限流配置
+
+```php
+// app/App/Providers/RouteServiceProvider.php:79-95
+protected function configureRateLimiting(): void
+{
+    // API 路由限流：登录用户按 user_id，访客按 IP
+    RateLimiter::for('api', function (Request $request) {
+        return Limit::perMinute(60)->by($request->user()?->id ?: $request->ip());
+    });
+
+    // 公开路由限流：按 IP
+    RateLimiter::for('public', function (Request $request) {
+        return Limit::perMinute(10)->by($request->ip());
+    });
+
+    // 导出限流：访客 4次/分，登录用户 10次/分
+    RateLimiter::for('exports', function (Request $request) {
+        $user = user();
+        $attempts = $user->isGuest() ? 4 : 10;
+        $key = $user->isGuest() ? $request->ip() : $user->id;
+        return Limit::perMinute($attempts)->by($key);
+    });
+}
+```
+
+### 15.3 三种限流配置对比
+
+| 配置名 | 适用范围 | 速率限制 | 标识 Key | 应用方式 |
+|-------|---------|---------|---------|---------|
+| `api` | API 接口 | 60 次/分 | user_id 或 IP | api middlewareGroup |
+| `public` | 公开路由 | 10 次/分 | IP | 路由手动指定 |
+| `exports` | 导出功能 | 访客 4/登录 10 次/分 | user_id 或 IP | 控制器 middleware |
+
+### 15.4 ThrottleApiRequests 自定义中间件
+
+```php
+// app/Http/Middleware/ThrottleApiRequests.php
+class ThrottleApiRequests extends ThrottleRequests
+{
+    /**
+     * 覆盖 resolveMaxAttempts，从配置文件 api.requests_per_minute 读取
+     * 而不是从路由参数中解析，允许管理员自定义 API 限流速率
+     */
+    protected function resolveMaxAttempts($request, $maxAttempts): int
+    {
+        return (int) config('api.requests_per_minute');
+    }
+}
+```
+
+### 15.5 导出限流接入点
+
+在三个导出控制器的构造函数中统一声明：
+
+```php
+class PageExportController extends Controller
+{
+    public function __construct(...)
+    {
+        $this->middleware(Permission::ContentExport->middleware());  // 权限
+        $this->middleware('throttle:exports');  // ← 限流
+    }
+}
+```
+
+**应用范围**：
+- `PageExportController` - 页面导出
+- `ChapterExportController` - 章节导出
+- `BookExportController` - 册导出
+
+### 15.6 业务场景内手动限流
+
+#### 15.6.1 登录限流 - ThrottlesLogins trait
+
+```php
+// app/Access/Controllers/ThrottlesLogins.php
+trait ThrottlesLogins
+{
+    // 5 次尝试后锁定 1 分钟
+    public function maxAttempts(): int { return 5; }
+    public function decayMinutes(): int { return 1; }
+
+    // 限流 Key = 小写用户名 | IP
+    protected function throttleKey(Request $request): string
+    {
+        return Str::transliterate(Str::lower($request->input($this->username())) . '|' . $request->ip());
+    }
+
+    // 超过限制抛出 ValidationException (429)
+    protected function sendLockoutResponse(Request $request): Response
+    {
+        throw ValidationException::withMessages([
+            $this->username() => [trans('auth.throttle', [
+                'seconds' => $seconds,
+                'minutes' => ceil($seconds / 60),
+            ])],
+        ])->status(Response::HTTP_TOO_MANY_REQUESTS);
+    }
+}
+```
+
+#### 15.6.2 MFA 验证限流 - MfaVerificationLimiter
+
+```php
+// app/Access/Mfa/MfaVerificationLimiter.php
+class MfaVerificationLimiter
+{
+    // 双层限流：按用户（严）+ 按 IP（宽）
+    protected int $maxUserAttemptsPerMinute = 5;    // 单用户 5 次/分
+    protected int $maxIpAttemptsPerMinute = 60;     // 单 IP 60 次/分
+
+    public function hasHitLimit(User $user, Request $request): bool
+    {
+        return $this->rateLimiter->tooManyAttempts(
+                   $this->getUserKey($user), $this->maxUserAttemptsPerMinute + 1
+               )
+            || $this->rateLimiter->tooManyAttempts(
+                   $this->getRequestKey($request), $this->maxIpAttemptsPerMinute + 1
+               );
+    }
+
+    // Key 命名规范
+    protected function getUserKey(User $user): string
+    {
+        return "mfa-attempt::user::{$user->id}";
+    }
+
+    protected function getRequestKey(Request $request): string
+    {
+        return "mfa-attempt::request::{$request->ip()}";
+    }
+}
+```
+
+---
+
+## 十六、Webhook 外部通知链路
+
+### 16.1 Webhook 系统架构
+
+```
+Activity::add(type, entity)
+    │
+    └─ ActivityLogger::add()
+          │
+          └─ dispatchWebhooks(type, detail)
+                │
+                ├─ 查询匹配的 Webhook（trackedEvents 包含当前事件或 'all'）
+                │
+                └─ 循环 dispatch(new DispatchWebhookJob(...))  // 异步队列
+                      │
+                      └─ DispatchWebhookJob::handle()
+                            │
+                            ├─ SSRF 防护：SsrUrlValidator::ensureAllowed()
+                            ├─ 主题事件钩子：ThemeEvents::WEBHOOK_CALL_BEFORE
+                            ├─ WebhookFormatter 构造 payload
+                            ├─ HttpClient::sendRequest() POST
+                            └─ 更新 webhook 状态（last_called_at / last_error）
+```
+
+### 16.2 核心数据模型
+
+#### 16.2.1 Webhook 模型 (`app/Activity/Models/Webhook.php`)
+
+```php
+class Webhook extends Model implements Loggable
+{
+    protected $fillable = ['name', 'endpoint', 'timeout'];
+
+    // 一对多关联到跟踪的事件
+    public function trackedEvents(): HasMany
+    {
+        return $this->hasMany(WebhookTrackedEvent::class);
+    }
+
+    // 更新跟踪事件（全量替换）
+    public function updateTrackedEvents(array $events): void
+    {
+        $this->trackedEvents()->delete();
+        $eventsToStore = array_intersect($events, array_values(ActivityType::all()));
+        if (in_array('all', $events)) {
+            $eventsToStore = ['all'];  // 'all' 跟踪所有事件
+        }
+        ...
+    }
+
+    // 检查是否跟踪某事件
+    public function tracksEvent(string $event): bool
+    {
+        return $this->trackedEvents->pluck('event')->contains($event);
+    }
+}
+```
+
+**Webhook 表结构**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    webhooks                      │
+├──────────────────┬──────────────────────────────┤
+│ id               │ 主键                         │
+│ name             │ Webhook 名称                 │
+│ endpoint         │ 回调 URL                     │
+│ active           │ 是否启用                     │
+│ timeout          │ 超时时间（秒）               │
+│ last_called_at   │ 最后调用时间                 │
+│ last_errored_at  │ 最后错误时间                 │
+│ last_error       │ 最后错误消息                 │
+│ created_at       │ 创建时间                     │
+│ updated_at       │ 更新时间                     │
+└──────────────────┴──────────────────────────────┘
+```
+
+**WebhookTrackedEvent 表结构**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│              webhook_tracked_events             │
+├──────────────────┬──────────────────────────────┤
+│ id               │ 主键                         │
+│ webhook_id       │ 所属 Webhook ID              │
+│ event            │ 跟踪的事件类型               │
+└──────────────────┴──────────────────────────────┘
+```
+
+### 16.3 Webhook 查找与分发
+
+```php
+// ActivityLogger.php:85-98
+protected function dispatchWebhooks(string $type, string|Loggable $detail): void
+{
+    // 查询所有跟踪此事件的活跃 Webhook
+    $webhooks = Webhook::query()
+        ->whereHas('trackedEvents', function (Builder $query) use ($type) {
+            $query->where('event', '=', $type)
+                ->orWhere('event', '=', 'all');  // 'all' 表示跟踪所有
+        })
+        ->where('active', '=', true)
+        ->get();
+
+    // 每个 Webhook 分发一个异步队列任务
+    foreach ($webhooks as $webhook) {
+        dispatch(new DispatchWebhookJob($webhook, $type, $detail));
+    }
+}
+```
+
+### 16.4 DispatchWebhookJob 异步任务
+
+```php
+// app/Activity/DispatchWebhookJob.php
+class DispatchWebhookJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    // 构造时即构造 payload（队列序列化前完成）
+    public function __construct(Webhook $webhook, string $event, Loggable|string $detail)
+    {
+        $this->webhook = $webhook;
+        $this->initiator = user();
+        $this->initiatedTime = time();
+
+        // 允许主题系统通过 WEBHOOK_CALL_BEFORE 事件修改 payload
+        $themeResponse = Theme::dispatch(
+            ThemeEvents::WEBHOOK_CALL_BEFORE,
+            $event, $this->webhook, $detail,
+            $this->initiator, $this->initiatedTime
+        );
+
+        $this->webhookData = $themeResponse ??
+            WebhookFormatter::getDefault($event, $this->webhook, $detail, $this->initiator, $this->initiatedTime)
+                ->format();
+    }
+
+    public function handle(HttpRequestService $http)
+    {
+        try {
+            // ① SSRF 防护：禁止访问内网地址（127.0.0.1、192.168.x.x 等）
+            (new SsrUrlValidator())->ensureAllowed($this->webhook->endpoint);
+
+            // ② 构建 HTTP 客户端
+            $client = $http->buildClient($this->webhook->timeout, [
+                'connect_timeout' => 10,
+                'allow_redirects' => ['strict' => true],
+            ]);
+
+            // ③ 发送 POST JSON 请求
+            $response = $client->sendRequest(
+                $http->jsonRequest('POST', $this->webhook->endpoint, $this->webhookData)
+            );
+            $statusCode = $response->getStatusCode();
+
+            // ④ 4xx/5xx 记录为错误
+            if ($statusCode >= 400) {
+                $lastError = "Response status from endpoint was {$statusCode}";
+                Log::error("Webhook call failed with status {$statusCode}");
+            }
+        } catch (\Exception $error) {
+            $lastError = $error->getMessage();
+            Log::error("Webhook call failed with error \"{$lastError}\"");
+        }
+
+        // ⑤ 更新 Webhook 状态（成功/失败时间、错误信息）
+        $this->webhook->last_called_at = now();
+        if ($lastError) {
+            $this->webhook->last_errored_at = now();
+            $this->webhook->last_error = $lastError;
+        }
+        $this->webhook->save();
+    }
+}
+```
+
+### 16.5 WebhookFormatter - Payload 构造
+
+**默认 Payload 结构**：
+
+```php
+// app/Activity/Tools/WebhookFormatter.php
+public function format(): array
+{
+    $data = [
+        'event'                    => 'page_create',          // 事件类型
+        'text'                     => 'Admin 创建了 "My Page"',// 人类可读描述
+        'triggered_at'             => '2025-01-15T10:00:00Z',// ISO 时间
+        'triggered_by'             => [...],                  // 触发者用户对象
+        'triggered_by_profile_url' => '/user/1/admin',       // 用户主页
+        'webhook_id'               => 1,                     // Webhook ID
+        'webhook_name'             => 'My Hook',             // Webhook 名称
+        'url'                      => '/books/1/page/2',     // 相关实体 URL
+        'related_item'            => [...],                  // 相关实体详情
+    ];
+}
+```
+
+**Model 智能格式化器（条件化预加载）**：
+
+```php
+public function addDefaultModelFormatters(): void
+{
+    // 对所有 Entity 类型，预加载 用户信息（创建者/更新者/拥有者）
+    $this->addModelFormatter(
+        fn ($event, $model) => ($model instanceof Entity),
+        fn ($model) => $model->load(['ownedBy', 'createdBy', 'updatedBy'])
+    );
+
+    // 对 Page 创建/更新事件，预加载当前版本详情
+    $this->addModelFormatter(
+        fn ($event, $model) => ($model instanceof Page && in_array($event, [
+            ActivityType::PAGE_CREATE, ActivityType::PAGE_UPDATE
+        ])),
+        fn ($model) => $model->load('currentRevision')
+    );
+}
+```
+
+### 16.6 Webhook 安全机制
+
+| 机制 | 实现 | 作用 |
+|-----|------|------|
+| SSRF 防护 | `SsrUrlValidator::ensureAllowed()` | 禁止回调到内网/本地 IP |
+| 严格重定向 | `allow_redirects: ['strict' => true]` | 避免开放重定向滥用 |
+| 超时控制 | `timeout` + `connect_timeout: 10` | 防止长连接阻塞队列 |
+| 配置项 | 管理员可设置 active=false | 快速停用有问题的 Webhook |
+| 错误追踪 | `last_error`, `last_errored_at` | 便于排查问题 |
+
+---
+
+## 十七、批量任务调度与 Job 队列链路
+
+### 17.1 队列系统架构
+
+```
+┌───────────────────────────────────────────────────────┐
+│                    任务调度体系                       │
+├───────────────────────────────────────────────────────┤
+│                                                       │
+│  ① Console 命令（手工/CRON 触发）                     │
+│     php artisan bookstack:xxx                         │
+│                                                       │
+│  ② Queue 队列任务（ShouldQueue 接口）                 │
+│     dispatch(new SomeJob()) → 队列 → queue:work       │
+│                                                       │
+│  ③ Schedule 调度器（Console Kernel::schedule）        │
+│     cron → php artisan schedule:run                   │
+│                                                       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 17.2 Console 命令清单（21 个 Artisan 命令）
+
+所有命令位于 `app/Console/Commands/`，命名空间 `bookstack:`：
+
+| 命令 | 功能分类 | 说明 |
+|------|---------|------|
+| `bookstack:regenerate-search` | 搜索 | 重建全文搜索索引（每批 250 条，带进度回调） |
+| `bookstack:regenerate-permissions` | 权限 | 重建所有联合权限（joint_permissions） |
+| `bookstack:regenerate-references` | 引用 | 重建所有实体间的交叉引用 |
+| `bookstack:clear-activity` | 审计 | **清空**所有活动日志（破坏性操作） |
+| `bookstack:clear-revisions` | 版本 | 清理旧版本修订 |
+| `bookstack:cleanup-images` | 存储 | 清理未使用图片（支持 --all --force） |
+| `bookstack:clear-views` | 其他 | 清理访问记录 |
+| `bookstack:update-url` | 配置 | 批量替换数据库中的旧 URL |
+| `bookstack:upgrade-database-encoding` | 数据库 | 升级数据库字符编码 |
+| `bookstack:create-admin` | 用户 | 创建管理员账号 |
+| `bookstack:delete-users` | 用户 | 批量删除用户 |
+| `bookstack:reset-mfa` | 用户 | 重置用户 MFA 设置 |
+| `bookstack:refresh-avatar` | 用户 | 刷新用户头像 |
+| `bookstack:copy-shelf-permissions` | 权限 | 复制书架权限到其下所有册 |
+| `bookstack:assign-sort-rule` | 排序 | 分配排序规则到指定册 |
+| `bookstack:install-module` | 扩展 | 安装主题模块 |
+| `bookstack:copy-shelf-permissions` | 权限 | 复制书架权限 |
+
+**典型命令实现 - RegenerateSearchCommand**：
+
+```php
+class RegenerateSearchCommand extends Command
+{
+    protected $signature = 'bookstack:regenerate-search
+                            {--database= : 使用的数据库连接}';
+
+    public function handle(SearchIndex $searchIndex): int
+    {
+        // 支持切换数据库连接
+        if ($this->option('database') !== null) {
+            DB::setDefaultConnection($this->option('database'));
+        }
+
+        // 调用 SearchIndex，传入进度报告回调
+        $searchIndex->indexAllEntities(function (Entity $model, int $processed, int $total): void {
+            $this->info('Indexed ' . class_basename($model) . " entries ({$processed}/{$total})");
+        });
+
+        $this->line('Search index regenerated!');
+        return static::SUCCESS;
+    }
+}
+```
+
+### 17.3 Schedule 调度器
+
+```php
+// app/Console/Kernel.php
+class Kernel extends ConsoleKernel
+{
+    protected function schedule(Schedule $schedule)
+    {
+        // 当前为空，未配置定时任务
+        // 典型配置示例（可扩展）：
+        // $schedule->command('bookstack:cleanup-images --force')->daily();
+        // $schedule->command('bookstack:clear-views')->weekly();
+    }
+
+    protected function commands()
+    {
+        $this->load(__DIR__ . '/Commands');  // 自动加载所有 Commands
+    }
+}
+```
+
+### 17.4 Queue 队列任务
+
+#### 17.4.1 唯一队列任务：DispatchWebhookJob
+
+```php
+class DispatchWebhookJob implements ShouldQueue
+{
+    // 核心 Trait 组合
+    use Dispatchable;       // 支持 dispatch() 静态调用
+    use InteractsWithQueue; // 可与队列交互（release()、delete() 等）
+    use Queueable;          // 队列配置（onQueue、delay 等）
+    use SerializesModels;   // 自动序列化/反序列化 Eloquent 模型
+
+    // 注意：构造函数在 dispatch 时同步执行，handle 在队列 worker 中异步执行
+    public function __construct(Webhook $webhook, string $event, ...) { ... }
+    public function handle(HttpRequestService $http) { ... }
+}
+```
+
+#### 17.4.2 其他异步通知（Notification）
+
+```
+User::notify() / Notification::send()
+    │
+    ├─ 站内通知：DatabaseChannel（写入 notifications 表）
+    │
+    ├─ 邮件通知：MailChannel
+    │     └─ MailNotification → 支持 locale 切换
+    │
+    └─ 支持 ShouldQueue 接口时：异步队列执行
+```
+
+### 17.5 队列配置说明
+
+通过 Laravel 标准 `config/queue.php` 配置，支持驱动：
+- `sync`（默认，同步执行，开发环境）
+- `database`（数据库队列）
+- `redis`（Redis 队列）
+- `beanstalkd`、`sqs` 等
+
+**DispatchWebhookJob 是项目中唯一显式实现 ShouldQueue 的 Job 类**，其他异步处理通过 Notification 系统完成。
+
+---
+
+## 十八、Locale 多语言链路
+
+### 18.1 多语言系统架构
+
+```
+HTTP 请求进入
+    │
+    └─ web middlewareGroup: Localization::handle()
+          │
+          ├─ ① LocaleManager::getForUser(user())
+          │     │
+          │     ├─ 登录用户 → setting()->getUser(user, 'language', default)
+          │     └─ 访客用户
+          │           ├─ auto_detect_locale=true → Accept-Language header 匹配
+          │           └─ auto_detect_locale=false → config('app.default_locale')
+          │
+          ├─ ② LocaleDefinition 封装（appName + isoName + isRtl）
+          │
+          ├─ ③ view()->share('locale', $userLocale)   // 视图共享
+          │
+          └─ ④ app()->setLocale($userLocale->appLocale())  // 设置 Laravel 翻译器
+                │
+                └─ Translator 使用 FileLoader 加载翻译
+                      │
+                      ├─ ① 原始翻译（resources/lang/）
+                      ├─ ② 模块翻译（Modules/*/lang/）
+                      └─ ③ 主题覆盖（theme_path('lang')/）
+```
+
+### 18.2 Localization 中间件
+
+```php
+// app/Http/Middleware/Localization.php
+class Localization
+{
+    public function handle($request, Closure $next)
+    {
+        // ① 获取用户 Locale 定义
+        $userLocale = $this->localeManager->getForUser(user());
+
+        // ② 共享到所有视图（用于 HTML lang/dir 属性等）
+        view()->share('locale', $userLocale);
+
+        // ③ 设置应用 Locale（Laravel 翻译器、Carbon 等）
+        app()->setLocale($userLocale->appLocale());
+
+        return $next($request);
+    }
+}
+```
+
+### 18.3 LocaleManager - 核心管理器
+
+```php
+// app/Translation/LocaleManager.php
+class LocaleManager
+{
+    // RTL（右到左）语言列表
+    protected array $rtlLocales = ['ar', 'fa', 'he'];
+
+    // BookStack Locale → ISO Locale 映射（76 种语言）
+    protected array $localeMap = [
+        'en'          => 'en_GB',
+        'zh_CN'       => 'zh_CN',
+        'zh_TW'       => 'zh_TW',
+        'de_informal' => 'de_DE',     // 特殊：非正式德语也用 de_DE
+        'ar'          => 'ar',
+        // ... 约 70 种语言映射
+    ];
+
+    /**
+     * 为用户解析 Locale 字符串
+     */
+    protected function getLocaleForUser(User $user): string
+    {
+        $default = config('app.default_locale');
+
+        // 访客 + 开启自动检测 → 从 Accept-Language 解析
+        if ($user->isGuest() && config('app.auto_detect_locale')) {
+            return $this->autoDetectLocale(request(), $default);
+        }
+
+        // 其他：用户设置 > 系统默认
+        return setting()->getUser($user, 'language', $default);
+    }
+
+    /**
+     * 从 HTTP Accept-Language 头自动匹配支持的语言
+     */
+    protected function autoDetectLocale(Request $request, string $default): string
+    {
+        $availableLocales = $this->getAllAppLocales();
+
+        // 按浏览器偏好顺序逐一匹配
+        foreach ($request->getLanguages() as $lang) {
+            if (in_array($lang, $availableLocales)) {
+                return $lang;
+            }
+        }
+
+        return $default;
+    }
+
+    /**
+     * 返回完整 Locale 定义（三重命名空间）
+     */
+    public function getForUser(User $user): LocaleDefinition
+    {
+        $localeString = $this->getLocaleForUser($user);
+
+        return new LocaleDefinition(
+            $localeString,                           // BookStack 内部名：zh_CN
+            $this->localeMap[$localeString] ?? $localeString,  // ISO 名：zh_CN
+            in_array($localeString, $this->rtlLocales),  // 是否 RTL：false
+        );
+    }
+}
+```
+
+### 18.4 LocaleDefinition - 封装对象
+
+```php
+// app/Translation/LocaleDefinition.php
+class LocaleDefinition
+{
+    public function __construct(
+        protected string $appName,   // 内部名（如 zh_CN、de_informal）
+        protected string $isoName,   // ISO 标准名（如 zh_CN、de_DE）
+        protected bool $isRtl        // 是否为 RTL 语言
+    ) {}
+
+    // Laravel 翻译器使用
+    public function appLocale(): string { return $this->appName; }
+
+    // 系统级操作使用（如 setlocale()）
+    public function isoLocale(): string { return $this->isoName; }
+
+    // HTML lang 属性（zh-CN）
+    public function htmlLang(): string { return str_replace('_', '-', $this->isoName); }
+
+    // HTML dir 属性（ltr / rtl）
+    public function htmlDirection(): string { return $this->isRtl ? 'rtl' : 'ltr'; }
+
+    // 按此 Locale 翻译（临时切换）
+    public function trans(string $key, array $replace = []): string
+    {
+        return trans($key, $replace, $this->appLocale());
+    }
+}
+```
+
+### 18.5 翻译文件加载器 - FileLoader
+
+```php
+// app/Translation/FileLoader.php
+class FileLoader extends BaseLoader
+{
+    /**
+     * 覆盖 Laravel 默认加载器，支持三层翻译覆盖
+     */
+    public function load($locale, $group, $namespace = null): array
+    {
+        if (is_null($namespace) || $namespace === '*') {
+            // ① 主题翻译（优先级最高，可覆盖系统默认）
+            $themePath = theme_path('lang');
+            $themeTranslations = $themePath ?
+                $this->loadPaths([$themePath], $locale, $group) : [];
+
+            // ② 模块翻译（安装的扩展模块）
+            $modules = Theme::getModules();
+            $moduleTranslations = [];
+            foreach ($modules as $module) {
+                $modulePath = $module->path('lang');
+                if (file_exists($modulePath)) {
+                    $moduleTranslations = array_merge(
+                        $moduleTranslations,
+                        $this->loadPaths([$modulePath], $locale, $group)
+                    );
+                }
+            }
+
+            // ③ 原始系统翻译（resources/lang/）
+            $originalTranslations = $this->loadPaths($this->paths, $locale, $group);
+
+            // 合并（后面的覆盖前面的）
+            return array_merge($originalTranslations, $moduleTranslations, $themeTranslations);
+        }
+
+        return $this->loadNamespaced($locale, $group, $namespace);
+    }
+}
+```
+
+**三层翻译覆盖优先级**：
+
+```
+主题目录 lang/  (theme_path)
+    ↑ 覆盖
+模块目录 lang/  (Modules/Xxx/lang)
+    ↑ 覆盖
+系统默认 lang/  (resources/lang)
+```
+
+### 18.6 MessageSelector - 复数支持扩展
+
+```php
+// app/Translation/MessageSelector.php
+/**
+ * 解决非标准 Locale（如 de_informal）的复数匹配问题
+ * 取 Locale 的第一部分（下划线前）作为复数判断依据
+ */
+class MessageSelector extends BaseClass
+{
+    public function getPluralIndex($locale, $number)
+    {
+        $locale = explode('_', $locale)[0];  // de_informal → de
+        return parent::getPluralIndex($locale, $number);
+    }
+}
+```
+
+### 18.7 多语言接入点汇总
+
+| 场景 | 使用方式 | 位置 |
+|------|---------|------|
+| Web 请求自动设置 | Localization middleware | `app/Http/Kernel.php:38` |
+| 视图中使用 | `$locale->htmlLang()`, `$locale->htmlDirection()` | Blade 模板 |
+| PHP 代码翻译 | `trans('key')` / `__('key')` | 全局 |
+| 邮件通知翻译 | `$notifiable->getLocale()` | 各类 Notification |
+| 导出 PDF/HTML | `user()->getLocale()` | ExportFormatter:41,63,82... |
+| 用户模型便捷获取 | `User::getLocale(): LocaleDefinition` | User.php:335 |
+
+### 18.8 特殊场景：邮件通知中的 Locale 处理
+
+邮件通知可能在队列中异步发送（请求上下文不存在），需要在通知构造时锁定接收者的 Locale：
+
+```php
+// 通知构造方法示例
+public function __construct(...)
+{
+    // 构造时即保存接收者的 Locale，防止队列中 user() 上下文丢失
+    $locale = $notifiable->getLocale();
+    ...
+}
+```
+
+---
+
+## 十九、完整代码位置速查表（最终版）
+
+### 19.1 API 限流与 Throttle
+
+| 功能 | 文件位置 |
+|------|----------|
+| Kernel 中间件注册 | `app/Http/Kernel.php` |
+| 路由服务提供商 | `app/App/Providers/RouteServiceProvider.php` |
+| API 请求限流中间件 | `app/Http/Middleware/ThrottleApiRequests.php` |
+| 登录限流 Trait | `app/Access/Controllers/ThrottlesLogins.php` |
+| MFA 验证限流 | `app/Access/Mfa/MfaVerificationLimiter.php` |
+
+### 19.2 Webhook 外部通知
+
+| 功能 | 文件位置 |
+|------|----------|
+| Webhook 模型 | `app/Activity/Models/Webhook.php` |
+| 跟踪事件模型 | `app/Activity/Models/WebhookTrackedEvent.php` |
+| Webhook 分发任务 | `app/Activity/DispatchWebhookJob.php` |
+| Webhook Payload 格式化 | `app/Activity/Tools/WebhookFormatter.php` |
+| SSRF URL 验证器 | `app/Util/SsrUrlValidator.php` |
+| Webhook 控制器 | `app/Activity/Controllers/WebhookController.php` |
+
+### 19.3 批量任务与队列调度
+
+| 功能 | 文件位置 |
+|------|----------|
+| Console 调度内核 | `app/Console/Kernel.php` |
+| 重建搜索索引命令 | `app/Console/Commands/RegenerateSearchCommand.php` |
+| 重建权限命令 | `app/Console/Commands/RegeneratePermissionsCommand.php` |
+| 重建引用命令 | `app/Console/Commands/RegenerateReferencesCommand.php` |
+| 清理活动日志命令 | `app/Console/Commands/ClearActivityCommand.php` |
+| 清理旧版本命令 | `app/Console/Commands/ClearRevisionsCommand.php` |
+| 清理未使用图片命令 | `app/Console/Commands/CleanupImagesCommand.php` |
+| URL 批量更新命令 | `app/Console/Commands/UpdateUrlCommand.php` |
+| 创建管理员命令 | `app/Console/Commands/CreateAdminCommand.php` |
+| 删除用户命令 | `app/Console/Commands/DeleteUsersCommand.php` |
+| 重置 MFA 命令 | `app/Console/Commands/ResetMfaCommand.php` |
+| 队列 HTTP 服务 | `app/Http/HttpRequestService.php` |
+
+### 19.4 Locale 多语言
+
+| 功能 | 文件位置 |
+|------|----------|
+| Locale 中间件 | `app/Http/Middleware/Localization.php` |
+| Locale 管理器 | `app/Translation/LocaleManager.php` |
+| Locale 定义对象 | `app/Translation/LocaleDefinition.php` |
+| 翻译文件加载器（三层覆盖） | `app/Translation/FileLoader.php` |
+| 复数选择器（非标准 Locale） | `app/Translation/MessageSelector.php` |
+| 翻译服务提供商 | `app/App/Providers/TranslationServiceProvider.php` |
+| Locale 配置 | `config/app.php` |

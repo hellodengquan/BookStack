@@ -162,6 +162,32 @@ export function listenForDragAndPaste(editor, options) {
 3. 有图片文件 → 拦截默认行为，插入 loading 占位图后异步上传
 4. 无图片 → 不拦截，走默认粘贴
 
+**④ Word 内容粘贴的格式清理 (`fixes.js:118`)**
+
+粘贴 Word 内容时，TinyMCE 自带 `paste_word_valid_elements` 处理基础格式，但表格选区场景下可能残留大量 Word 私有样式。`handleTableCellRangeEvents` 会监听 `RemoveFormat` 命令，手动清理单元格上的冗余属性：
+
+```javascript
+const actionByCommand = {
+    RemoveFormat: cell => {
+        const attrsToRemove = ['class', 'style', 'width', 'height', 'align'];
+        for (const attr of attrsToRemove) {
+            cell.removeAttribute(attr);
+        }
+    },
+    // ...
+};
+```
+
+**⑤ SVG 与 MathML 公式：前端全放行，后端特殊净化**
+
+TinyMCE 的 `extended_valid_elements` 配置 (`config.js:271`)：
+```javascript
+extended_valid_elements: 'pre[*],svg[*],div[drawio-diagram],details[*],summary[*],div[*],li[class|checked|style]',
+```
+- `svg[*]` 表示 SVG 标签及其所有属性在编辑器内全部放行（包括 MathML、VML 等 Word 粘贴的矢量图形）
+- 保存时不做任何过滤，直接随 HTML 入库
+- 真正的净化发生在**后端渲染阶段**（见 4.7 节 SVG 专项净化）
+
 ### 2.6 TinyMCE 编辑器：Image Upload Base64 转外链 (`drop-paste-handling.js:15`)
 
 当粘贴/拖拽图片到编辑器时：
@@ -200,7 +226,50 @@ $contextPage = $this->pageQueries->findVisibleByIdOrFail($uploadedTo);
 // 校验当前用户对该 page 有 ImageCreateAll 权限
 ```
 
-### 2.7 TinyMCE 编辑器：Code-Block 语言识别 (`plugin-codeeditor.js`)
+### 2.8 大图压缩与缩略图生成管线
+
+图片上传后走 `ImageService → ImageResizer` 两级处理：
+
+**① 上传时即时压缩 (`ImageService::saveNewFromUpload:30`)**
+
+如果调用方传入了 `$resizeWidth`/`$resizeHeight`，保存原图前先压缩：
+- `ImageResizer::resizeImageData()` → Intervention Image (GD驱动)
+- 保持比例用 `scaleDown()`，裁剪用 `cover()`
+- PNG 用 `PngEncoder`，其他用 `AutoEncoder`
+- 如果压缩后体积反而更大，返回原图数据（不做负优化）
+- 自动读取 EXIF Orientation 并纠正方向
+
+**② 上传后生成两套缩略图 (`ImageRepo::saveNew:112`)**
+
+保存原图后，`ImageResizer::loadGalleryThumbnailsForImage()` 生成两套：
+
+| 缩略图名 | 尺寸 | 类型 | 用途 |
+|---------|------|------|------|
+| `gallery` | 150×150 | 裁剪 (cover) | 图库列表、编辑器图片选择 |
+| `display` | 1680×null | 等比 (scaleDown) | 页面内展示（大图限制宽度） |
+
+缩略图文件结构：
+```
+uploads/images/gallery/2024-01/
+├── photo.jpg                  # 原图
+├── thumbs-150-150/
+│   └── photo.jpg              # 裁剪缩略图
+└── scaled-1680-/
+    └── photo.jpg              # 等比缩放图
+```
+
+**③ 缓存与懒生成**
+
+缩略图不强制上传时生成，可按需延迟创建：
+- 缓存键：`images::{id}::{thumbFilePath}`，缓存 1 周
+- 先查缓存 → 再查磁盘 → 都没有才生成
+- `shouldCreate=true` 时强制生成（上传时调用）
+- 动图（GIF/APNG/AVIF）等比缩放宽高时跳过，返回原图
+
+> **注意**：缩略图生成是 **同步阻塞** 的，不通过 hook 事件机制，直接在 `ImageRepo` 方法里链式调用。
+> 主题系统没有图片处理相关的扩展点，只能通过替换 `ImageResizer` 服务实现扩展。
+
+### 2.9 Code-Block：前后端语言识别规则对比
 
 TinyMCE 使用自定义 `<code-block>` Web Component 作为代码块包装器，实现语法高亮的所见即所得：
 
@@ -249,6 +318,20 @@ editor.serializer.addNodeFilter('code-block', elms => {
 ```html
 <pre dir="ltr"><code class="language-javascript">const a = 1;</code></pre>
 ```
+
+**④ 前后端语言识别规则对比**
+
+| 维度 | 前端（CodeMirror 6） | 后端（无） |
+|------|---------------------|------------|
+| 高亮引擎 | CodeMirror 6 + `@codemirror/lang-*` + legacy mode | **不做语法高亮** |
+| 语言识别 | 从 `<pre class="language-xxx">` 或 `<code class="language-xxx">` 提取 | 纯文本提取用 `toPlainText()` 剥所有标签 |
+| 语言列表 | 60+ 种，含别名映射（`languages.js:20`） | N/A |
+| PHP 特殊处理 | 根据是否含 `<?php` 切换 plain 模式 | N/A |
+| 与 highlight.js 关系 | **不共用**，完全独立的 CodeMirror 6 体系 | N/A |
+
+> **重要**：BookStack 的代码高亮是**纯前端行为**，服务端不做任何语法高亮处理。
+> 服务端 `HtmlContentFilter` 只把 `<pre><code>` 当作普通 HTML 标签过滤，不识别 `language-*` 类名。
+> 前后端**不共享**语言规则，也不使用 highlight.js。
 
 ---
 
@@ -535,7 +618,59 @@ $a->attr['target'] = new HTMLPurifier_AttrDef_Enum(['_blank']);
 $a->attr['data-mention-user-id'] = new HTMLPurifier_AttrDef_Text();
 ```
 
-### 4.6 净化触发时机汇总
+### 4.6 SVG 与 Word 公式的专项净化路径
+
+BookStack 对 SVG/MathML/VML 采用 **"前端全放行、后端重点防御"** 的策略：
+
+**前端（TinyMCE）**：
+- `extended_valid_elements: 'svg[*],...'` → SVG 及其所有属性全部允许进入编辑器
+- Word 粘贴的 MathML 公式、VML 图形都以 SVG/XML 形式进入 DOM
+- 保存时不做任何过滤，原样入库
+
+**后端（HtmlContentFilter）**：
+- 没有完整的 SVG 白名单，采用**风险点精准打击**策略：
+  1. `//svg//@*[contains(., 'data:')]` → 删除 SVG 内所有含 `data:` URI 的属性值
+  2. `//svg//@*[contains(., 'javascript:')]` → 删除 SVG 内所有含 `javascript:` 的属性值
+  3. `//@*[contains(name(), 'xlink:href')]` → 删除所有 `xlink:href` 属性（SVG 废弃属性，常见 XSS 载体）
+  4. `//@*[starts-with(name(), 'on')]` → 删除所有 `on*` 事件属性（包括 SVG 的 `onload`/`onclick` 等）
+
+> **设计思路**：SVG 元素/属性众多，维护完整白名单成本高，因此采用"删已知风险"而非"保留已知安全"策略。
+> 如果启用了 `useAllowListFilter`（HTMLPurifier），SVG 会被**整体删除**，因为 HTMLPurifier 默认白名单不包含 SVG。
+
+### 4.7 Hook 扩展点：如何新增白名单标签
+
+**BookStack 主题系统没有直接扩展 HTMLPurifier 白名单的事件。**
+
+可用的扩展方式有三种：
+
+**方式一：通过 `PAGE_CONTENT_PRE_STORE` 预处理**
+```php
+// themes/your-theme/functions.php
+Theme::listen(ThemeEvents::PAGE_CONTENT_PRE_STORE, function($html, $page) {
+    // 保存前自定义处理，可添加自定义属性/标签
+    return $html;
+});
+```
+
+**方式二：通过 `PAGE_CONTENT_POST_RENDER` 后处理**
+```php
+Theme::listen(ThemeEvents::PAGE_CONTENT_POST_RENDER, function($html, $page) {
+    // 渲染后注入自定义内容（不受白名单限制，因为已经过净化）
+    return $html . '<my-custom-component></my-custom-component>';
+});
+```
+
+**方式三：替换 `ConfiguredHtmlPurifier` 服务（高级）**
+在服务提供者中绑定自定义的 HTMLPurifier 配置类：
+```php
+$this->app->bind(ConfiguredHtmlPurifier::class, function() {
+    return new MyCustomHtmlPurifier();
+});
+```
+
+> **注意**：`PAGE_CONTENT_POST_RENDER` 钩子在**缓存之后**执行（见 5.9 节），因此通过此钩子添加的自定义标签不会被缓存，每次渲染都会重新执行。
+
+### 4.8 净化触发时机汇总
 
 | 时机 | 位置 | 说明 |
 |------|------|------|
@@ -772,7 +907,31 @@ goToText(text) {
 }
 ```
 
-### 5.9 缓存命中后 Hooks 触发确认
+### 5.9 长文章分屏滚动的前端性能预算
+
+**结论：BookStack 没有虚拟滚动/分屏渲染机制，超长文章是全量 DOM 渲染。**
+
+性能优化手段采用**保守型策略**，主要集中在减少滚动触发的重计算：
+
+| 优化手段 | 位置 | 说明 |
+|---------|------|------|
+| `passive: true` 滚动监听 | `tri-layout.ts:27`, `page-display.js:116` | 滚动事件不阻塞主线程 |
+| `IntersectionObserver` 目录高亮 | `page-display.js:78` | 异步判断元素可见性，不阻塞滚动 |
+| `debounce` 防抖 | `util.ts:6` | 搜索、内容变化等场景使用，200~1000ms 不等 |
+| `requestAnimationFrame` | 多处 | DOM 变更统一合并到下一帧 |
+| 代码高亮异步加载 | `page-display.js:35` | `importVersioned('code')` 动态 import，不阻塞首屏 |
+| 三栏布局响应式切换 | `tri-layout.ts:33` | 仅在 1000px / 1400px 断点切换，不做实时计算 |
+
+**没有的性能机制**：
+- ❌ 虚拟列表 / 窗口化（Virtual Scrolling）
+- ❌ 内容分段懒加载
+- ❌ 长文章分页
+- ❌ 图片懒加载（页面内图片是全量加载的）
+- ❌ 显式的性能预算配置
+
+> **性能预期**：几千字的普通文章完全没问题。如果是包含大量代码块、图片的超长文章（数万字），首屏渲染可能会有明显延迟，主要瓶颈在 CodeMirror 6 代码高亮的 DOM 替换和重排。
+
+### 5.10 缓存命中后 Hooks 触发确认
 
 **结论：缓存命中后 `PAGE_CONTENT_POST_RENDER` 钩子仍然会触发。**
 
@@ -852,12 +1011,71 @@ class ThemeService
 
 | 事件常量 | 触发时机 | 参数 | 返回值用途 |
 |----------|---------|------|----------|
-| `PAGE_CONTENT_PRE_STORE | 保存前 | `string $html`, `Page $page` | 返回 string 替换 HTML |
-| `PAGE_CONTENT_POST_RENDER | 渲染后（含缓存命中） | `string $html`, `Page $page` | 返回 string 替换 HTML |
-| `PAGE_INCLUDE_PARSE | 页面引用解析时 | `string $tagReference`, `string $replacementHTML`, `Page $currentPage`, `?Page $referencedPage` | 返回 string 替换引用内容 |
+| `PAGE_CONTENT_PRE_STORE` | 保存前 | `string $html`, `Page $page` | 返回 string 替换 HTML |
+| `PAGE_CONTENT_POST_RENDER` | 渲染后（含缓存命中） | `string $html`, `Page $page` | 返回 string 替换 HTML |
+| `PAGE_INCLUDE_PARSE` | 页面引用解析时 | `string $tagReference`, `string $replacementHTML`, `Page $currentPage`, `?Page $referencedPage` | 返回 string 替换引用内容 |
 | `COMMONMARK_ENVIRONMENT_CONFIGURE` | Markdown 转 HTML 前 | `Environment $environment` | 返回 Environment 替换 |
 
-### 6.3 主题系统加载流程 (`ThemeServiceProvider.php:25`)
+> **注意**：没有 `PAGE_CONTENT_HEAD` 这类头部渲染事件。页面头部自定义通过 `CustomHtmlHeadContentProvider` 机制实现（见 6.5 节）。
+
+### 6.3 页面头部自定义机制 (`CustomHtmlHeadContentProvider`)
+
+BookStack 没有 `PAGE_CONTENT_HEAD` 主题事件，头部自定义走独立的 **设置 + 主题模块** 双轨制：
+
+**① 系统设置：`app-custom-head`**
+- 后台「设置→自定义」里填写的 HTML 头部内容
+- 通过 `setting('app-custom-head')` 读取
+
+**② 主题模块：`head/` 目录**
+- 激活主题下 `head/*.html` 文件会被自动拼接到页面头部
+- 支持模块（modules）也可以提供 `head/` 目录
+
+**③ 执行链路 (`CustomHtmlHeadContentProvider::forWeb():24`)**
+
+```
+getSourceContent()  [app-custom-head 设置]
+  │
+  ▼
++ getModuleHeadContent()  [主题模块 head/*.html]
+  │
+  ▼
+HtmlNonceApplicator::prepare()  [预处理 nonce 占位符]
+  │
+  ▼
+缓存 1 天 (md5(content) + modulesHash)
+  │
+  ▼
+HtmlNonceApplicator::apply()  [注入实际 CSP nonce]
+  │
+  ▼
+输出到页面 <head>
+```
+
+**④ 触发时机与顺序**
+
+`custom-head.blade.php` 在布局模板的 `@stack('head')` **之后**注入：
+```blade
+<!-- base.blade.php -->
+@stack('head')
+@include('layouts.parts.custom-head')
+```
+
+执行顺序：
+1. 各子视图 `@push('head')` 的内容（如页面特定 CSS/JS）
+2. `CustomHtmlHeadContentProvider::forWeb()` 的内容（设置 + 主题模块）
+
+**⑤ 导出模式下的头部净化 (`forExport():40`)**
+导出 PDF/HTML 时，头部内容会走简化版过滤：
+```php
+$config = new HtmlContentFilterConfig(
+    filterOutNonContentElements: false,
+    useAllowListFilter: false
+);
+return (new HtmlContentFilter($config))->filterString($content);
+```
+只保留非内容元素过滤，跳过脚本/表单/白名单过滤（因为导出场景需要完整样式）。
+
+### 6.4 主题系统加载流程 (`ThemeServiceProvider.php:25`)
 
 ```
 App boot
@@ -1013,7 +1231,50 @@ protected function getContentProviderClosure(bool $blankIncludes): Closure
 3. 无权限时返回空字符串（静默失败，不报错）
 4. 被引用页面内容也会经过完整净化流程（在宿主页面净化阶段）
 
-### 7.4 `findVisibleById` 实现 (`PageQueries.php:32`)
+### 7.4 三层递归 Include 的权限叠加机制
+
+**递归解析循环 (`PageContent::render():327`)**：
+
+```php
+$doc = $this->getHtmlDocument();
+$contentProvider = $this->getContentProviderClosure($blankIncludes);
+$parser = new PageIncludeParser($doc, $contentProvider);
+
+$nodesAdded = -1;
+for ($includeDepth = 0; $includeDepth < 3 && $nodesAdded !== 0; $includeDepth++) {
+    $nodesAdded = $parser->parse();
+}
+
+if ($includeDepth > 1) {
+    $this->formatHtml($doc);  // 多层嵌套时重新规范所有锚点ID
+}
+```
+
+**循环规则**：
+- 上限：最多 3 层（`$includeDepth < 3`）
+- 终止条件：某一轮没有新增节点（`$nodesAdded === 0`）
+- 每层都调用同一个 `PageIncludeParser` 实例，在上一轮的结果上继续解析
+- 超过 1 层嵌套时，最后统一重新规范锚点 ID，避免 ID 冲突
+
+**每层的权限校验**：
+
+| 层级 | 页面 | 权限校验方式 |
+|------|------|-------------|
+| 第 0 层（宿主） | 页面 A | `findVisibleBySlugsOrFail` → 四层权限 |
+| 第 1 层（直接引用） | 页面 B | `findVisibleById(B)` → 独立四层权限 |
+| 第 2 层（间接引用） | 页面 C | `findVisibleById(C)` → 独立四层权限 |
+
+**权限叠加函数**：
+
+**没有权限叠加**。每一层的页面都是**独立查询**，各自走完整的四层权限校验：
+- 宿主 A 的权限不影响被引用 B 的权限判断
+- 被引用 B 的权限不影响被引用 C 的权限判断
+- 任意一层无权限 → 该层内容为空 → 更深层引用自然也不存在
+
+> **安全边界**：递归 3 层上限 + 每层独立权限校验，既防止了循环引用死循环，
+> 也确保了"能看到 A 不代表能看到 A 引用的 B"的权限隔离。
+
+### 7.5 `findVisibleById` 实现 (`PageQueries.php:32`)
 
 ```php
 public function findVisibleById(int $id): ?Page
@@ -1027,7 +1288,7 @@ public function findVisibleById(int $id): ?Page
 - ③ 草稿过滤（通过 `restrictDraftsOnPageQuery`）
 - ④ 软删除过滤（通过 `SoftDeletes` scope）
 
-### 7.5 关键查询入口汇总
+### 7.6 关键查询入口汇总
 
 | 查询方法 | 场景 | 权限 scope |
 |---------|------|------------|
@@ -1037,7 +1298,7 @@ public function findVisibleById(int $id): ?Page
 | `visibleForContent` | 内容查询 | visible |
 | `visibleWithContents` | 带 HTML 的列表 | visible |
 
-### 7.6 权限校验时机
+### 7.7 权限校验时机
 
 | 操作 | 权限检查点 |
 |------|----------|
@@ -1060,28 +1321,36 @@ public function findVisibleById(int $id): ?Page
 | HTML 过滤器主类 | `app/Util/HtmlContentFilter.php` | `filterDocument():17` |
 | 过滤配置 | `app/Util/HtmlContentFilterConfig.php` | `fromConfigString():20` |
 | HTMLPurifier 封装 | `app/Util/HtmlPurifier/ConfiguredHtmlPurifier.php` | 全文 |
+| HTML 文档包装器 | `app/Util/HtmlDocument.php` | 全文 |
 | 编辑页数据装配 | `app/Entities/Tools/PageEditorData.php` | `build():37` |
 | 编辑器类型枚举 | `app/Entities/Tools/PageEditorType.php` | 全文 |
 | 主题服务（事件系统） | `app/Theming/ThemeService.php` | `listen():37`, `dispatch():54` |
 | 主题事件常量 | `app/Theming/ThemeEvents.php` | `PAGE_CONTENT_POST_RENDER:125` |
 | 主题服务提供者 | `app/App/Providers/ThemeServiceProvider.php` | `boot():25` |
+| 自定义头部内容提供者 | `app/Theming/CustomHtmlHeadContentProvider.php` | `forWeb():24`, `forExport():40` |
 | 权限应用器 | `app/Permissions/PermissionApplicator.php` | `restrictEntityQuery():99` |
 | 实体基类（visible scope） | `app/Entities/Models/Entity.php` | `scopeVisible():150` |
 | 页面查询类 | `app/Entities/Queries/PageQueries.php` | `findVisibleById():32` |
-| HTML 文档包装器 | `app/Util/HtmlDocument.php` | 全文 |
+| 图片服务 | `app/Uploads/ImageService.php` | `saveNewFromUpload():30`, `saveNewFromBase64Uri():54` |
+| 图片仓库 | `app/Uploads/ImageRepo.php` | `saveNewFromData():134` |
+| 图片缩放器 | `app/Uploads/ImageResizer.php` | `resizeImageData():118`, `loadGalleryThumbnailsForImage():42` |
 | 前端-页面编辑器 | `resources/js/components/page-editor.js` | `saveDraft():123` |
 | 前端-WYSIWYG 编辑器 | `resources/js/components/wysiwyg-editor.js` | `getContent():65` |
 | 前端-TinyMCE 编辑器 | `resources/js/components/wysiwyg-editor-tinymce.js` | `getContent():42` |
 | 前端-TinyMCE 配置 | `resources/js/wysiwyg-tinymce/config.js` | `buildForEditor():241` |
 | 前端-TinyMCE 粘贴处理 | `resources/js/wysiwyg-tinymce/drop-paste-handling.js` | `paste():35`, `uploadImageFile():15` |
+| 前端-TinyMCE 修复 | `resources/js/wysiwyg-tinymce/fixes.js` | `handleTableCellRangeEvents():102` |
 | 前端-TinyMCE 代码块插件 | `resources/js/wysiwyg-tinymce/plugin-codeeditor.js` | 全文 |
 | 前端-TinyMCE 过滤器 | `resources/js/wysiwyg-tinymce/filters.js` | `setupFilters():40` |
 | 前端-Markdown 编辑器 | `resources/js/components/markdown-editor.js` | `getContent():138` |
 | 前端-page-display 组件 | `resources/js/components/page-display.js` | `setup():34` |
+| 前端-三栏布局 | `resources/js/components/tri-layout.ts` | `updateLayout():33`, `setupDesktop():65` |
 | 前端-代码高亮 | `resources/js/code/index.mjs` | `highlight():107`, `highlightElem():62` |
 | 前端-代码语言映射 | `resources/js/code/languages.js` | `modeMap:20`, `getLanguageExtension():110` |
 | 前端-代码编辑器视图 | `resources/js/code/views.js` | `createView():14`, `updateViewLanguage():45` |
+| 前端-工具函数 | `resources/js/services/util.ts` | `debounce():8` |
 | 只读展示模板 | `resources/views/pages/parts/page-display.blade.php` | 全文 |
 | 展示页主模板 | `resources/views/pages/show.blade.php` | `@section('body'):9` |
 | TinyMCE 编辑器模板 | `resources/views/pages/parts/wysiwyg-editor-tinymce.blade.php` | 全文 |
+| 自定义头部模板 | `resources/views/layouts/parts/custom-head.blade.php` | 全文 |
 | 主题系统文档 | `dev/docs/logical-theme-system.md` | 全文 |

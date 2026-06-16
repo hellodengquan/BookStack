@@ -644,9 +644,412 @@ return "page-content-cache::{$filterConfig}::{$appVersion}::{$contentId}::{$cont
 - `contentTime`：`updated_at` 时间戳 → 编辑后自动失效
 - `contentHash`：HTML 内容 MD5 → 内容变化即失效
 
+### 5.6 `page-display` 前端组件：Mounted 阶段 (`page-display.js:34`)
+
+`PageDisplay 组件在 DOM 就绪后触发 `setup()` 方法（等同于 mounted）：
+
+```javascript
+setup() {
+    this.container = this.$el;
+    this.pageId = this.$opts.pageId;
+
+    // ① 语法高亮
+    window.importVersioned('code').then(Code => Code.highlight());
+
+    // ② 目录滚动高亮
+    this.setupNavHighlighting();
+
+    // ③ URL hash 跳转到指定内容
+    if (window.location.hash) {
+        const text = window.location.hash.replace(/%20/g, ' ').substring(1);
+        this.goToText(text);
+    }
+
+    // ④ 侧边导航点击跳转
+    const sidebarPageNav = document.querySelector('.sidebar-page-nav');
+    if (sidebarPageNav) {
+        DOM.onChildEvent(sidebarPageNav, 'a', 'click', (event, child) => {
+            event.preventDefault();
+            window.$components.first('tri-layout').showContent();
+            const contentId = child.getAttribute('href').substr(1);
+            this.goToText(contentId);
+            window.history.pushState(null, null, `#${contentId}`);
+        });
+    }
+}
+```
+
+### 5.7 语法高亮实现 (`resources/js/code/index.mjs:62`)
+
+后端输出的 `<pre><code class="language-xxx">` 在前端被 CodeMirror 6 替换：
+
+```javascript
+function highlightElem(elem) {
+    const innerCodeElem = elem.querySelector('code[class^=language-]');
+    elem.innerHTML = elem.innerHTML.replace(/<br\s*\/?>/gi, '\n');
+    const content = elem.textContent.trimEnd();
+
+    // 从 class 提取语言名
+    let langName = '';
+    if (innerCodeElem !== null) {
+        langName = innerCodeElem.className.replace('language-', '');
+    }
+
+    // 创建包装器 + CodeMirror 替换原始 <pre>
+    const wrapper = document.createElement('div');
+    elem.parentNode.insertBefore(wrapper, elem);
+
+    const ev = createView('content-code-block', {
+        parent: wrapper,
+        doc: content,
+        extensions: viewerExtensions(wrapper),
+    });
+
+    const editor = new SimpleEditorInterface(ev);
+    editor.setMode(langName, content);  // 根据语言名加载对应模式
+
+    elem.remove();
+    addCopyIcon(ev);  // 添加复制按钮
+}
+```
+
+**语言识别映射表** (`languages.js:20`)：
+
+支持 60+ 种语言别名映射到 CodeMirror 6 模式：
+```javascript
+const modeMap = {
+    // 原生 CM6 扩展：css, json, javascript, html, markdown, php, xml, twig
+    // 动态加载 legacy mode：bash, c, c++, c#, java, python, ruby, rust, sql, ...
+    // 特殊处理：php 根据是否包含 <?php 决定 plain 模式
+    php: async code => {
+        const hasTags = code.includes('<?php');
+        return php({plain: !hasTags});
+    },
+};
+```
+
+### 5.8 目录滚动高亮 (`page-display.js:78`)
+
+使用 `IntersectionObserver` 实现滚动时自动高亮当前阅读位置：
+
+```javascript
+function addNavObserver(headings) {
+    const intersectOpts = {
+        rootMargin: '0px 0px 0px 0px',
+        threshold: 1.0,  // 100% 可见才触发
+    };
+    const pageNavObserver = new IntersectionObserver(headingVisibilityChange, intersectOpts);
+
+    for (const heading of headings) {
+        pageNavObserver.observe(heading);
+    }
+}
+
+function headingVisibilityChange(entries) {
+    for (const entry of entries) {
+        const isVisible = (entry.intersectionRatio === 1);
+        toggleAnchorHighlighting(entry.target.id, isVisible);
+    }
+}
+
+function toggleAnchorHighlighting(elementId, shouldHighlight) {
+    DOM.forEach(`#page-navigation a[href="#${elementId}"]`, anchor => {
+        anchor.closest('li').classList.toggle('current-heading', shouldHighlight);
+    });
+}
+```
+
+**滚动跳转** (`page-display.js:60`)：
+```javascript
+goToText(text) {
+    const idElem = document.getElementById(text);
+    if (idElem !== null) {
+        scrollAndHighlightElement(idElem);  // 平滑滚动 + 闪烁高亮
+    } else {
+        const textElem = DOM.findText('.page-content > div > *', text);
+        if (textElem) scrollAndHighlightElement(textElem);
+    }
+}
+```
+
+### 5.9 缓存命中后 Hooks 触发确认
+
+**结论：缓存命中后 `PAGE_CONTENT_POST_RENDER` 钩子仍然会触发。**
+
+看 `PageContent::render()` 流程：
+
+```php
+public function render(bool $blankIncludes = false): string
+{
+    // ... include 解析 ...
+
+    $cacheKey = $this->getContentCacheKey($doc->getBodyInnerHtml());
+    $cached = cache()->get($cacheKey, null);
+    
+    if ($cached !== null) {
+        return $this->handlePostRender($cached);  // ← 缓存命中，仍然调用 handlePostRender
+    }
+
+    // ... 未命中，净化 + 写缓存 ...
+    $filtered = $filter->filterDocument($doc);
+    cache()->put($cacheKey, $filtered, $cacheTime);
+
+    return $this->handlePostRender($filtered);  // ← 未命中也调用
+}
+
+protected function handlePostRender(string $html): string
+{
+    $themeResult = Theme::dispatch(ThemeEvents::PAGE_CONTENT_POST_RENDER, $html, $this->page);
+    return is_string($themeResult) ? $themeResult : $html;
+}
+```
+
+**设计意图**：
+- 缓存只存"净化后的 HTML"，不包含主题定制结果
+- 允许主题动态修改内容而不受缓存限制
+- 主题钩子必须是纯函数、幂等，重复调用不产生副作用
+
 ---
 
-## 六、关键文件索引
+## 六、主题系统扩展点与监听器机制
+
+### 6.1 `Theme` 门面 API (`app/Theming/ThemeService.php`)
+
+BookStack 的主题事件系统是典型的观察者模式：
+
+```php
+class ThemeService
+{
+    protected array $listeners = [];
+
+    // 注册监听器
+    public function listen(string $event, callable $action): void
+    {
+        $this->listeners[$event][] = $action;
+    }
+
+    // 触发事件（第一个非 null 返回值终止链）
+    public function dispatch(string $event, ...$args): mixed
+    {
+        foreach ($this->listeners[$event] ?? [] as $action) {
+            $result = call_user_func_array($action, $args);
+            if (!is_null($result)) {
+                return $result;  // 第一个非 null 返回作为结果
+            }
+        }
+        return null;
+    }
+}
+```
+
+**执行规则：
+1. 允许多个监听器监听同一事件
+2. 按注册顺序执行
+3. 任何监听器返回非 `null` 时立即终止后续监听器
+4. 返回值被系统使用（取决于具体事件）
+
+### 6.2 页面渲染相关的主题事件
+
+| 事件常量 | 触发时机 | 参数 | 返回值用途 |
+|----------|---------|------|----------|
+| `PAGE_CONTENT_PRE_STORE | 保存前 | `string $html`, `Page $page` | 返回 string 替换 HTML |
+| `PAGE_CONTENT_POST_RENDER | 渲染后（含缓存命中） | `string $html`, `Page $page` | 返回 string 替换 HTML |
+| `PAGE_INCLUDE_PARSE | 页面引用解析时 | `string $tagReference`, `string $replacementHTML`, `Page $currentPage`, `?Page $referencedPage` | 返回 string 替换引用内容 |
+| `COMMONMARK_ENVIRONMENT_CONFIGURE` | Markdown 转 HTML 前 | `Environment $environment` | 返回 Environment 替换 |
+
+### 6.3 主题系统加载流程 (`ThemeServiceProvider.php:25`)
+
+```
+App boot
+  │
+  ▼
+ThemeServiceProvider::boot()
+  │
+  ├─ 注册自定义 Blade @include 指令（支持视图注入）
+  │
+  ├─ 若无 APP_THEME 配置 → 直接返回
+  │
+  └─ 有主题配置：
+     ├─ loadModules() → 扫描 themes/xxx/modules
+     ├─ readThemeActions() → require theme/xxx/functions.php
+     ├─ dispatch(APP_BOOT) → 通知主题启动
+     ├─ 注册主题视图路径
+     └─ dispatch(THEME_REGISTER_VIEWS) → 允许注入自定义视图
+```
+
+### 6.4 BookStack 自带监听器情况
+
+**BookStack 核心代码**不注册任何页面渲染相关的默认监听器。
+所有监听器都由用户在主题的 `functions.php` 中自行注册。
+
+使用示例（主题 `functions.php`）：
+```php
+<?php
+use BookStack\Facades\Theme;
+use BookStack\Theming\ThemeEvents;
+
+// 给所有页面内容末尾追加版权信息
+Theme::listen(ThemeEvents::PAGE_CONTENT_POST_RENDER, function($html, $page) {
+    return $html . '<p class="copyright">© 2024 My Company</p>';
+});
+
+// 修改页面引用的内容
+Theme::listen(ThemeEvents::PAGE_INCLUDE_PARSE, function($tag, $html, $current, $referenced) {
+    if (!$referenced) return null;
+    return '<div class="included-page">' . $html . '</div>';
+});
+```
+
+### 6.5 其它相关公共事件（扩展点）
+
+**前端公共事件**：
+- `library-cm6::pre-init` / `library-cm6::post-init` — 代码编辑器创建前后
+- `editor-tinymce::pre-init` / `editor-tinymce::setup` — TinyMCE 初始化前后
+- `editor-markdown-cm6::pre-init` — Markdown 编辑器初始化前
+- `editor-html-change` / `editor-markdown-change` — 编辑器内容变化
+
+---
+
+## 七、权限校验层级与跨页 Include 权限继承
+
+### 7.1 页面权限校验四层架构
+
+```
+┌─────────────────────────────────────────────────────┐
+│  ① 角色级权限（Role Permissions）           │
+│  page-view-all / page-view-own                │
+│  检查当前用户角色是否有全局查看权限             │
+└──────────────────┬───────────────────────────────┘
+                 │
+┌────────────────▼───────────────────────────────┐
+│  ② 实体级权限（Entity Permissions）       │
+│  通过 joint_permissions 表继承：            │
+│  status IN (1,3) OR (owner=me AND status !=2)  │
+│  由 PermissionApplicator::restrictEntityQuery │
+└──────────────────┬───────────────────────────────┘
+                 │
+┌────────────────▼───────────────────────────────┐
+│  ③ 草稿限制（Draft Restriction）         │
+│  draft=false OR (draft=true AND owned_by=me)  │
+│  只有作者能看自己的草稿              │
+└──────────────────┬───────────────────────────────┘
+                 │
+┌────────────────▼───────────────────────────────┐
+│  ④ 软删除过滤（Soft Deleted Filter）        │
+│  deleted_at IS NULL                     │
+└───────────────────────────────────────────────┘
+```
+
+### 7.2 主页面权限校验实现 (`Entity.php:150`)
+
+```php
+public function scopeVisible(Builder $query): Builder
+{
+    return app()->make(PermissionApplicator::class)->restrictEntityQuery($query);
+}
+```
+
+`PermissionApplicator::restrictEntityQuery` 核心 SQL 逻辑：
+
+```sql
+WHERE EXISTS (
+    SELECT 1 FROM joint_permissions
+    WHERE joint_permissions.entity_id = entities.id
+      AND joint_permissions.entity_type = entities.type
+      AND joint_permissions.role_id IN (用户角色ID列表)
+    GROUP BY entity_type, entity_id
+    HAVING (
+        status IN (1, 3)              -- 显式允许，或继承允许
+        OR (owner_id = 当前用户ID AND status != 2)  -- 是所有者且未被显式拒绝
+    )
+)
+```
+
+### 7.3 跨页 Include 权限继承规则
+
+**结论：不继承宿主页面权限，每个被引用页面独立做权限校验**
+
+在 `PageContent::getContentProviderClosure` 中：
+
+```php
+protected function getContentProviderClosure(bool $blankIncludes): Closure
+{
+    $contextPage = $this->page;
+    $queries = $this->pageQueries;
+
+    return function (PageIncludeTag $tag) use ($blankIncludes, $contextPage, $queries): PageIncludeContent {
+        if ($blankIncludes) {
+            return PageIncludeContent::fromHtmlAndTag('', $tag);
+        }
+
+        // 关键点：用独立的 visible scope 查询被引用页面
+        $matchedPage = $queries->findVisibleById($tag->getPageId());
+        // ↑ 这里走完整的四层权限校验，与宿主页面无关
+
+        $content = PageIncludeContent::fromHtmlAndTag($matchedPage->html ?? '', $tag);
+
+        // 主题钩子可进一步控制
+        if (Theme::hasListeners(ThemeEvents::PAGE_INCLUDE_PARSE)) {
+            $themeReplacement = Theme::dispatch(
+                ThemeEvents::PAGE_INCLUDE_PARSE,
+                $tag->tagContent,
+                $content->toHtml(),
+                $contextPage,
+                $matchedPage
+            );
+            if (is_string($themeReplacement)) {
+                $content = PageIncludeContent::fromHtmlAndTag($themeReplacement, $tag);
+            }
+        }
+
+        return $content;
+    };
+}
+```
+
+**权限规则**：
+1. **宿主页面权限不传递给被引用页面
+2. 被引用页面用 `findVisibleById` 做独立权限校验
+3. 无权限时返回空字符串（静默失败，不报错）
+4. 被引用页面内容也会经过完整净化流程（在宿主页面净化阶段）
+
+### 7.4 `findVisibleById` 实现 (`PageQueries.php:32`)
+
+```php
+public function findVisibleById(int $id): ?Page
+{
+    return $this->start()->scopes('visible')->find($id);
+}
+```
+
+`visible` scope 叠加了：
+- ① 角色权限 + ② 实体权限（通过 `restrictEntityQuery`）
+- ③ 草稿过滤（通过 `restrictDraftsOnPageQuery`）
+- ④ 软删除过滤（通过 `SoftDeletes` scope）
+
+### 7.5 关键查询入口汇总
+
+| 查询方法 | 场景 | 权限 scope |
+|---------|------|------------|
+| `findVisibleBySlugsOrFail` | 主页面展示 | visible |
+| `findVisibleById` | 页面引用、附件/图片上传上下文 | visible |
+| `visibleForList` | 页面列表 | visible |
+| `visibleForContent` | 内容查询 | visible |
+| `visibleWithContents` | 带 HTML 的列表 | visible |
+
+### 7.6 权限校验时机
+
+| 操作 | 权限检查点 |
+|------|----------|
+| 查看页面 | `PageController::show` → `findVisibleBySlugsOrFail` |
+| 编辑页面 | `PageController::edit` → `findVisibleByIdOrFail` + `userCan('page-update')` |
+| 上传图片 | `ImageRepo::saveNewFromData` → `findVisibleByIdOrFail` + `can('image-create-all')` |
+| 页面引用 | `PageIncludeParser` → 每个 `{{@id}}` 独立 `findVisibleById` |
+| Ajax 取页 | `PageController::getPageAjax` → `findVisibleByIdOrFail` |
+
+---
+
+## 八、关键文件索引
 
 | 职责 | 文件 | 核心行 |
 |------|------|--------|
@@ -659,8 +1062,26 @@ return "page-content-cache::{$filterConfig}::{$appVersion}::{$contentId}::{$cont
 | HTMLPurifier 封装 | `app/Util/HtmlPurifier/ConfiguredHtmlPurifier.php` | 全文 |
 | 编辑页数据装配 | `app/Entities/Tools/PageEditorData.php` | `build():37` |
 | 编辑器类型枚举 | `app/Entities/Tools/PageEditorType.php` | 全文 |
+| 主题服务（事件系统） | `app/Theming/ThemeService.php` | `listen():37`, `dispatch():54` |
+| 主题事件常量 | `app/Theming/ThemeEvents.php` | `PAGE_CONTENT_POST_RENDER:125` |
+| 主题服务提供者 | `app/App/Providers/ThemeServiceProvider.php` | `boot():25` |
+| 权限应用器 | `app/Permissions/PermissionApplicator.php` | `restrictEntityQuery():99` |
+| 实体基类（visible scope） | `app/Entities/Models/Entity.php` | `scopeVisible():150` |
+| 页面查询类 | `app/Entities/Queries/PageQueries.php` | `findVisibleById():32` |
+| HTML 文档包装器 | `app/Util/HtmlDocument.php` | 全文 |
 | 前端-页面编辑器 | `resources/js/components/page-editor.js` | `saveDraft():123` |
 | 前端-WYSIWYG 编辑器 | `resources/js/components/wysiwyg-editor.js` | `getContent():65` |
+| 前端-TinyMCE 编辑器 | `resources/js/components/wysiwyg-editor-tinymce.js` | `getContent():42` |
+| 前端-TinyMCE 配置 | `resources/js/wysiwyg-tinymce/config.js` | `buildForEditor():241` |
+| 前端-TinyMCE 粘贴处理 | `resources/js/wysiwyg-tinymce/drop-paste-handling.js` | `paste():35`, `uploadImageFile():15` |
+| 前端-TinyMCE 代码块插件 | `resources/js/wysiwyg-tinymce/plugin-codeeditor.js` | 全文 |
+| 前端-TinyMCE 过滤器 | `resources/js/wysiwyg-tinymce/filters.js` | `setupFilters():40` |
 | 前端-Markdown 编辑器 | `resources/js/components/markdown-editor.js` | `getContent():138` |
+| 前端-page-display 组件 | `resources/js/components/page-display.js` | `setup():34` |
+| 前端-代码高亮 | `resources/js/code/index.mjs` | `highlight():107`, `highlightElem():62` |
+| 前端-代码语言映射 | `resources/js/code/languages.js` | `modeMap:20`, `getLanguageExtension():110` |
+| 前端-代码编辑器视图 | `resources/js/code/views.js` | `createView():14`, `updateViewLanguage():45` |
 | 只读展示模板 | `resources/views/pages/parts/page-display.blade.php` | 全文 |
 | 展示页主模板 | `resources/views/pages/show.blade.php` | `@section('body'):9` |
+| TinyMCE 编辑器模板 | `resources/views/pages/parts/wysiwyg-editor-tinymce.blade.php` | 全文 |
+| 主题系统文档 | `dev/docs/logical-theme-system.md` | 全文 |

@@ -1354,3 +1354,284 @@ public function findVisibleById(int $id): ?Page
 | TinyMCE 编辑器模板 | `resources/views/pages/parts/wysiwyg-editor-tinymce.blade.php` | 全文 |
 | 自定义头部模板 | `resources/views/layouts/parts/custom-head.blade.php` | 全文 |
 | 主题系统文档 | `dev/docs/logical-theme-system.md` | 全文 |
+
+---
+
+## 九、代码级实现细节勘误
+
+> 以下逐一对照代码核实用户提出的实现细节。部分概念在 BookStack 中**不存在对应实现**，如实记录。
+
+### 9.1 本地无 MathJax 时的降级路径
+
+**结论：BookStack 不内置 MathJax，不存在相关降级路径。**
+
+搜索范围：
+- 全项目 Grep `mathjax|katex|math.*render` → 命中仅 TinyMCE 压缩包内字符串，无业务代码
+- `resources/js/` 无数学公式渲染模块
+- `app/` 无 MathML 处理逻辑
+- `composer.json` / `package.json` 无 math 相关依赖
+
+**实际行为**：
+- Word 粘贴的公式以 OMML（Office MathML）形式进入 TinyMCE
+- TinyMCE 将其转为标准 HTML/SVG 片段（`svg[*]` 放行策略）
+- 保存入库的是 SVG 标记，不是 MathML
+- 只读视图中公式显示为静态 SVG，无 JavaScript 运行时渲染
+- 如果用户需要 MathJax，只能通过「设置→自定义 HTML 头部」注入 CDN 脚本，不属于核心管线
+
+### 9.2 SVG 外链 `<use href>` 的 SSRF 风险与防护
+
+**结论：存在已知风险点，但 BookStack 的防护是间接的、不完整。**
+
+`<svg><use href="http://internal-server/..."/></svg>` 是经典 SSRF 向量——浏览器会请求外部 URL 加载 SVG 片段。
+
+**BookStack 已有的防护**：
+
+| 防护层 | 代码位置 | 覆盖场景 |
+|--------|---------|---------|
+| `xlink:href` 全删 | `HtmlContentFilter.php:81` `//@*[contains(name(), 'xlink:href')]` | 覆盖 SVG 1.1 的 `xlink:href`（已废弃） |
+| SVG 属性中 `data:`/`javascript:` 删除 | `HtmlContentFilter.php:76` | 覆盖属性值含 `data:`/`javascript:` 的情况 |
+| `<iframe src>` 外链检查 | `ConfiguredHtmlPurifier.php` iframe 正则 `%^(http://|https://|//)%` | 仅限 iframe，不影响 SVG |
+| HTMLPurifier URI 策略 | `ConfiguredHtmlPurifier.php` 允许 `http https mailto ...` | 仅限白名单过滤启用时 |
+
+**未覆盖的缺口**：
+
+```html
+<!-- 这段不会被任何现有规则拦截： -->
+<svg><use href="http://internal-server/admin"/></svg>
+<!-- 1. href 属性不在 xlink:href 过滤范围 -->
+<!-- 2. href 值不含 data: 或 javascript:，不触发属性值过滤 -->
+<!-- 3. SVG use 不走 iframe 的 href 白名单 -->
+<!-- 4. 若未启用 useAllowListFilter (a)，HTMLPurifier 不参与 -->
+```
+
+**风险评级**：中等。需要攻击者能在页面中插入任意 SVG（需要编辑权限），且服务端在内网有可达资源。默认配置 `jhfa` 中若启用 `a`（HTMLPurifier），SVG 整体会被删除从而消除此风险。
+
+### 9.3 Intervention/Image 在 GD 与 Imagick 后端的兼容差异
+
+**结论：BookStack 硬编码使用 GD 驱动，不支持 Imagick 后端。**
+
+`ImageResizer.php:163-168`：
+```php
+if (!extension_loaded('gd')) {
+    throw new ImageUploadException('The PHP "gd" extension is required to resize images, but is missing.');
+}
+$manager = new ImageManager(
+    new Driver(),   // ← 硬编码 Gd\Driver
+    autoOrientation: false,
+);
+```
+
+| 维度 | GD（当前使用） | Imagick（未使用） |
+|------|--------------|-----------------|
+| 动画 GIF | `NativeObjectDecoder` + `imagecreatefromstring()` 特殊处理 | Imagick 原生支持 |
+| EXIF 方向 | 手动 `exif_read_data()` + 旋转（`orientImageToOriginalExif`） | Intervention `autoOrientation` 已关闭，手动处理同 GD |
+| 内存占用 | 较高（全量解码到内存） | 更高（Imagick 对象更大） |
+| 格式支持 | `jpg jpeg png gif webp avif` | 更多格式 |
+| APNG/AVIF 动画检测 | 手动二进制解析（`isApngData`/`isAnimatedAvifData`） | Imagick 可用 `getImageDelay()` |
+
+**不存在运行时切换后端的逻辑**，也无配置项。若要切换需修改 `ImageResizer` 源码。
+
+### 9.4 highlight.js 前后端版本不一致时的对账方案
+
+**结论：BookStack 不使用 highlight.js，不存在前后端版本对账问题。**
+
+搜索范围：
+- 全项目 Grep `highlight\.js|hljs` → 仅命中 `debugbar.php` 配置（Laravel Debugbar 的可选功能）
+- 代码高亮使用 **CodeMirror 6**（`resources/js/code/`），不是 highlight.js
+- 服务端**不做语法高亮**（见 2.9 节）
+- 前端 CodeMirror 6 语言包版本由 `package.json` 锁定，不存在前后端版本对账需求
+
+**版本管理方式**：
+- CodeMirror 及其语言扩展通过 `package.json` + `package-lock.json` 统一管理
+- 构建时打包进 `dist/`，运行时加载单一 bundle
+- 语言映射表 `languages.js` 是前端静态配置，不依赖服务端
+
+### 9.5 IntersectionObserver 低端机降级到节流的阈值与判定
+
+**结论：BookStack 不做 IntersectionObserver 降级，无阈值判定逻辑。**
+
+`page-display.js:78` 的目录滚动高亮直接使用 `IntersectionObserver`：
+```javascript
+const pageNavObserver = new IntersectionObserver(headingVisibilityChange, {
+    rootMargin: '0px 0px 0px 0px',
+    threshold: 1.0,
+});
+```
+
+**没有降级逻辑**：
+- ❌ 无 `typeof IntersectionObserver === 'undefined'` 检测
+- ❌ 无 `window.IntersectionObserver` polyfill
+- ❌ 无备用的 `scroll` + `throttle` 方案
+- ❌ 无低端机特征检测（UA/内存/CPU 核心）
+
+**影响**：在不支持 `IntersectionObserver` 的浏览器（IE11、极老版 Android WebView）上，目录高亮功能静默失效，但不影响页面内容渲染——功能降级为"无高亮"，不存在崩溃风险。
+
+### 9.6 ServiceProvider 注册扩展运行时禁用时的清理顺序
+
+**结论：BookStack 的主题 ServiceProvider 不支持运行时动态禁用/清理。**
+
+`ThemeServiceProvider::boot()` 的工作模式：
+```
+App boot
+  ├─ 若无 APP_THEME → 直接 return（不注册任何东西）
+  └─ 有主题配置 →
+      ├─ loadModules() → 扫描目录
+      ├─ readThemeActions() → require functions.php（监听器注册）
+      ├─ dispatch(APP_BOOT) → 一次性通知
+      ├─ 注册视图路径 → view()->addNamespace()
+      └─ dispatch(THEME_REGISTER_VIEWS)
+```
+
+**关键特性**：
+1. **单次启动**：`boot()` 只执行一次，注册的监听器、视图命名空间等无法撤销
+2. **无 `register()` 方法**：不使用 Laravel 的 deferred provider 机制
+3. **无 `provides()` 方法**：不声明可延迟加载的服务
+4. **监听器不可取消**：`ThemeService::listen()` 只做 `$this->listeners[$event][] = $action`，没有 `forgetListener`/`removeListener`
+
+**禁用主题的方式**：只能通过修改 `APP_THEME` 环境变量后重启应用。不支持运行时热切换。
+
+### 9.7 PAGE_CONTENT_HEAD 与 PAGE_BEFORE_DISPLAY 的相对触发顺序
+
+**结论：这两个事件在 BookStack 中都不存在。**
+
+搜索范围：
+- `ThemeEvents.php` 完整常量列表：无 `PAGE_CONTENT_HEAD`，无 `PAGE_BEFORE_DISPLAY`
+- 全项目 Grep `PAGE_BEFORE_DISPLAY|PAGE_CONTENT_HEAD` → 仅命中 `page-render.md`（本文档之前的描述）
+
+**BookStack 实际存在的事件**（完整列表）：
+
+| 事件 | 触发时机 |
+|------|---------|
+| `APP_BOOT` | 应用启动后 |
+| `COMMONMARK_ENVIRONMENT_CONFIGURE` | Markdown 转换前 |
+| `PAGE_INCLUDE_PARSE` | 页面引用解析时 |
+| `PAGE_CONTENT_PRE_STORE` | 内容保存前 |
+| `PAGE_CONTENT_POST_RENDER` | 内容渲染后 |
+| `WEB_MIDDLEWARE_BEFORE` | Web 中间件前 |
+| `WEB_MIDDLEWARE_AFTER` | Web 中间件后 |
+| `OIDC_ID_TOKEN_PRE_VALIDATE` | OIDC ID Token 验证前 |
+| `ROUTES_REGISTER_WEB` | Web 路由注册时 |
+| `ROUTES_REGISTER_WEB_AUTH` | 认证路由注册时 |
+| `THEME_REGISTER_VIEWS` | 主题视图注册时 |
+
+**页面头部自定义**通过 `CustomHtmlHeadContentProvider`（见 6.3 节）实现，不是通过事件钩子。
+
+### 9.8 EntityPermissionEvaluator 权限链递归终止条件
+
+**结论：权限链不是递归实现，而是有限长度的数组遍历，终止条件是链的固定结构。**
+
+`EntityPermissionEvaluator::gatherEntityChainTypeIds()` (`EntityPermissionEvaluator.php:139`)：
+
+```php
+protected function gatherEntityChainTypeIds(SimpleEntityData $entity): array
+{
+    $chain = [$entity->type . ':' . $entity->id];
+
+    if ($entity->type === 'page' && $entity->chapter_id) {
+        $chain[] = 'chapter:' . $entity->chapter_id;
+    }
+
+    if ($entity->type === 'page' || $entity->type === 'chapter') {
+        $chain[] = 'book:' . $entity->book_id;
+    }
+
+    return $chain;
+}
+```
+
+**链的固定结构**（最多 3 级，无递归）：
+
+| 实体类型 | 权限链 |
+|---------|--------|
+| Page（有章节） | `page:id` → `chapter:id` → `book:id` |
+| Page（无章节） | `page:id` → `book:id` |
+| Chapter | `chapter:id` → `book:id` |
+| Book | `book:id` |
+| Bookshelf | `bookshelf:id` |
+
+**终止条件控制变量**：
+
+```php
+// collapseAndCategorisePermissions 中的提前终止
+protected function collapseAndCategorisePermissions(array $typeIdChain, array $permissionMapByTypeId): array
+{
+    $permitsByType = ['fallback' => [], 'role' => []];
+
+    foreach ($typeIdChain as $typeId) {
+        // ...收集权限...
+        
+        // 关键终止条件：找到 fallback 权限即停止向上遍历
+        if (isset($permitsByType['fallback'][0])) {
+            break;   // ← 这是唯一的提前终止点
+        }
+    }
+
+    return $permitsByType;
+}
+```
+
+**终止机制总结**：
+1. **结构性终止**：链长度由实体类型决定，最多 3 级，不会无限延伸
+2. **语义性终止**：遍历链时如果找到 `fallback` 权限（`role_id = 0`），立即 `break`——上级实体的权限不再参考
+3. **没有 `mergePermissions` 递归函数**：权限评估是迭代式链遍历，不是递归合并
+4. **优先级**：链前端优先 → 页面自身权限 > 章节权限 > 书本权限；`role` 级权限 > `fallback` 级权限
+
+### 9.9 边界条件源码级索引表
+
+以下汇总 7 个边界问题的精确源码位置和关键参数：
+
+| 边界问题 | 源码文件 | 行号 | 关键代码 | 备注 |
+|---------|---------|------|---------|------|
+| **MathJax 降级** | `app/Theming/CustomHtmlHeadContentProvider.php` | 24 | `forWeb()` | 无内置 MathJax，公式转静态 SVG。需自定义头部注入 CDN。 |
+| **SVG `<use href>` SSRF 防护** | `app/Util/HtmlContentFilter.php` | 76, 81 | `//svg//@*[contains(., 'data:')]` / `//@*[contains(name(), 'xlink:href')]` | 防护不完整，默认 `jhfa` 中 `a` 选项会整体删除 SVG。 |
+| **GD 与 Imagick 切换** | `app/Uploads/ImageResizer.php` | 163-168 | `new Driver()` (Gd\Driver 硬编码) | 不支持 Imagick，无配置项切换，需改源码。 |
+| **highlight.js 版本对账** | N/A | N/A | N/A | 不使用 highlight.js，用 CodeMirror 6，服务端不做高亮，无对账需求。 |
+| **IntersectionObserver 降级阈值** | `resources/js/components/page-display.js` | 78 | `threshold: 1.0` | 无降级逻辑。现有 `debounce()` 阈值由调用方传入，搜索用 200ms、内容变化用 500ms。 |
+| **扩展运行时禁用清理** | `app/App/Providers/ThemeServiceProvider.php` | 25-40 | `boot()` | 不支持运行时禁用，监听器注册后无法注销，无清理顺序。 |
+| **权限链终止关键变量** | `app/Permissions/EntityPermissionEvaluator.php` | 69-71 | `if (isset($permitsByType['fallback'][0])) break;` | 找到 `role_id = 0` 的 fallback 权限即停止向上遍历。 |
+| **PermissionStatus 常量** | `app/Permissions/PermissionStatus.php` | 7-10 | `IMPLICIT_DENY=0, IMPLICIT_ALLOW=1, EXPLICIT_DENY=2, EXPLICIT_ALLOW=3` | 联合权限状态枚举，`max(status)` 用于 role 级冲突解决。 |
+
+### 9.10 `debounce` 节流阈值在各场景的取值
+
+BookStack 前端唯一的节流工具是 `util.ts:8` 的 `debounce()`，各调用场景的阈值取舍：
+
+| 场景 | 文件 | 阈值 | 说明 |
+|------|------|------|------|
+| 搜索输入 | `components/search.js` | 200ms | 快速响应用户输入 |
+| 编辑器内容变化 | `components/page-editor.js` | 500ms | 平衡响应速度与服务器压力 |
+| 自动保存草稿 | `components/page-editor.js` | 30s | 定时保存，避免频繁提交 |
+| 布局响应式切换 | `components/tri-layout.ts` | 100ms | 窗口 resize 防抖 |
+| 目录滚动高亮 | N/A | N/A | 直接用 IntersectionObserver，不节流 |
+
+> 如果要给 IntersectionObserver 做低端机降级，参考阈值可设为 `debounce(callback, 100ms)`，与布局切换一致。
+
+### 9.11 联合权限状态合并逻辑
+
+`JointPermissionBuilder::createJointPermissionData()` 中无 `mergePermissions` 递归函数，但有**角色权限 vs 实体权限**的合并逻辑：
+
+```php
+// EntityPermissionEvaluator.php:35-47
+protected function evaluatePermitsByType(array $permitsByType): ?int
+{
+    // ① 角色级权限优先（显式设置）
+    if (count($permitsByType['role']) > 0) {
+        return max($permitsByType['role'])
+            ? PermissionStatus::EXPLICIT_ALLOW
+            : PermissionStatus::EXPLICIT_DENY;
+    }
+
+    // ② fallback 权限（role_id = 0，适用于所有角色）
+    if (count($permitsByType['fallback']) > 0) {
+        return $permitsByType['fallback'][0]
+            ? PermissionStatus::IMPLICIT_ALLOW
+            : PermissionStatus::IMPLICIT_DENY;
+    }
+
+    return null;  // ③ 无实体权限 → 回退到角色全局权限
+}
+```
+
+**终止条件的控制变量**：
+- **结构性**：`$typeIdChain` 数组长度（最多 3）
+- **语义性**：`isset($permitsByType['fallback'][0])` → `break`
+- **角色冲突**：`max($permitsByType['role'])` → 任意角色显式允许即允许（但通常同一实体同一角色只有一条权限记录，不会冲突）

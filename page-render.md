@@ -128,6 +128,128 @@ if ($editorType->isHtmlBased() && !old('html') && $lastEditorId !== user()->id) 
 }
 ```
 
+### 2.5 TinyMCE 编辑器：Paste 净化 (`resources/js/wysiwyg-tinymce/config.js:296`)
+
+TinyMCE 配置了三层粘贴防御：
+
+**① `paste_preprocess` 钩子（TinyMCE 原生事件）**
+```javascript
+paste_preprocess(plugin, args) {
+    const {content} = args;
+    if (content.indexOf('<img src="file://') !== -1) {
+        args.content = '';  // 直接清空本地文件引用
+    }
+}
+```
+
+**② `paste_data_images: false`（全局配置）**
+```javascript
+paste_data_images: false,  // 禁止 TinyMCE 自动把剪贴板图片转成 base64
+```
+
+**③ 自定义 `paste` 事件监听器 (`drop-paste-handling.js:35`)**
+```javascript
+export function listenForDragAndPaste(editor, options) {
+    editor.on('paste', event => paste(editor, options, event));
+    editor.on('drop', event => drop(editor, options, event));
+    // ...
+}
+```
+
+自定义 `paste()` 函数处理流程：
+1. 用 `Clipboard` 服务检查剪贴板条目
+2. 如果包含表格数据 → 交给 TinyMCE 默认处理
+3. 有图片文件 → 拦截默认行为，插入 loading 占位图后异步上传
+4. 无图片 → 不拦截，走默认粘贴
+
+### 2.6 TinyMCE 编辑器：Image Upload Base64 转外链 (`drop-paste-handling.js:15`)
+
+当粘贴/拖拽图片到编辑器时：
+
+```javascript
+async function uploadImageFile(file, pageId) {
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    formData.append('uploaded_to', pageId);
+    const resp = await window.$http.post(window.baseUrl('/images/gallery'), formData);
+    return resp.data;  // 返回 {url, thumbs: {display}, name}
+}
+
+function paste(editor, options, event) {
+    const images = clipboard.getImages();
+    for (const imageFile of images) {
+        // 1. 先插入 loading 占位图
+        editor.insertContent(`<p><img src="/loading.gif" id="${id}"></p>`);
+        // 2. 异步上传
+        uploadImageFile(imageFile, options.pageId).then(resp => {
+            // 3. 上传成功，替换为外链 + a 标签包裹
+            const newImageHtml = `<img src="${resp.thumbs.display}" alt="${resp.name}"/>`;
+            const newEl = editor.dom.create('a', {target: '_blank', href: resp.url}, newImageHtml);
+            editor.dom.replace(newEl, id);
+        }).catch(err => {
+            // 4. 上传失败，移除占位图
+            editor.dom.remove(id);
+        });
+    }
+}
+```
+
+**后端上传安全检查**（`ImageRepo.php:87`）：
+```php
+$contextPage = $this->pageQueries->findVisibleByIdOrFail($uploadedTo);
+// 校验当前用户对该 page 有 ImageCreateAll 权限
+```
+
+### 2.7 TinyMCE 编辑器：Code-Block 语言识别 (`plugin-codeeditor.js`)
+
+TinyMCE 使用自定义 `<code-block>` Web Component 作为代码块包装器，实现语法高亮的所见即所得：
+
+**① 解析阶段：`<pre>` → `<code-block>` 包装**
+```javascript
+editor.parser.addNodeFilter('pre', elms => {
+    for (const el of elms) {
+        const wrapper = window.tinymce.html.Node.create('code-block', {
+            contenteditable: 'false',
+        });
+        // 剥除 <pre> 内的高亮 span（防止粘贴带格式的代码）
+        const spans = el.getAll('span');
+        for (const span of spans) span.unwrap();
+        el.attr('style', null);
+        el.wrap(wrapper);
+    }
+});
+```
+
+**② 语言识别：`<code class="language-xxx">`**
+```javascript
+getLanguage() {
+    const getLanguageFromClassList = classes => {
+        const langClasses = classes.split(' ').filter(c => c.startsWith('language-'));
+        return (langClasses[0] || '').replace('language-', '');
+    };
+    const code = this.querySelector('code');
+    const pre = this.querySelector('pre');
+    return getLanguageFromClassList(pre.className) || (code && getLanguageFromClassList(code.className)) || '';
+}
+```
+
+**③ 序列化阶段：`<code-block>` → 解包**
+```javascript
+editor.serializer.addNodeFilter('code-block', elms => {
+    for (const el of elms) {
+        // 把 dir 转到内部 <pre> 上
+        const direction = el.attr('dir');
+        if (direction && el.firstChild) el.firstChild.attr('dir', direction);
+        el.unwrap();  // 移除外层 <code-block>，保留内部 <pre><code>
+    }
+});
+```
+
+最终输出到数据库的格式：
+```html
+<pre dir="ltr"><code class="language-javascript">const a = 1;</code></pre>
+```
+
 ---
 
 ## 三、模板拼装与内容保存（后端阶段）
@@ -329,7 +451,91 @@ URI 策略：
 - Iframe src 正则：`%^(http://|https://|//)%`
 - 启用：`CSS.AllowTricky`、`Attr.EnableID`
 
-### 4.3 净化触发时机汇总
+### 4.4 HtmlContentFilter 自定义过滤的完整 XPath 枚举
+
+`filterOutScriptsFromDocument` 方法中的完整 XPath 规则：
+
+| 目标 | XPath 表达式 | 处理方式 |
+|------|-------------|----------|
+| `<script>` 标签 | `//script` | 删除节点 |
+| `<iframe src="data:">` | `//iframe[contains(@src, 'data:')]` | 删除节点 |
+| `<embed src="data:">` | `//*[self::embed or self::object][contains(@src, 'data:')]` | 删除节点 |
+| `<iframe src="javascript:">` | `//*[self::iframe or self::embed or self::object][contains(@src, 'javascript:')]` | 删除节点 |
+| `href="javascript:"` | `//*[contains(@href, 'javascript:')]` | 删除节点 |
+| `action="javascript:"` | `//*[contains(@action, 'javascript:')]` | 删除节点 |
+| `formaction="javascript:"` | `//*[contains(@formaction, 'javascript:')]` | 删除节点 |
+| `xlink:href` SVG 属性 | `//@*[name() = 'xlink:href']` | 删除属性 |
+| SVG 危险属性值 | `//@*[namespace-uri() = 'http://www.w3.org/2000/svg' and contains(., 'javascript:')]` | 删除属性 |
+| SVG data: 属性值 | `//@*[namespace-uri() = 'http://www.w3.org/2000/svg' and contains(., 'data:')]` | 删除属性 |
+| `on*` 事件属性 | `//@*[starts-with(name(), 'on')]` | 删除属性 |
+
+`filterOutFormElementsFromDocument` 方法：
+
+| 目标 | XPath 表达式 | 处理方式 |
+|------|-------------|----------|
+| 表单标签 | `//*[self::form or self::fieldset or self::button or self::textarea or self::select]` | 删除节点 |
+| 非 checkbox 的 `<input>` | `//input[not(@type) or @type != 'checkbox']` | 删除节点 |
+| `form*` 属性 | `//@*[name() = 'form' or name() = 'formaction' or name() = 'formmethod' or name() = 'formtarget']` | 删除属性 |
+
+`filterOutBadHtmlElementsFromDocument` 方法：
+
+| 目标 | XPath 表达式 | 处理方式 |
+|------|-------------|----------|
+| meta refresh | `//meta[@http-equiv = 'refresh' and contains(@content, 'url=')]` | 删除节点 |
+
+`filterOutNonContentElementsFromDocument` 方法：
+
+| 目标 | XPath 表达式 | 处理方式 |
+|------|-------------|----------|
+| 非内容标签 | `//*[self::link or self::style or self::meta or self::title or self::template]` | 删除节点 |
+
+### 4.5 HTMLPurifier 白名单标签与属性完整枚举
+
+`HTMLPurifier` 默认 HTML5 配置 + BookStack 自定义扩展后的允许清单：
+
+**块级元素**：
+```
+address, article, aside, blockquote, body, br, caption, cite, code, col, colgroup, dd, del, details, dfn, div, dl, dt, em, figcaption, figure, footer, h1, h2, h3, h4, h5, h6, header, hr, html, i, img, ins, kbd, li, main, mark, nav, noscript, ol, p, pre, q, rp, rt, ruby, s, samp, section, small, span, strike, strong, sub, summary, sup, table, tbody, td, tfoot, th, thead, time, tr, u, ul, var, wbr, object, embed, input
+```
+
+**自定义扩展元素**：
+```php
+// <object data type width height>
+$object = $config->getHTMLDefinition(true)->addElement('object', 'Block', 'Flow', 'Common', [
+    'data' => 'URI#embedded',
+    'type' => 'Text',
+    'width' => 'Length',
+    'height' => 'Length',
+]);
+// <embed src type width height>
+$embed = $config->getHTMLDefinition(true)->addElement('embed', 'Inline', 'Empty', 'Common', [
+    'src' => 'URI#embedded',
+    'type' => 'Text',
+    'width' => 'Length',
+    'height' => 'Length',
+]);
+// <input type=checkbox checked disabled readonly>
+$input = $config->getHTMLDefinition(true)->addElement('input', 'Inline', 'Empty', 'Common', [
+    'type' => new HTMLPurifier_AttrDef_Enum(['checkbox']),
+    'checked' => 'Bool',
+    'disabled' => 'Bool',
+    'readonly' => 'Bool',
+]);
+```
+
+**自定义扩展属性**：
+```php
+// div[drawio-diagram]
+$div = $config->getHTMLDefinition(true)->addBlankElement('div');
+$div->attr['drawio-diagram'] = new HTMLPurifier_AttrDef_Text();
+
+// a[target=_blank|data-mention-user-id]
+$a = $config->getHTMLDefinition(true)->addBlankElement('a');
+$a->attr['target'] = new HTMLPurifier_AttrDef_Enum(['_blank']);
+$a->attr['data-mention-user-id'] = new HTMLPurifier_AttrDef_Text();
+```
+
+### 4.6 净化触发时机汇总
 
 | 时机 | 位置 | 说明 |
 |------|------|------|

@@ -112,7 +112,85 @@ public function update(Page $page, array $input): Page
 }
 ```
 
-### 1.4 修订存储与清理
+### 1.4 updatePage 事务回滚链
+
+#### 1.4.1 事务封装机制
+
+BookStack 使用自定义的 `DatabaseTransaction` 类封装数据库事务，设置 `READ COMMITTED` 隔离级别：
+
+- **核心类**：`DatabaseTransaction` [app/Util/DatabaseTransaction.php](app/Util/DatabaseTransaction.php)
+- **隔离级别**：`READ COMMITTED` — 事务内能读到其他已提交事务的修改
+- **设计原因**：权限生成等场景需要考虑其他已提交事务的变更
+
+```php
+class DatabaseTransaction
+{
+    public function run(): mixed
+    {
+        DB::statement('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        return DB::transaction($this->callback);
+    }
+}
+```
+
+#### 1.4.2 新页面创建事务链
+
+`publishDraft()` 使用事务包裹以下操作，任一环节失败全部回滚：
+
+1. `draft = false` + `revision_count = 1`
+2. `BaseRepo::update()` — 更新页面基本信息
+3. `rebuildPermissions()` — 重建权限
+4. `storeNewForPage()` — 创建第一条修订
+5. `Activity::add()` — 记录活动日志
+6. `sortParent()` — 父级排序
+
+- **核心代码**：`PageRepo::publishDraft()` [app/Entities/Repos/PageRepo.php:85-102](app/Entities/Repos/PageRepo.php#L85-L102)
+
+```php
+public function publishDraft(Page $draft, array $input): Page
+{
+    return (new DatabaseTransaction(function () use ($draft, $input) {
+        $draft->draft = false;
+        $draft->revision_count = 1;
+        // ... 更新内容 ...
+        $draft = $this->baseRepo->update($draft, $input);
+        $draft->rebuildPermissions();
+        $this->revisionRepo->storeNewForPage($draft, $summary);
+        // ... 活动日志 ...
+        return $draft;
+    }))->run();
+}
+```
+
+#### 1.4.3 页面更新的非事务特性
+
+**注意**：常规 `PageRepo::update()` **没有显式事务包裹**，以下操作分步执行：
+
+| 步骤 | 操作 | 失败影响 |
+|------|------|----------|
+| 1 | `BaseRepo::update()` 保存页面 | 页面数据不更新 |
+| 2 | `revision_count++` 保存 | 版本号不递增 |
+| 3 | 删除用户草稿 | 草稿可能残留 |
+| 4 | `storeNewForPage()` 创建修订 | 修订不创建，但页面已更新 |
+
+> **风险**：第4步（创建修订）失败时，页面内容已更新但版本历史缺失，出现"幽灵更新"。
+
+#### 1.4.4 回滚操作的非事务特性
+
+`restoreRevision()` 同样**没有事务包裹**，分步执行：
+
+1. `revision_count++` + 填充旧数据
+2. 重新解析内容（setNewMarkdown/HTML）
+3. `refreshSlug()` + `save()`
+4. `indexForSearch()` — 搜索索引
+5. `referenceStore->updateForEntity()` — 引用存储
+6. `storeNewForPage()` — 创建恢复版本的修订
+7. URL 变化时更新引用
+8. 活动日志
+
+> **风险点**：步骤 6 之前失败会导致页面已回滚但无修订记录；步骤 7 失败会导致引用链接失效。
+
+### 1.5 修订存储与清理
 
 - **存储字段**：完整快照（name、html、markdown、text）
 - **版本限制**：通过 `config('app.revision_limit')` 配置，默认保留最近版本
@@ -171,7 +249,69 @@ restoreRevision():
   create revision with revision_number = N+1
 ```
 
-### 2.3 数据库设计溯源
+### 2.3 revision_number 并发插入冲突分析
+
+#### 2.3.1 并发场景与风险
+
+**典型并发时序**（两个用户同时保存同一页面）：
+
+```
+User A: read page.revision_count = 5
+User B: read page.revision_count = 5
+User A: page.revision_count++ → 6, save()
+User A: create revision with revision_number = 6 ✓
+User B: page.revision_count++ → 7, save()
+User B: create revision with revision_number = 7 ✓
+```
+
+看似没有问题，但存在**丢失更新风险**：
+
+| 时序 | 用户A | 用户B | page.revision_count |
+|------|-------|-------|---------------------|
+| T1 | 读取=5 | - | 5 |
+| T2 | - | 读取=5 | 5 |
+| T3 | ++ → 6，save | - | 6 |
+| T4 | - | ++ → 6，save | 6 (覆盖!) |
+| T5 | 创建修订#6 | - | 6 |
+| T6 | - | 创建修订#6 | 6 |
+
+> **问题**：PHP 层 `++` 操作不是原子的，两个请求都读到 5，都改成 6，产生两个 `revision_number = 6` 的修订，且 `revision_count` 只递增了一次。
+
+#### 2.3.2 现有防御机制
+
+**实际上 BookStack 并没有显式的乐观锁或悲观锁机制**，依赖以下因素降低冲突概率：
+
+1. **草稿分散写入**：自动保存写入 `update_draft` 类型的修订，不更新 `revision_count`
+2. **正式保存低频**：用户主动点击保存才触发 `revision_count++`，频率远低于自动保存
+3. **并发警告**：通过 `PageEditActivity` 提前告知用户有人在编辑
+
+#### 2.3.3 为什么用自增ID而非revision_number定位
+
+`getPreviousRevision()` 使用自增 ID 定位前一版本 [app/Entities/Models/PageRevision.php:66-77](app/Entities/Models/PageRevision.php#L66-L77)，而非 `revision_number`：
+
+```php
+$id = static::newQuery()->where('page_id', '=', $this->page_id)
+    ->where('id', '<', $this->id)  // 用自增ID比较
+    ->max('id');
+```
+
+**原因**：
+- `revision_number` 可能重复（并发冲突）
+- 自增 ID 全局唯一，不会重复
+- 即使版本号冲突，历史记录仍然可通过 ID 正确遍历
+
+#### 2.3.4 并发冲突的实际影响
+
+即使发生并发覆盖，后果相对可控：
+
+- **revision_count 不准确**：显示的修订总数偏少，但修订记录本身存在
+- **重复的 revision_number**：两个修订版本号相同，但内容是两份快照
+- **不影响回滚**：回滚通过 `id` 而非 `revision_number` 定位
+- **不影响差异对比**：diff 通过 ID 顺序遍历
+
+> **结论**：并发冲突主要影响"版本号展示"的准确性，不影响核心功能可用性。这是一个已知的权衡设计，优先保障写入性能和用户体验。
+
+### 2.4 数据库设计溯源
 
 - `pages.revision_count` 字段：[database/migrations/2017_04_20_185112_add_revision_counts.php:15-17](database/migrations/2017_04_20_185112_add_revision_counts.php#L15-L17)
 - `page_revisions.revision_number` 字段：[database/migrations/2017_04_20_185112_add_revision_counts.php:18-21](database/migrations/2017_04_20_185112_add_revision_counts.php#L18-L21)

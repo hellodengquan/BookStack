@@ -1635,3 +1635,243 @@ protected function evaluatePermitsByType(array $permitsByType): ?int
 - **结构性**：`$typeIdChain` 数组长度（最多 3）
 - **语义性**：`isset($permitsByType['fallback'][0])` → `break`
 - **角色冲突**：`max($permitsByType['role'])` → 任意角色显式允许即允许（但通常同一实体同一角色只有一条权限记录，不会冲突）
+
+### 9.12 第二轮 8 个边界问题源码级核实
+
+以下继续对照代码核实第二批边界问题，按"有对应实现 / 无对应实现"分类。
+
+---
+
+#### 9.12.1 MathJax 缺包时服务端预渲染缓存的清理路径
+
+**结论：不存在。BookStack 无 MathJax，无服务端预渲染，更无相关缓存。**
+
+搜索范围：
+- 全项目 Grep `mathjax|katex|mathml|latex` → 仅命中 TinyMCE 压缩包内字符串
+- `app/` 无任何数学公式处理类
+- 缓存键中无 `math` 相关标识
+- 没有"公式渲染缓存清理"的 Artisan 命令
+
+**实际行为**：Word 粘贴的公式经 TinyMCE 转为 SVG 位图，保存为静态 SVG，不需要运行时渲染。
+
+---
+
+#### 9.12.2 SVG 内部 HTTPS 调用如何区分 SSRF
+
+**结论：BookStack 不区分合法 HTTPS 与 SSRF，采用"删已知风险"策略而非白名单。**
+
+`HtmlContentFilter.php` 中的 SVG 相关规则：
+
+| XPath | 作用 |
+|-------|------|
+| `//svg//@*[contains(., 'data:')]` | 删除含 `data:` URI 的 SVG 属性值 |
+| `//svg//@*[contains(., 'javascript:')]` | 删除含 `javascript:` 的 SVG 属性值 |
+| `//@*[contains(name(), 'xlink:href')]` | 删除所有 `xlink:href` 属性 |
+
+**不会被拦截的合法/危险 URL**：
+
+```html
+<!-- 合法外链 SVG（不会被删，但可能被浏览器加载） -->
+<svg><use href="https://cdn.example.com/icons.svg#heart"/></svg>
+
+<!-- SSRF 攻击（不会被删，可被浏览器发起请求） -->
+<svg><use href="https://internal-server/metadata"/></svg>
+```
+
+**原因**：
+1. `href` 属性本身不在删除列表中（只删 `xlink:href`）
+2. `https://` 不是 `data:`/`javascript:`，不触发属性值过滤
+3. `filterOutJavaScript` 只检测 `data:`/`javascript:` 方案，不检测 `http://`/`https://`
+
+**绕过方式（启用白名单过滤 `a` 时）**：
+- 启用 `useAllowListFilter` 后，HTMLPurifier 白名单不包含 `<svg>`/`<use>`，整个 SVG 会被删除，自然消除 SSRF 风险
+
+---
+
+#### 9.12.3 GD 与 Imagick 运行时切换并恢复历史压缩结果
+
+**结论：不存在运行时切换机制。硬编码 GD 驱动，不支持 Imagick。**
+
+`ImageResizer.php:163-168`：
+```php
+if (!extension_loaded('gd')) {
+    throw new ImageUploadException('The PHP "gd" extension is required to resize images, but is missing.');
+}
+$manager = new ImageManager(
+    new Driver(),   // \Intervention\Image\Drivers\Gd\Driver
+    autoOrientation: false,
+);
+```
+
+**没有的东西**：
+- ❌ 无 `imagick` 驱动检测
+- ❌ 无配置项切换后端
+- ❌ 无"历史压缩结果恢复"逻辑（每次请求都重新生成缩略图，然后查缓存）
+- ❌ 无驱动热切换或 fallback 机制
+
+**缩略图缓存逻辑**（`ImageResizer::loadGalleryThumbnailsForImage`）：
+```
+查缓存 → 查磁盘 → 都没有才生成
+```
+这里的缓存是 Laravel Cache（存路径和存在性），不是"历史压缩结果"的反向恢复。
+
+---
+
+#### 9.12.4 highlight.js 前后端不一致时回退到纯文本的判定
+
+**结论：不存在。BookStack 不用 highlight.js，也没有"前后端不一致→回退纯文本"的逻辑。**
+
+搜索范围：
+- 全项目 Grep `highlight\.js|hljs|highlightjs` → 仅 debugbar 配置有引用
+- 前端用 CodeMirror 6（`@codemirror/lang-*` + `@codemirror/legacy-modes`）
+- 后端不做任何语法高亮
+
+**相关概念澄清**：
+- 服务端 `HtmlContentFilter` 会保留 `<pre>`/`<code>` 标签的结构，不碰内容
+- `toPlainText()` 会剥所有标签生成纯文本用于搜索索引，但这不是"回退"，是正常的索引提取
+- 前端如果 CodeMirror 6 加载失败（网络/CDN问题），代码块会以普通 `<pre>` 文本显示——这是静默降级，不是主动判定回退
+
+---
+
+#### 9.12.5 `deviceMemory` 不被支持时移动端 Safari 的退路
+
+**结论：不存在。BookStack 不使用 `navigator.deviceMemory` 做性能分级。**
+
+搜索范围：
+- 全项目 Grep `deviceMemory|hardwareConcurrency|navigator\.deviceMemory` → 0 命中
+- 无性能分级逻辑，无低内存/低端机特殊处理
+- 无 `Navigator.deviceMemory` polyfill
+
+**现有的性能相关 API 使用情况**：
+- `IntersectionObserver` — 用于目录高亮（不做降级）
+- `requestAnimationFrame` — 用于动画和 DOM 合并
+- `debounce()` — 用于搜索、布局切换等场景
+- 没有基于设备能力的渐进式降级策略
+
+> 如果要实现低端机降级，常见方案是：检测 `navigator.deviceMemory < 2 || !window.IntersectionObserver` 时用 `scroll + debounce(100ms)` 代替 IntersectionObserver。但 BookStack 目前没有做这一层。
+
+---
+
+#### 9.12.6 事件监听器与定时任务的解绑差异
+
+**结论：组件化框架不一致，解绑/清理模式不统一。**
+
+BookStack 前端用自研的 `$components` 组件系统，没有统一的生命周期钩子（如 React 的 `useEffect` cleanup 或 Vue 的 `unmounted`）。各组件自行管理：
+
+**① `tri-layout.ts` — 最规范，有显式 `onDestroy`**：
+```typescript
+private onDestroy: (() => void) | null = null;
+
+setupMobile() {
+    // ...
+    this.onDestroy = () => {
+        // 清理 mobileTabClick 监听器
+        tab.removeEventListener('click', this.mobileTabClick);
+    };
+}
+
+// 切换布局时调用
+if (this.onDestroy) {
+    this.onDestroy();  // ← 切到 desktop 时清理 mobile 的监听器
+    this.onDestroy = null;
+}
+```
+
+**② `page-editor.js` — 有定时器清理，无监听器清理**：
+```javascript
+// 定时任务清理（页面离开时）
+beforeUnload() {
+    if (this.autoSave.interval) {
+        window.clearInterval(this.autoSave.interval);
+    }
+}
+// ← 但没看到 removeEventListener 的清理代码
+```
+
+**③ `notification.js` — 自清理模式**：
+```javascript
+hide() {
+    // ...触发过渡动画...
+    this.container.addEventListener('transitionend', this.hideCleanup);
+}
+hideCleanup() {
+    this.container.removeEventListener('transitionend', this.hideCleanup);  // 执行完自删
+}
+```
+
+**差异对比**：
+
+| 类型 | 清理方式 | 是否统一 | 典型问题 |
+|------|---------|---------|---------|
+| `setInterval` 定时器 | 部分组件有 `clearInterval` | ❌ 不统一 | 组件销毁后仍在跑 → 内存泄漏 |
+| `addEventListener` 事件 | 部分组件有 `removeEventListener` | ❌ 不统一 | 大部分一次性组件不清理，靠 GC 回收 |
+| `IntersectionObserver` | 无 `.disconnect()` 调用 | ❌ 不统一 | page-display 中从未调用 disconnect |
+
+> 由于 BookStack 是多页应用（MPA），页面跳转时整体销毁，组件级泄漏影响有限。单页内的动态组件（如弹窗、编辑器）才需要关注清理。
+
+---
+
+#### 9.12.7 嵌套 Include 父子 HEAD 钩子合并
+
+**结论：不存在。没有 `PAGE_CONTENT_HEAD` 事件，没有 include 的 head 合并逻辑。**
+
+搜索范围：
+- `ThemeEvents.php` 完整常量列表 → 无 `PAGE_CONTENT_HEAD`
+- `PageIncludeParser` → 只处理 body 内的 `{{@id}}` 标签，不碰 head
+- `CustomHtmlHeadContentProvider` → 全局级别的头部注入，与页面内容无关
+
+**实际行为**：
+- 被引用页面的内容嵌入宿主页面的 body 内
+- 不合并任何 head 内容（不合并 CSS、不合并 JS、不合并 meta）
+- 如果被引用页面有特殊的 head 依赖（如数学公式脚本），需要宿主页面自行引入
+
+**自定义头部的注入点**（见 6.3 节）：
+1. `@stack('head')` — Blade 子视图 push
+2. `CustomHtmlHeadContentProvider::forWeb()` — 设置 + 主题模块
+3. 与页面 include 系统完全独立，无"父子合并"概念
+
+---
+
+#### 9.12.8 权限传播：父无子有 / 父有子无 的继承规则
+
+**结论：权限是链状继承，不是递归合并。父无子有 → 子页面独立生效；父有子无 → 继承父级。**
+
+`EntityPermissionEvaluator::collapseAndCategorisePermissions()` 中的遍历逻辑：
+
+```php
+// 链顺序（前端→后端）：page → chapter → book
+// 优先级：链前端 > 链后端
+foreach ($typeIdChain as $typeId) {
+    // 收集该层级的权限...
+    
+    // 找到 fallback 立即停止（= 该层级有"适用于所有角色"的权限设置）
+    if (isset($permitsByType['fallback'][0])) {
+        break;
+    }
+}
+```
+
+**传播规则矩阵**（针对某个角色）：
+
+| 页面权限 | 章节权限 | 书本权限 | 最终结果 | 说明 |
+|---------|---------|---------|---------|------|
+| 显式允许 | 任意 | 任意 | 显式允许 | 页面级覆盖上级 |
+| 显式拒绝 | 任意 | 任意 | 显式拒绝 | 页面级覆盖上级 |
+| 未设置 | 显式允许 | 任意 | 显式允许 | 继承章节 |
+| 未设置 | 显式拒绝 | 任意 | 显式拒绝 | 继承章节 |
+| 未设置 | 未设置 | 显式允许 | 显式允许 | 继承书本 |
+| 未设置 | 未设置 | 显式拒绝 | 显式拒绝 | 继承书本 |
+| 未设置 | 未设置 | 未设置 | 回退角色全局权限 | 链式未命中 |
+
+**"父无子有"的传播**：
+- 子页面有显式权限 → 使用子页面的（无论父级如何）
+- 子页面无 → 看章节 → 章节有 → 使用章节的
+- 章节也无 → 看书本 → 书本有 → 使用书本的
+- 都没有 → 回退到角色全局权限
+
+**关键终止变量**：
+1. **结构性终止**：`$typeIdChain` 数组遍历完（最多 3 级）
+2. **语义性终止**：找到 `fallback`（`role_id = 0`）权限 → `break`，不再向上找
+3. **角色级优先**：`role` 级权限 > `fallback` 级权限（见 `evaluatePermitsByType`）
+
+> **没有 `mergePermissions` 函数**。权限不是"合并"，是"优先级继承"——链上最近的显式权限生效。

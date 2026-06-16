@@ -367,6 +367,44 @@ public function getPreviousRevision(): ?PageRevision
 
 > **注意**：这里使用的是自增ID而非 `revision_number` 来定位前一版本，避免版本号不连续导致的定位错误。
 
+### 3.4 html_diff 大文档性能分析
+
+#### 3.4.1 算法复杂度
+
+`ssddanbrown/htmldiff` 基于经典的 HTML diff 算法：
+
+- **核心思想**：将 HTML 拆分为词元（words），使用 LCS（最长公共子序列）算法找差异
+- **时间复杂度**：O(n*m)，n 和 m 分别为两个版本的词元数
+- **空间复杂度**：O(n*m)，需构建二维动态规划表
+
+#### 3.4.2 性能瓶颈点
+
+| 瓶颈 | 原因 | 影响 |
+|------|------|------|
+| **大文档比对** | LCS 算法平方级复杂度 | 文档越长，耗时指数级增长 |
+| **HTML 结构复杂** | 嵌套标签多，词元数量膨胀 | 内存占用高，计算慢 |
+| **大段内容替换** | 几乎无公共子序列 | 退化为 O(n*m) 最坏情况 |
+
+#### 3.4.3 BookStack 中的性能保障
+
+BookStack 对 diff 做了以下间接优化：
+
+1. **仅按需加载**：`changes()` 路由独立，用户点击"查看变化"才执行 diff
+2. **分页展示**：修订列表分页（50条/页），diff 只针对单个修订
+3. **内容过滤后再对比**：先过滤再 diff，减少无效标签干扰
+   ```php
+   $rawDiff = Diff::excecute($prevContent, $revision->html);
+   $diff = $filter->filterString($rawDiff);  // 注意：过滤在diff之后
+   ```
+
+> **注意**：`HtmlContentFilter` 在 diff 之后执行，意味着 diff 过程处理的是原始 HTML，可能包含大量可过滤标签，增加了计算量。
+
+#### 3.4.4 大文档场景风险
+
+- **内存溢出**：特别长的页面（几万字+复杂HTML）可能导致 PHP 内存超限
+- **超时风险**：diff 计算可能超过 PHP `max_execution_time` 限制
+- **无缓存机制**：每次访问重新计算，不缓存 diff 结果
+
 ---
 
 ## 四、并发覆盖兜底机制
@@ -442,11 +480,280 @@ if (resp.data.warning && !this.shownWarningsCache.has(resp.data.warning)) {
 
 > **设计思想**：BookStack 采用**警告而非阻塞**的策略，用户可以选择继续保存，但会被明确告知风险。
 
+### 4.5 乐观锁冲突解决 UI
+
+#### 4.5.1 无真正的乐观锁机制
+
+BookStack **没有实现基于版本号的乐观锁**（即没有 `version` 字段用于 `WHERE version = ?` 的原子更新检查）。
+
+当前的"冲突检测"本质是：
+- **检测**：查询是否有他人的 `update_draft` 草稿
+- **提示**：给出警告消息
+- **不阻止**：用户仍然可以保存，不会因为冲突而拒绝写入
+
+#### 4.5.2 冲突UI呈现方式
+
+警告通过两种方式传递给用户：
+
+**方式一：页面级通知（进入编辑页时）**
+
+```php
+// PageEditorData::build()
+if ($editActivity->hasActiveEditing()) {
+    $this->warnings[] = $editActivity->activeEditingMessage();
+}
+// 在控制器中通过 showWarningNotification() 展示
+if ($editorData->getWarnings()) {
+    $this->showWarningNotification(implode("\n", $editorData->getWarnings()));
+}
+```
+
+**方式二：AJAX 返回的 warning 字段（自动保存时）**
+
+```javascript
+// page-editor.js
+if (resp.data.warning && !this.shownWarningsCache.has(resp.data.warning)) {
+    window.$events.emit('warning', resp.data.warning);
+    this.shownWarningsCache.add(resp.data.warning);
+}
+```
+
+#### 4.5.3 缺少的冲突解决能力
+
+与真正的协作系统相比，BookStack 缺少：
+
+| 能力 | 状态 | 说明 |
+|------|------|------|
+| **实时看到他人编辑** | ❌ | 仅知道有人在编辑，看不到编辑内容 |
+| **冲突差异对比** | ❌ | 不会对比你的版本和最新版本的差异 |
+| **选择合并** | ❌ | 没有"接受我的版本/接受他人版本/合并"选项 |
+| **保存被拒绝** | ❌ | 后保存的会直接覆盖先保存的 |
+
+### 4.6 分支与合并机制
+
+#### 4.6.1 无版本分支概念
+
+BookStack 的修订历史是**线性的**，没有分支（branch）概念：
+
+- 只有一条时间线，按 `created_at` / `id` 排序
+- 每个修订都只有一个"前一版本"和（可能的）"后一版本"
+- 回滚 = 创建新版本，不是切回旧分支
+
+#### 4.6.2 Yjs 实时协作（实验性？）
+
+代码中存在 Yjs 协同编辑相关实现，位于 `resources/js/wysiwyg/lexical/yjs/` 目录下：
+
+- **核心文件**：
+  - `SyncEditorStates.ts` — 编辑器状态同步
+  - `SyncCursors.ts` — 光标位置同步
+  - `Bindings.ts` — Yjs 与 Lexical 绑定
+  - `CollabElementNode.ts` / `CollabTextNode.ts` — 可协作节点类型
+
+- **冲突解决方式**：CRDT（无冲突复制数据类型）
+  - Yjs 自动处理并发编辑的合并
+  - 不需要用户手动解决冲突
+  - 基于操作转换（OT）思想的 CRDT 实现
+
+```typescript
+// SyncEditorStates.ts - 核心同步逻辑
+export function syncYjsChangesToLexical(
+  binding: Binding,
+  provider: Provider,
+  events: Array<YEvent<YText>>,
+  isFromUndoManger: boolean,
+): void {
+  editor.update(() => {
+    for (let i = 0; i < events.length; i++) {
+      $syncEvent(binding, events[i]);
+    }
+    // ... 光标同步
+  });
+}
+```
+
+#### 4.6.3 实时协作的现状
+
+根据代码分析：
+- 仅存在于 Lexical 编辑器（下一代 WYSIWYG 编辑器）
+- 有完整的 Yjs 绑定实现
+- 但**需要 Provider**（如 WebSocket 后端）才能真正启用
+- 默认安装中可能未启用实时协作功能
+
+> **注意**：Yjs 协作是前端层面的实时合并，最终保存时仍然走常规修订流程，产生 `revision_count++` 的新版本快照。
+
 ---
 
-## 五、回滚完整流程
+## 五、版本审计与权限
 
-### 5.1 回滚入口
+### 5.1 修订权限体系
+
+#### 5.1.1 权限定义
+
+专门的修订权限只有一个：
+
+```php
+// Permission.php
+case RevisionViewAll = 'revision-view-all';
+```
+
+权限粒度：
+- **查看**：`revision-view-all` — 全局查看所有修订历史
+- **删除**：受 `page-delete` 权限控制（删除修订需要页面删除权限）
+- **恢复**：受 `page-update` 权限控制（回滚需要页面更新权限）
+
+- **核心代码**：`Permission::RevisionViewAll` [app/Permissions/Permission.php:121](app/Permissions/Permission.php#L121)
+
+#### 5.1.2 权限检查点
+
+| 操作 | 权限检查 | 代码位置 |
+|------|----------|----------|
+| 查看修订列表 | `RevisionViewAll` | `PageRevisionController::index()` |
+| 查看修订详情 | `RevisionViewAll` | `PageRevisionController::show()` |
+| 查看修订差异 | `RevisionViewAll` | `PageRevisionController::changes()` |
+| 执行回滚 | `PageUpdate` + `RevisionViewAll` | `PageRevisionController::restore()` |
+| 删除修订 | `PageDelete` + `RevisionViewAll` | `PageRevisionController::destroy()` |
+
+```php
+// PageRevisionController::restore()
+$this->checkPermission(Permission::RevisionViewAll);
+$page = $this->pageQueries->findVisibleBySlugsOrFail($bookSlug, $pageSlug);
+$this->checkOwnablePermission(Permission::PageUpdate, $page);
+```
+
+### 5.2 审计日志
+
+#### 5.2.1 修订相关活动类型
+
+```php
+// ActivityType.php
+const REVISION_RESTORE = 'revision_restore';  // 修订被恢复
+const REVISION_DELETE = 'revision_delete';    // 修订被删除
+```
+
+- **核心代码**：`ActivityType` [app/Activity/ActivityType.php:36-37](app/Activity/ActivityType.php#L36-L37)
+
+#### 5.2.2 审计日志查询
+
+- **入口**：`AuditLogController::index()` [app/Activity/Controllers/AuditLogController.php:15-72](app/Activity/Controllers/AuditLogController.php#L15-L72)
+- **权限要求**：`SettingsManage` + `UsersManage`（管理员级权限）
+- **筛选维度**：事件类型、日期范围、用户、IP
+
+#### 5.2.3 审计日志与修订记录的区别
+
+| 维度 | 修订记录 (page_revisions) | 审计日志 (activities) |
+|------|---------------------------|----------------------|
+| **内容** | 包含完整页面内容快照 | 仅记录操作事件元数据 |
+| **目的** | 支持回滚、差异对比 | 操作审计、安全追溯 |
+| **保留** | 受 revision_limit 限制 | 通常永久保留（需手动清理） |
+| **权限** | revision-view-all | settings-manage + users-manage |
+| **粒度** | 按页面 | 全系统 |
+
+---
+
+## 六、存储优化与回滚副作用
+
+### 6.1 存储优化：仅存 diff 的可能性
+
+#### 6.1.1 当前策略：完整快照
+
+BookStack 采用**全量快照**存储策略，每次修订保存完整的 HTML/Markdown/文本：
+
+```php
+// RevisionRepo::storeNewForPage()
+$revision->name = $page->name;
+$revision->html = $page->html;      // 完整HTML
+$revision->markdown = $page->markdown;  // 完整Markdown
+$revision->text = $page->text;      // 完整纯文本
+```
+
+#### 6.1.2 为什么不用增量 diff 存储
+
+**优点（当前快照策略）**：
+1. **回滚简单**：直接读取某条修订记录即可恢复
+2. **diff 灵活**：可以任意两个版本对比，不限于相邻版本
+3. **可靠性高**：单条记录损坏不影响其他版本
+4. **实现简单**：逻辑直接，bug 少
+
+**缺点**：
+1. **存储空间大**：每个版本都是完整拷贝，冗余度高
+2. **增量效率低**：小修改也产生完整快照
+
+#### 6.1.3 现有的存储优化手段
+
+BookStack 通过以下方式控制存储体积，而非使用 diff 存储：
+
+1. **版本数量限制**：`config('app.revision_limit')`，超出自动清理
+   ```php
+   protected function deleteOldRevisions(Page $page): void {
+       $revisionLimit = config('app.revision_limit');
+       // ... 跳过前 N 条，删除剩余的
+   }
+   ```
+
+2. **草稿定期失效**：`update_draft` 草稿只检测最近 60 分钟的
+3. **用户草稿复用**：同一用户对同一页面只有一个 update_draft（更新而非新增）
+
+### 6.2 回滚副作用分析
+
+#### 6.2.1 直接副作用
+
+执行 `restoreRevision()` 会触发以下连锁反应：
+
+| 副作用 | 触发条件 | 说明 |
+|--------|----------|------|
+| **搜索索引重建** | 总是触发 | `$page->indexForSearch()` |
+| **引用关系更新** | 总是触发 | `referenceStore->updateForEntity()` |
+| **Slug 重新生成** | 总是触发 | `refreshSlug()` — 可能导致URL变化 |
+| **引用链接批量更新** | URL 变化时触发 | 更新所有引用该页面的链接 |
+| **父级重排序** | 总是触发 | `sortParent()` — 可能影响同级页面顺序 |
+| **新修订产生** | 总是触发 | 回滚本身产生新版本，revision_count++ |
+| **活动日志** | 总是触发 | PAGE_RESTORE + REVISION_RESTORE 两条日志 |
+
+#### 6.2.2 URL 变化的连锁反应
+
+当回滚导致页面标题（slug）变化时，`ReferenceUpdater` 会批量更新所有引用：
+
+- **核心代码**：`ReferenceUpdater::updateEntityReferences()` [app/References/ReferenceUpdater.php:20-30](app/References/ReferenceUpdater.php#L20-L30)
+
+```php
+public function updateEntityReferences(Entity $entity, string $oldLink): void
+{
+    $references = $this->getReferencesToUpdate($entity);
+    foreach ($references as $reference) {
+        $this->updateReferencesWithinEntity($reference->from, $oldLink, $newLink);
+    }
+}
+```
+
+**影响范围**：
+- 更新所有引用该页面的其他页面的 HTML/Markdown
+- 更新书籍、章节的描述中的链接
+- 每个被修改的页面都会 `revision_count++`，产生新修订
+- 新修订的摘要为 "Updated references to page"
+
+> **潜在风险**：回滚一个热门页面（被很多其他页面引用）可能触发大量页面的修订记录增长。
+
+#### 6.2.3 搜索索引回滚一致性
+
+回滚后调用 `indexForSearch()`，确保搜索结果与回滚后内容一致：
+
+- 更新搜索索引中的页面标题、文本内容
+- 回滚是立即生效的，搜索结果同步更新
+
+#### 6.2.4 回滚的"不可逆"性
+
+虽然回滚操作本身被记录为新版本（可以"回滚回滚"），但有几点不可逆：
+
+1. **修订记录的创建**：回滚产生的新版本不会消失
+2. **活动日志**：审计日志永久记录回滚操作
+3. **引用更新**：如果 URL 变化后又变回来，引用页面也会产生两次修订记录
+4. **已删除的修订**：如果回滚到的版本之后的修订被手动删除了，回滚后那些内容就找不回来了
+
+---
+
+## 七、回滚完整流程
+
+### 7.1 回滚入口
 
 - **路由**：`POST /books/{bookSlug}/page/{pageSlug}/revisions/{revisionId}/restore`
 - **控制器**：`PageRevisionController::restore()` [app/Entities/Controllers/PageRevisionController.php:135-144](app/Entities/Controllers/PageRevisionController.php#L135-L144)
@@ -461,7 +768,7 @@ public function restore(string $bookSlug, string $pageSlug, int $revisionId)
 }
 ```
 
-### 5.2 回滚核心实现
+### 7.2 回滚核心实现
 
 - **核心方法**：`PageRepo::restoreRevision()` [app/Entities/Repos/PageRepo.php:229-265](app/Entities/Repos/PageRepo.php#L229-L265)
 
@@ -526,11 +833,11 @@ public function restoreRevision(Page $page, int $revisionId): Page
   2. 触发HTML净化和安全过滤
   3. 处理可能的格式升级
 
-#### 5.3.3 引用更新
+#### 7.3.3 引用更新
 - **设计**：检测URL变化，更新系统内所有引用
 - **涉及**：`ReferenceUpdater::updateEntityReferences()`
 
-### 5.4 修订删除限制
+### 7.4 修订删除限制
 
 - **禁止删除最新修订**：`PageRevisionController::destroy()` [app/Entities/Controllers/PageRevisionController.php:163-167](app/Entities/Controllers/PageRevisionController.php#L163-L167)
 
@@ -543,7 +850,7 @@ if (intval($page->currentRevision->id ?? null) === intval($revId)) {
 
 ---
 
-## 六、完整数据链路图
+## 八、完整数据链路图
 
 ```
 用户编辑页面
@@ -586,7 +893,7 @@ if (intval($page->currentRevision->id ?? null) === intval($revId)) {
 
 ---
 
-## 七、关键设计总结
+## 九、关键设计总结
 
 | 设计点 | 实现方式 | 优势 |
 |--------|----------|------|
@@ -596,3 +903,9 @@ if (intval($page->currentRevision->id ?? null) === intval($revId)) {
 | **警告而非阻塞** | 并发编辑只提示不阻止 | 用户体验好，极端场景不丢数据 |
 | **LocalStorage兜底** | AJAX失败时存本地 | 网络异常时保障用户输入 |
 | **版本数量限制** | 可配置revision_limit，自动清理旧版本 | 控制数据库体积 |
+| **线性历史无分支** | 单时间线，回滚=创建新版本 | 概念简单，用户易理解 |
+| **READ COMMITTED事务** | 自定义事务隔离级别 | 权限生成等场景能看到其他已提交变更 |
+| **自增ID定位前序** | diff用ID而非revision_number | 避免版本号冲突导致历史断裂 |
+| **CRDT实时协作** | Lexical+Yjs（前端层） | 多用户实时编辑无冲突合并 |
+| **引用自动更新** | URL变化时批量更新引用页 | 保持链接有效性 |
+| **审计日志分离** | activities表独立于revisions表 | 安全审计与内容回滚职责分离 |

@@ -320,6 +320,27 @@ $exportModel->metadataOnly() → 只保留名称/id 存到 import.metadata
 - text/plain 且提供了扩展名时，按 `textTypesByExtension` 映射回更具体的类型（css→text/css、js→text/javascript、json→application/json、csv→text/csv）
 - 本质是**MIME 白名单 + 安全降级**，防止 polyglot 文件（伪装成图片的脚本/HTML）绕过检测
 
+**ZipValidationHelper 自定义规则扩展机制**：
+`ZipValidationHelper`（`app/Exports/ZipExports/ZipValidationHelper.php`）是校验规则的上下文容器，设计上支持自定义规则扩展：
+
+**核心机制**：
+- **上下文共享**：Helper 持有 `ZipExportReader` 实例和 `validatedIds` 状态，所有规则类共享同一上下文
+- **工厂方法**：`fileReferenceRule()` 和 `uniqueIdRule()` 是规则工厂方法，每次调用返回新的 Rule 实例但共享同一个 Helper
+- **Laravel 集成**：内部通过 `app(Factory::class)` 获取 Laravel Validation Factory，`validateData()` 委托给 Laravel Validator
+- **递归校验**：`validateRelations()` 对每个子数组（如 pages[]、chapters[]）递归调用对应模型的 `validate()` 方法，整棵树一次性校验完
+
+**扩展新规则的约定步骤**：
+1. 新建规则类实现 `Illuminate\Contracts\Validation\ValidationRule` 接口
+2. 构造函数接收 `ZipValidationHelper $context` + 业务参数
+3. 在 `validate()` 方法中通过 `$this->context->zipReader` 访问 ZIP，通过 `$this->context->hasIdBeenUsed()` 等方法共享状态
+4. 在 `ZipValidationHelper` 中添加工厂方法（如 `myCustomRule($param): MyCustomRule`）
+5. 在对应 `ZipExport*::validate()` 方法的 rules 数组中使用 `$helper->myCustomRule(...)`
+
+**状态共享模式**：
+- `validatedIds` 数组是全局 Set，跨所有子模型校验共享，保证 ID 全局唯一
+- `zipReader` 是单例，所有规则复用同一个 ZIP 句柄，避免重复打开
+- 错误消息扁平化：`ZipExportValidator::flattenModelErrors()` 把嵌套错误数组拍平为 `book.chapters.0.pages.2.name` 形式的点分路径，方便前端展示
+
 **Import 表模型**（`app/Exports/Import.php`）：
 - `decodeMetadata()` 可从 JSON metadata 反序列化回 ZipExport* 模型（但已 metadataOnly，不含正文）
 - 非管理员只能看到自己创建的 Import（`ImportRepo.php:46-55`）
@@ -430,6 +451,14 @@ DatabaseTransaction → DB::transaction(...)
 - 导入完成后 `sortParent()` 只做同层内的顺序调整，不涉及跨父级移动
 - 真正的排序 ABAC 发生在手动拖拽排序（BookSorter）场景，导入是"批量创建"语义而非"移动重排"语义
 
+**BookSorter cache invalidation 机制**：
+`BookSorter::sortUsingMap()` 完成排序后，对每本涉及的 Book 调用 `rebuildPermissions()`（`BookSorter.php:111-114`），触发权限缓存失效与重建：
+- **缓存介质**：`joint_permissions` 数据库表（预计算的权限联合表），由 `JointPermissionBuilder` 维护（`app/Permissions/JointPermissionBuilder.php`）
+- **失效粒度**：按 Book 维度失效+重建 — 排序可能改变 book/chapter 归属，因此整本书的 joint permission 全部重算
+- **级联重建**：`rebuildForEntity()` 对 Book 实例会递归包含所有子 Chapter 和 Page，确保整树权限一致
+- **与导入的区别**：导入时 `publishDraft()` / 创建章节也会调 `rebuildPermissions()`，但只针对单个新创建的实体；BookSorter 因为可能涉及跨书籍移动，需要按 Book 粒度整块重建
+- **READ COMMITTED 隔离**：`DatabaseTransaction` 使用 READ COMMITTED 而非默认 REPEATABLE READ，确保权限重建能读到其他已提交事务的变更，避免遗漏
+
 #### 2.2.3 文件提取与上传
 
 `ZipImportRunner::zipFileToUploadedFile()`（`ZipImportRunner.php:264-281`）：
@@ -452,6 +481,14 @@ DatabaseTransaction → DB::transaction(...)
 | ZIP → 临时文件 | `stream_copy_to_stream()` 字节流拷贝，内存占用恒定 | `ZipImportRunner.php:273-275` |
 | 远程存储 → 本地 | `getZipPath()` 中远程 ZIP 流式下载到 `tempnam()` 临时文件 | `ZipImportRunner.php:353-368` |
 | 存储 → ZIP 导出 | `streamAttachmentFromStorage()` / `getImageStream()` 取流后再拷贝 | `ZipExportFiles.php:87-106` |
+
+**四层流式的 backpressure 特性**：
+整个流式链路基于 PHP `stream_copy_to_stream()` 的同步阻塞模型，天然具备 backpressure（背压）：
+- **天然背压**：读端和写端在同一个线程内同步执行，读速度受写速度约束，写慢则读慢，不会出现"读太快写跟不上导致内存暴涨"的情况
+- **缓冲区大小**：PHP 默认 8192 字节/次拷贝，每批次都在 write 端完成后才读下一批
+- **无异步队列**：没有 producer-consumer 队列，也不需要显式的水位线（watermark）控制
+- **阻塞点**：远程存储（S3）的网络 IO 是主要瓶颈，backpressure 自动从最慢的一层向上传导
+- **局限性**：单线程串行拷贝吞吐量有限；超大文件（GB 级）仍受 PHP max_execution_time 限制
 
 **两层大小限制**：
 1. `data.json` 大小限制（读取前检查 stat size）
@@ -489,6 +526,27 @@ BaseRepo::update() / PageRepo::setContentFromInput() 写回数据库
 - 替换后的 URL 不会再被扫描（不是占位符格式），因此 A→B→A 的循环引用不会导致无限替换
 - 与导出前 Page Include 的 3 层深度限制不同，导入时的链接引用是"平面的"——只是 URL 字符串，没有嵌套结构
 - 真正的循环引用风险在 Page Include（`{{@pageId}}` 标签），但导出时已全部展开为静态 HTML，导入文件中不存在 include 标签
+
+**环检测双层的子树合并机制**：
+导出端的 Page Include 展开是双层环检测 + 子树合并的组合策略：
+
+| 层级 | 机制 | 作用 |
+|------|------|------|
+| 第一层（深度限制） | `$includeDepth < 3`，最多展开 3 层 | 防止 A→B→C→A 的循环引用无限展开 |
+| 第二层（节点增量检测） | 每层展开后 `$nodesAdded !== 0` 才继续，无新增则提前终止 | 处理空内容或纯文本 include 的快速退出 |
+
+**子树合并的 DOM 操作**（`PageIncludeParser`）：
+1. **定位与隔离**：用 XPath 找到包含 `{{@` 的文本节点，按标签位置切割为独立 DOM 节点
+2. **段落拆分**：如果 include 标签在 `<p>` 中间，需要把 `<p>` 从标签处拆成两个 `<p>`，因为 include 内容可能是块级元素
+3. **节点替换**：把 include 标签节点替换为被包含页面的 DOM 子树（`toDomNodes()` 返回的节点数组）
+4. **空节点清理**：`toCleanup` 数组收集被掏空的父节点，统一删除
+5. **id 重生成**：超过 1 层时 `updateIdsRecursively()` 给所有标题/有 id 的元素加 `bkmrk-` 前缀，防止子树间 id 冲突
+6. **引用转换**：展开后内容是纯 HTML，原页面内的相对链接会变成绝对 URL（由导出引用编码阶段再处理）
+
+**子树合并的边界约定**：
+- include 内容若是 inline（行内），可留在 `<p>` 内
+- include 内容若是 block（块级），必须"破开"父 `<p>`，把块级元素提升到同级
+- `isInline()` 判断依据：被包含页面是否只含单个段落/纯文本
 
 ---
 
@@ -529,6 +587,31 @@ BaseRepo::update() / PageRepo::setContentFromInput() 写回数据库
    - 上传时 ZIP 已经存到 `uploads/files/imports/` 下
    - 执行导入失败不删除 ZIP 文件本身（Import 记录保留，用户可重试或手动删除）
    - 只有 `deleteImport()` 才会清理 ZIP 文件和 Import 记录
+
+**references rollback 的幂等性分析**：
+`revertStoredFiles()` 的幂等程度取决于底层存储 API：
+
+| 操作 | 幂等性 | 原因 |
+|------|--------|------|
+| `ImageService::destroyFileAtPath()` | 近似幂等 | 底层 `FileStorage::delete()` 调用 `Storage::delete()`，大多数驱动（local/S3）对已不存在文件静默返回 |
+| `AttachmentService::deleteFileInStorage()` | 近似幂等 | 同上 |
+| `cleanup()` 清理临时文件 | 幂等 | `unlink()` 后 `tempFilesToCleanup = []` 清空数组，重复调用不会出错 |
+| 数据库回滚 | 严格幂等 | DB transaction 原子性，要么全部撤销要么全部未提交 |
+
+**幂等性的边界条件**：
+- `revertStoredFiles()` 没有幂等保护标记，多次调用会重复执行删除逻辑
+- 但由于 `cleanup()` 清空 `tempFilesToCleanup` 数组，第二次调用时临时文件列表为空
+- images/attachments 数组在引用对象中不会被清空，重复调用会重复执行文件删除 — 大多数存储驱动对已删除文件返回成功或静默忽略，但理论上可能抛出异常
+- 实际场景中回滚只执行一次（事务回滚后立即调用一次），所以幂等性不是强需求
+
+**远程存储最终一致的告警机制**：
+BookStack 对远程存储最终一致性的处理非常克制，**没有显式告警**：
+- 写入/删除操作不做重试，失败直接抛 `FileUploadException` 或被上层 catch
+- `FileStorage::uploadFile()` 捕获异常后只 `Log::error()` 记日志，然后重新抛出
+- 导入导出链路中，存储操作失败会被最外层的 try-catch 捕获，触发 DB 回滚 + 文件回滚
+- S3 的最终一致性窗口内（通常秒级）重复操作可能出现"刚上传就读不到"或"刚删了还能读到"的情况
+- 由于导入流程是单线程串行的（先上传文件再读回？不，导入时只写不读回），写后立刻读的场景很少，因此最终一致性问题实际影响有限
+- 若需增强告警，可在 `FileStorage` 层面添加事件钩子（如 `FileStored` / `FileDeleted` event），由外部系统监听并做一致性校验
 
 ---
 
@@ -602,9 +685,39 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 - **双重大小限制**：data.json 和 files/* 分别受 `app.upload_limit` 限制，双层防护防止超大文件
 - **事务隔离级别**：关键写操作（publishDraft 等）统一用 `DatabaseTransaction` 封装，显式设置 READ COMMITTED 隔离级别
 
+### 3.4 导入 17 项防御优先级排序
+
+按执行顺序 + 防御重要性综合排序（编号越小越先执行 / 越关键）：
+
+| 优先级 | 防御项 | 类型 | 失败影响 |
+|-------|--------|------|---------|
+| P0 | ZIP 格式校验（能否打开） | 入口防线 | 直接拒绝，不进入后续逻辑 |
+| P0 | data.json 存在且可解析 | 入口防线 | 直接拒绝 |
+| P0 | data.json 大小限制 | 资源防线 | 防止超大 JSON 撑爆内存 |
+| P1 | 顶层 key 类型识别（book/chapter/page） | 结构防线 | 拒绝未知格式 |
+| P1 | 必填字段校验 | 结构防线 | 字段缺失导致后续逻辑出错 |
+| P1 | 字段类型校验 | 结构防线 | 类型错误导致运行时异常 |
+| P1 | ZipUniqueIdRule 同类型 ID 唯一 | 引用防线 | 占位符歧义、引用指向错误实体 |
+| P2 | ZipFileReferenceRule 文件存在性 | 文件防线 | 创建实体时找不到文件 |
+| P2 | 单文件大小限制 | 资源防线 | 大文件占满磁盘/内存 |
+| P2 | 图片 MIME 白名单校验 | 安全防线 | polyglot 文件绕过安全策略 |
+| P2 | 父级类型匹配校验 | 结构防线 | 实体归属错误 |
+| P3 | 权限逐级校验（ensurePermissionsPermitImport） | 权限防线 | 越权创建实体 |
+| P3 | 图片伪装扩展名嗅探 | 安全防线 | 同上，侧重上传后真实检测 |
+| P3 | publishDraft 事务原子性 | 数据一致性 | 部分创建半残数据 |
+| P3 | 数据库事务 + 文件回滚 | 数据一致性 | 失败后残留垃圾数据 |
+| P4 | 引用替换两阶段 | 数据正确性 | 内部链接指向旧 URL 或失效 |
+| P4 | Draw.io 图表 ID 替换 | 数据正确性 | drawio 图表关联错乱 |
+
+**分层防御思想**：
+- **P0-P1 入口/结构层**：在 data.json 解析阶段就挡掉 80% 的无效输入
+- **P2 文件/资源层**：在实体创建前校验文件引用和资源限制
+- **P3 权限/一致性层**：创建过程中保证权限合规和事务完整
+- **P4 正确性/细节层**：创建后修正引用，保证数据可用但不影响安全
+
 ---
 
-## 附录：核心类索引
+## 附录 A：核心类索引
 
 | 功能 | 类文件路径 |
 |------|-----------|
@@ -632,3 +745,51 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 | 数据库事务封装 | `app/Util/DatabaseTransaction.php` |
 | Web 安全 MIME 嗅探器 | `app/Util/WebSafeMimeSniffer.php` |
 | 导出配置 | `app/Config/exports.php` |
+
+---
+
+## 附录 B：24 核心类 SOLID 评估
+
+对导入导出链路中 24 个核心类按 SOLID 五原则做逐一评估：
+
+| 类 | SRP 单一职责 | OCP 开闭 | LSP 里氏替换 | ISP 接口隔离 | DIP 依赖反转 | 综合评价 |
+|----|-------------|----------|-------------|-------------|-------------|---------|
+| **PdfGenerator** | ⭐⭐⭐⭐⭐ 只做 PDF 生成，引擎选择逻辑内聚 | ⭐⭐⭐ 新增引擎需改 match 分支 | ⭐⭐⭐ 无继承体系 | ⭐⭐⭐⭐ 对外接口单一（fromHtml） | ⭐⭐ 直接 new 引擎对象 | 引擎策略模式可再抽象 |
+| **ExportFormatter** | ⭐⭐⭐⭐ 只做导出格式化，5 种格式各成方法 | ⭐⭐⭐ 新增格式需加方法 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 对外是具体方法 | ⭐⭐ 依赖具体类而非接口 | 职责较多但边界清晰 |
+| **ZipExportBuilder** | ⭐⭐⭐⭐⭐ 只负责构建 ZIP 文件 | ⭐⭐⭐ 新增导出类型需扩展 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口简洁 | ⭐⭐⭐ 依赖 ZipExportFiles 等具体类 | 职责单一，异常回滚完善 |
+| **ZipExportFiles** | ⭐⭐⭐⭐⭐ 只管文件引用命名和提取 | ⭐⭐⭐⭐ 新增文件类型只需加方法 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口精简 | ⭐⭐⭐ 依赖 AttachmentService/ImageService | 命名去重逻辑干净 |
+| **ZipExportReferences** | ⭐⭐⭐⭐⭐ 只管引用编码替换 | ⭐⭐⭐⭐ 新增引用类型加 resolver | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口明确 | ⭐⭐⭐ 依赖具体 referenceMap | 职责高度内聚 |
+| **ZipImportRunner** | ⭐⭐⭐ 负责整个导入流程，职责偏多 | ⭐⭐ 新增导入类型需改 run() | ⭐⭐⭐ 无继承 | ⭐⭐⭐ 接口简单但内部复杂 | ⭐⭐⭐ 依赖注入 Repo 和 Service | 可拆分为 ImportOrchestrator + 各层级 Importer |
+| **ZipImportReferences** | ⭐⭐⭐⭐⭐ 只管引用替换和映射 | ⭐⭐⭐⭐ 新增类型加方法即可 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口清晰 | ⭐⭐⭐ 依赖具体 model 类 | 引用两阶段设计优雅 |
+| **ZipReferenceParser** | ⭐⭐⭐⭐⭐ 只做 URL/引用解析 | ⭐⭐⭐⭐⭐ resolver 链模式可扩展 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口单一 | ⭐⭐⭐⭐ 面向 Closure 编程可扩展 | 解析器链模式经典 |
+| **ZipExportReader** | ⭐⭐⭐⭐⭐ 只读取 ZIP 文件 | ⭐⭐⭐⭐ 新增读取方法不破坏 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口简洁 | ⭐⭐⭐ 依赖 ZipArchive 具体类 | 流式读取设计好 |
+| **ZipExportValidator** | ⭐⭐⭐⭐⭐ 只做校验编排 | ⭐⭐⭐⭐ 模型 validate 可扩展 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口单一 | ⭐⭐⭐⭐ 依赖 ZipValidationHelper 抽象 | 校验与错误分离清晰 |
+| **ZipUniqueIdRule** | ⭐⭐⭐⭐⭐ 只做唯一性校验 | ⭐⭐⭐⭐ 新增规则不影响 | ⭐⭐⭐⭐⭐ 实现 ValidationRule 接口 | ⭐⭐⭐⭐⭐ 接口隔离好 | ⭐⭐⭐ 依赖 ZipValidationHelper 具体类 | 典型策略模式 |
+| **ZipFileReferenceRule** | ⭐⭐⭐⭐⭐ 只做文件引用校验 | ⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐⭐ 实现 ValidationRule 接口 | ⭐⭐⭐⭐⭐ 接口隔离好 | ⭐⭐⭐ 依赖 ZipValidationHelper | 三重校验逻辑内聚 |
+| **ZipValidationHelper** | ⭐⭐⭐⭐ 管理校验上下文和规则工厂 | ⭐⭐⭐⭐ 加规则只需加工厂方法 | ⭐⭐⭐ 无继承 | ⭐⭐⭐ 暴露方法较多 | ⭐⭐⭐ 依赖具体规则类 | 上下文容器设计合理 |
+| **ZipExportModel** (抽象) | ⭐⭐⭐⭐ 定义导出模型契约 | ⭐⭐⭐⭐⭐ 新增子类不改基类 | ⭐⭐⭐⭐⭐ 模板方法模式 | ⭐⭐⭐⭐⭐ 接口精简（4 个方法） | ⭐⭐⭐⭐⭐ 完全依赖抽象 | 抽象基类设计典范 |
+| **ZipExportBook** | ⭐⭐⭐⭐⭐ 只表示书籍导出数据 | ⭐⭐⭐⭐ 新增字段不破坏 | ⭐⭐⭐⭐⭐ 继承 ZipExportModel | ⭐⭐⭐⭐ 接口稳定 | ⭐⭐⭐ 依赖具体 model | 数据模型类 |
+| **ZipExportChapter** | ⭐⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐ 同上 | ⭐⭐⭐ 同上 | 数据模型类 |
+| **ZipExportPage** | ⭐⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐⭐ 同上 | ⭐⭐⭐⭐ 同上 | ⭐⭐⭐ 同上 | 数据模型类 |
+| **ImportRepo** | ⭐⭐⭐⭐ 导入生命周期管理 | ⭐⭐⭐ 新增生命周期阶段需改 | ⭐⭐⭐ 无继承 | ⭐⭐⭐ 方法较多 | ⭐⭐⭐ 依赖具体类 | 仓储模式标准实现 |
+| **Import** | ⭐⭐⭐⭐⭐ Eloquent 模型，只表示数据 | ⭐⭐⭐⭐ 加字段不破坏 | ⭐⭐⭐ 继承 Model | ⭐⭐⭐  Eloquent 接口较大 | ⭐⭐ Laravel 模型通病 | 典型 Active Record |
+| **BookContents** | ⭐⭐⭐⭐⭐ 只构建书籍内容树 | ⭐⭐⭐⭐ 新增排序方式可扩展 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口清晰 | ⭐⭐⭐ 依赖具体查询类 | 树构建逻辑内聚 |
+| **PageContent** | ⭐⭐⭐⭐ 页面内容渲染，含 include 展开 | ⭐⭐⭐ 新增渲染逻辑需加方法 | ⭐⭐⭐ 无继承 | ⭐⭐⭐ 接口较多 | ⭐⭐⭐ 依赖具体类 | 渲染+include 略重 |
+| **PageIncludeParser** | ⭐⭐⭐⭐⭐ 只做 include 标签解析 | ⭐⭐⭐⭐ 解析逻辑独立 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口单一 | ⭐⭐⭐⭐ 依赖 Closure 回调 | 解析器模式 |
+| **PageRepo** | ⭐⭐⭐⭐ 页面仓储，CRUD + 业务操作 | ⭐⭐⭐ 新增操作需加方法 | ⭐⭐⭐ 无接口 | ⭐⭐⭐ 接口较多 | ⭐⭐ 依赖多个具体服务 | 典型 Repository 模式 |
+| **BookSorter** | ⭐⭐⭐⭐ 只做书籍排序 | ⭐⭐⭐⭐⭐ SortRule 可扩展排序操作 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐ 接口清晰 | ⭐⭐⭐ 依赖具体类 | 排序策略模式好 |
+| **WebSafeMimeSniffer** | ⭐⭐⭐⭐⭐ 只做 MIME 嗅探 + 安全降级 | ⭐⭐⭐⭐ 加白名单改配置即可 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐⭐ 单方法接口 | ⭐⭐⭐ 依赖 finfo 扩展 | 职责单一且安全 |
+| **DatabaseTransaction** | ⭐⭐⭐⭐⭐ 只封装事务和隔离级别 | ⭐⭐⭐ 新增隔离策略需改 | ⭐⭐⭐ 无继承 | ⭐⭐⭐⭐⭐ 单 run() 方法 | ⭐⭐⭐ 依赖 DB Facade | 装饰器模式精简实现 |
+
+**整体 SOLID 评价**：
+
+- **最强项**：SRP（单一职责）整体表现优秀，大部分类职责清晰且边界明确；Zip 相关类尤其突出
+- **次强项**：ISP（接口隔离）良好，核心类对外接口精简，Validation Rule 类是典范
+- **中等项**：OCP（开闭原则）参差不齐 — 解析器链、排序规则、校验规则扩展性好；导入执行器、PDF 生成器扩展性一般
+- **薄弱项**：DIP（依赖反转）是最大短板 — Laravel 生态下普遍依赖具体类而非接口；Eloquent 模型和 Facade 广泛使用导致依赖方向向下
+- **LSP**：继承体系不深，主要在 ZipExportModel 模板方法模式中体现良好
+
+**可改进建议**：
+1. `ZipImportRunner` 可拆分为 `ImportOrchestrator`（编排）+ `BookImporter`/`ChapterImporter`/`PageImporter`（执行），提升 SRP
+2. PDF 引擎可抽象出 `PdfEngineInterface`，用 DI 容器注入，提升 OCP + DIP
+3. Repository 层可抽出接口（如 `PageRepositoryInterface`），便于测试和替换实现

@@ -189,6 +189,17 @@ export.zip
 - 循环检测确保不与已分配的文件名冲突
 - 按 `attachmentId → ref` 和 `imageId → ref` 两张 Map 去重，同个文件多次引用只存一份
 
+**流式提取大文件**：
+`ZipExportFiles::extractEach()` 使用 PHP `stream_copy_to_stream()` 做流式拷贝，而不是一次性读入内存：
+```
+stream 来源 (S3/本地文件) → stream 临时文件 → 加入 ZIP
+```
+- 附件走 `AttachmentService::streamAttachmentFromStorage()` 取流
+- 图片走 `ImageService::getImageStream()` 取流
+- 每个文件落到 `tempnam(sys_get_temp_dir(), 'bszipfile-')` 命名的临时文件
+- 回调处理完后由调用方（`ZipExportBuilder`）负责 `unlink()` 清理
+- 避免大文件占满内存，尤其在远程存储（S3 等）场景下
+
 #### 1.4.3 内部引用转换：[[bsexport:type:id]]
 
 `ZipExportReferences::buildReferences()`（`ZipExportReferences.php:80-112`）把内容中的绝对 URL 替换为占位符：
@@ -215,6 +226,14 @@ page.html 中的链接/图片 → ZipReferenceParser::parseLinks()
 **附件处理约定**：
 - 外部链接（`external=true`）→ 存 `link` 字段（URL 字符串）
 - 内部文件 → 存 `file` 字段（指向 files/ 下的随机名引用）
+
+**Page Include 与循环引用防御**：
+导出前的 `PageContent::render()` 会展开 `{{@pageId}}` 形式的页面 include 标签（`app/Entities/Tools/PageContent.php:327-335`）：
+- 最多展开 **3 层** 嵌套（`$includeDepth < 3`），每层调用 `PageIncludeParser::parse()`
+- 每层展开后如果有新增节点才继续下一层，无新增则提前终止
+- 超过 1 层时还会重新生成 DOM 元素的 `id`（`bkmrk-` 前缀），防止 id 冲突
+- 这是一种**深度限制**的循环防御：即使 A 包含 B、B 包含 A，3 层后自动停止，不会无限递归
+- 导出的 HTML 是**完全展开后的静态内容**，导入时不再有 include 标签，因此导入阶段不需要处理循环引用
 
 #### 1.4.4 各层级数据模型
 
@@ -280,6 +299,26 @@ $exportModel->metadataOnly() → 只保留名称/id 存到 import.metadata
   ↓
 写入 imports 表记录（type/name/size/path/metadata/created_by）
 ```
+
+**ZipUniqueIdRule：历史 ID 复用与唯一性**（`app/Exports/ZipExports/ZipUniqueIdRule.php` + `ZipValidationHelper.php:46-56`）：
+- 校验范围是**同类型内** ID 唯一，即 `page:5` 和 `chapter:5` 可以共存，但不能有两个 `page:5`
+- `validatedIds` 用 `"<type>:<id>"` 字符串 key 做 Set，`hasIdBeenUsed()` 首次调用返回 false 并登记，后续相同 key 返回 true 触发失败
+- 这些 ID 是**源实例的历史 ID**，导入后会重新分配新 ID，不与当前实例 ID 冲突
+- 唯一性保证的是 `[[bsexport:page:5]]` 占位符不会歧义——一个 ID 只能指向一个实体
+
+**ZipFileReferenceRule + WebSafeMimeSniffer：极端 MIME 防御**：
+`ZipFileReferenceRule`（`app/Exports/ZipExports/ZipFileReferenceRule.php`）做三重校验：
+1. **存在性**：`files/<name>` 在 ZIP 中真实存在
+2. **大小限制**：单文件 ≤ `app.upload_limit` MB，和 data.json 用同一上限
+3. **MIME 白名单**（图片时）：用 `WebSafeMimeSniffer` 嗅探前 2000 字节，必须在 `{image/png, image/jpeg, image/gif, image/webp}` 内
+
+`WebSafeMimeSniffer`（`app/Util/WebSafeMimeSniffer.php`）的降级策略：
+- 先用 `finfo` 扩展嗅探原始 MIME
+- 若结果在 40 余种 `$safeMimes` 白名单内 → 直接返回
+- 若不在白名单但属于 `text/*` → 降级为 `text/plain`
+- 其他全部 → 降级为 `application/octet-stream`
+- text/plain 且提供了扩展名时，按 `textTypesByExtension` 映射回更具体的类型（css→text/css、js→text/javascript、json→application/json、csv→text/csv）
+- 本质是**MIME 白名单 + 安全降级**，防止 polyglot 文件（伪装成图片的脚本/HTML）绕过检测
 
 **Import 表模型**（`app/Exports/Import.php`）：
 - `decodeMetadata()` 可从 JSON metadata 反序列化回 ZipExport* 模型（但已 metadataOnly，不含正文）
@@ -357,6 +396,40 @@ importBook()
 - 所有子节点按 `priority` 升序创建，保持导出时的排序
 - 每个创建的实体/附件/图片都立即调用 `ZipImportReferences::addXxx()` 建立旧 id → 新对象的映射
 
+**publishDraft 原子性**（`app/Entities/Repos/PageRepo.php:83-103`）：
+`publishDraft()` 用 `DatabaseTransaction` 包装成单事务，设置 **READ COMMITTED** 隔离级别：
+```
+DatabaseTransaction → DB::transaction(...)
+  ├── $draft->draft = false;
+  ├── $draft->revision_count = 1;
+  ├── $this->getNewPriority($draft)  // 计算新 priority
+  ├── updateTemplateStatusAndContentFromInput()  // 处理 HTML/Markdown 内容
+  ├── baseRepo->update()  // slug、name 等字段更新
+  ├── rebuildPermissions()  // 重建权限索引
+  ├── revisionRepo->storeNewForPage()  // 存初始版本
+  ├── Activity::add(PAGE_CREATE)  // 活动日志
+  └── baseRepo->sortParent()  // 触发父级排序
+```
+- 任何一步异常都会回滚整个事务，保证页面对象、版本、权限、活动日志全部或全无
+- `DatabaseTransaction` 先执行 `SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED`，再调用 Laravel 的 `DB::transaction()`
+- READ COMMITTED 的意义：权限重建等操作能读到其他已提交事务的变更，避免权限遗漏
+
+**Markdown 双轨与 metadata 兼容**：
+- 导出时：若 Page 有原始 `markdown` 字段，data.json 中同时存 `html` + `markdown`；否则只存 `html`
+- `metadataOnly()` 时：`html` 和 `markdown` 都被置为 null，仅保留 `name`/`id`/`priority` 等元数据
+- 导入预览（`Import::decodeMetadata()`）：因为 metadataOnly 过，所以只展示名称树，不暴露正文内容
+- 执行导入时：重新从 ZIP 的 data.json 读取完整数据，包含 html + markdown
+- 正文写入（`updateTemplateStatusAndContentFromInput()`）：**markdown 优先** — 若 input 中有 markdown 且非空，走 Markdown 编辑器路径并重新渲染 HTML；否则走 HTML 编辑器路径
+- 编辑器类型（`page.editor`字段）会根据内容类型自动切换，需 `Permission::EditorChange` 权限
+
+**priority 排序与 ABAC 接入**：
+导入过程中 priority 是直接赋值的，不经过排序 UI 的 ABAC 检查，但权限统一在 `ensurePermissionsPermitImport()` 中校验：
+- 导入排序不经过 `BookSorter`（`app/Sorting/BookSorter.php`）的复杂 ABAC 逻辑
+- `BookSorter::isSortChangePermissible()` 会同时检查：当前父级更新权 + 目标父级更新权 + 元素本身编辑权 + 移动时的删除权/创建权
+- 导入时简化为：只要有对应层级的 `PageCreate`/`ChapterCreate` 权限，就允许设置 priority
+- 导入完成后 `sortParent()` 只做同层内的顺序调整，不涉及跨父级移动
+- 真正的排序 ABAC 发生在手动拖拽排序（BookSorter）场景，导入是"批量创建"语义而非"移动重排"语义
+
 #### 2.2.3 文件提取与上传
 
 `ZipImportRunner::zipFileToUploadedFile()`（`ZipImportRunner.php:264-281`）：
@@ -369,6 +442,21 @@ importBook()
   ↓
 临时文件路径加入 tempFilesToCleanup[]，全部流程结束后统一 unlink
 ```
+
+**大文件流式处理的多层设计**：
+整个导入导出链路对大文件都采用 stream 流式处理，避免一次性载入内存：
+
+| 层级 | 实现 | 代码位置 |
+|------|------|---------|
+| ZIP 读取 | `ZipArchive::getStream()` 获取文件流，而非 `getFromName()` 一次性读 | `ZipExportReader.php:100-103` |
+| ZIP → 临时文件 | `stream_copy_to_stream()` 字节流拷贝，内存占用恒定 | `ZipImportRunner.php:273-275` |
+| 远程存储 → 本地 | `getZipPath()` 中远程 ZIP 流式下载到 `tempnam()` 临时文件 | `ZipImportRunner.php:353-368` |
+| 存储 → ZIP 导出 | `streamAttachmentFromStorage()` / `getImageStream()` 取流后再拷贝 | `ZipExportFiles.php:87-106` |
+
+**两层大小限制**：
+1. `data.json` 大小限制（读取前检查 stat size）
+2. 每个 `files/xxx` 大小限制（提取前检查 stat size）
+都基于 `app.upload_limit` 配置（MB），防止超大文件撑爆内存或磁盘。
 
 **图片 MIME 嗅探**：`importImage()` 先用 `ZipExportReader::sniffFileMime()` 读文件前 2000 字节通过 `WebSafeMimeSniffer` 检测真实 MIME，再从 MIME 推导出扩展名用于保存。
 
@@ -395,6 +483,13 @@ BaseRepo::update() / PageRepo::setContentFromInput() 写回数据库
 
 **referenceMap 的构建时机**：每个 `addXxx($newModel, $exportModel)` 被调用时，以 `"<type>:<oldid>"` 为 key 存入 `$this->referenceMap`，因此替换阶段能查到映射。
 
+**循环引用与递归防御**：
+导入阶段的引用替换是**单次扫描**，不会出现循环替换问题：
+- `parseReferences()` 用正则一次性找出所有 `[[bsexport:*]]` 占位符，逐个替换为真实 URL
+- 替换后的 URL 不会再被扫描（不是占位符格式），因此 A→B→A 的循环引用不会导致无限替换
+- 与导出前 Page Include 的 3 层深度限制不同，导入时的链接引用是"平面的"——只是 URL 字符串，没有嵌套结构
+- 真正的循环引用风险在 Page Include（`{{@pageId}}` 标签），但导出时已全部展开为静态 HTML，导入文件中不存在 include 标签
+
 ---
 
 ### 2.3 导入失败的回滚策略
@@ -412,6 +507,28 @@ BaseRepo::update() / PageRepo::setContentFromInput() 写回数据库
 - 清理临时文件
 
 > 注意：文件回滚独立于事务，因为存储（尤其 S3 等远程）不受 DB 事务控制。
+
+**部分回滚的边界与限制**：
+回滚是"尽力而为"的部分回滚，存在以下边界情况：
+
+1. **references 只记录已完成创建的**：
+   - 只有成功调用 `addXxx()` 加入 references 的文件才会被回滚
+   - 如果在创建某个文件的过程中失败（如写到一半磁盘满了），该文件不在 references 中，可能残留临时文件
+   - `tempFilesToCleanup[]` 中的临时文件由 `cleanup()` 兜底删除
+
+2. **回滚顺序与部分成功**：
+   - 按 images → attachments → 临时文件的顺序删除
+   - 单个文件删除失败不会中断回滚过程（没有 try-catch 包裹）
+   - 极端情况下可能出现"删了一部分图片后失败，附件还没删"的部分回滚状态
+
+3. **远程存储的最终一致性**：
+   - S3 等远程存储的删除操作是异步的，即使 API 返回成功也可能有延迟
+   - 回滚调用的是同步删除 API，但不保证立即生效
+
+4. **回滚不覆盖 data.json 解析阶段**：
+   - 上传时 ZIP 已经存到 `uploads/files/imports/` 下
+   - 执行导入失败不删除 ZIP 文件本身（Import 记录保留，用户可重试或手动删除）
+   - 只有 `deleteImport()` 才会清理 ZIP 文件和 Import 记录
 
 ---
 
@@ -444,6 +561,9 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 | PDF 命令超时 | 默认 15 秒后 `ProcessTimedOutException` 捕获并抛友好异常 | PdfGenerator.php:158-161 |
 | ZIP 导出中途异常 | 回滚已添加到 ZIP 的 entry + 删除临时文件 + 关闭并删除 ZIP | ZipExportBuilder.php:97-108 |
 | 文件名冲突 | 附件/图片用 `Str::random(20)` 循环检测生成唯一名 | ZipExportFiles.php:43-45, 65-67 |
+| Page Include 循环引用 | 最多展开 3 层嵌套，每层无新增节点则提前终止；超过 1 层重新生成元素 id | PageContent.php:327-335 |
+| 大文件内存占用 | 导出时 `stream_copy_to_stream()` 流式拷贝，不一次性载入内存 | ZipExportFiles.php:87-106 |
+| CSS 变量不兼容 PDF 引擎 | PDF 格式额外注入内联样式：链接色 `app-link`、引用左边框色 `app-color` | resources/views/exports/parts/styles.blade.php |
 
 ### 3.2 导入阶段的防御性处理
 
@@ -459,15 +579,28 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 | 数据库异常 | 外层事务回滚 + `revertStoredFiles()` 清理已落盘的图片/附件 | ImportRepo.php:127-130 |
 | 远程存储文件 | `getZipPath()` 先把远程 ZIP 流式下载到本地临时文件再操作 | ZipImportRunner.php:353-368 |
 | Draw.io 图表 ID | `replaceDrawingIdReferences()` 单独处理 `drawio-diagram="<id>"` 属性替换 | ZipImportReferences.php:114-128 |
+| 极端 MIME 攻击 | `WebSafeMimeSniffer` 白名单机制，非安全 MIME 降级为 text/plain 或 application/octet-stream | WebSafeMimeSniffer.php:64-83 |
+| 历史 ID 复用歧义 | 同类型内 ID 必须唯一，保证 `[[bsexport:type:id]]` 占位符不会指向多个实体 | ZipUniqueIdRule.php:20-25 |
+| publishDraft 部分失败 | 用 `DatabaseTransaction` 包裹为单事务，READ COMMITTED 隔离级别 | PageRepo.php:83-103 |
+| 回滚不彻底 | `revertStoredFiles()` 只清理已加入 references 的文件；临时文件由 `cleanup()` 兜底 | ZipImportRunner.php:103-125 |
+| 大文件内存溢出 | ZIP 读取、存储传输全程 `stream_copy_to_stream()` 流式处理 | ZipExportReader.php、ZipImportRunner.php、ZipExportFiles.php |
+| 引用循环替换 | 单次扫描正则替换，替换后的 URL 不再重新扫描，不会循环替换 | ZipImportReferences.php:130-164 |
+| metadata 正文泄露 | 导入前 `metadataOnly()` 清空 html/markdown 等大字段，预览页只展示名称 | ImportRepo.php:96-97 |
 
 ### 3.3 跨层级一致性约定
 
 - **priority 排序**：导出和导入都按 priority 升序处理，保证书籍内章节/页面顺序稳定
+- **priority 与 ABAC**：导入是"批量创建"语义，只校验 Create 权限；手动排序（BookSorter）才会执行完整的 Update/Delete/Create 多级权限校验
 - **可见性过滤**：导出前所有查询均走 `visible` scope，不导出用户不可见的内容
 - **标签保留**：Book/Chapter/Page 三级的 tags 都完整保留（name + value）
 - **Markdown 双轨**：导出时若 Page 有原始 markdown 则同时存 html + markdown；导入时优先用 markdown 渲染回 html
+- **Markdown 与 metadata**：`metadataOnly()` 会同时清空 html 和 markdown，预览阶段不暴露正文内容
 - **引用两阶段**：导出用 `[[bsexport:*]]` 占位符编码，导入第二阶段统一替换为新 URL — 避免创建过程中引用到尚未创建的实体
+- **循环引用防御**：导出端 Page Include 3 层深度限制 + 导入端单次扫描替换，双层保证不会出现无限循环
 - **空字段省略**：`ZipExportModel::jsonSerialize()` 自动过滤 null 值，使 data.json 更精简
+- **流式大文件**：导入导出链路全程 stream 处理，从 ZIP 读取到存储读写都避免一次性载入内存
+- **双重大小限制**：data.json 和 files/* 分别受 `app.upload_limit` 限制，双层防护防止超大文件
+- **事务隔离级别**：关键写操作（publishDraft 等）统一用 `DatabaseTransaction` 封装，显式设置 READ COMMITTED 隔离级别
 
 ---
 
@@ -485,7 +618,17 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 | 链接/引用解析器 | `app/Exports/ZipExports/ZipReferenceParser.php` |
 | ZIP 读取器 | `app/Exports/ZipExports/ZipExportReader.php` |
 | ZIP 校验器 | `app/Exports/ZipExports/ZipExportValidator.php` |
+| ZIP 唯一 ID 校验规则 | `app/Exports/ZipExports/ZipUniqueIdRule.php` |
+| ZIP 文件引用校验规则 | `app/Exports/ZipExports/ZipFileReferenceRule.php` |
+| ZIP 校验辅助类 | `app/Exports/ZipExports/ZipValidationHelper.php` |
 | 导入仓储（生命周期管理） | `app/Exports/ImportRepo.php` |
+| 导入模型 | `app/Exports/Import.php` |
 | 书籍内容树构建 | `app/Entities/Tools/BookContents.php` |
 | 页面内容渲染（含 include 展开） | `app/Entities/Tools/PageContent.php` |
+| 页面 Include 解析器 | `app/Entities/Tools/PageIncludeParser.php` |
+| 页面仓储（publishDraft 等） | `app/Entities/Repos/PageRepo.php` |
+| 书籍排序器（ABAC 排序） | `app/Sorting/BookSorter.php` |
+| 排序规则模型 | `app/Sorting/SortRule.php` |
+| 数据库事务封装 | `app/Util/DatabaseTransaction.php` |
+| Web 安全 MIME 嗅探器 | `app/Util/WebSafeMimeSniffer.php` |
 | 导出配置 | `app/Config/exports.php` |

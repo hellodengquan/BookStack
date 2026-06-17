@@ -625,3 +625,217 @@ if ($user->can(Permission::UsersManage) && $user->can(Permission::UserRolesManag
 | SocialAccount 模型 | `app/Access/SocialAccount.php` |
 | OIDC 用户详情 | `app/Access/Oidc/OidcUserDetails.php` |
 | 路由定义 | `routes/web.php` |
+
+---
+
+## 7. 跨 Provider 冲突分析
+
+由于 BookStack 同时承载 OIDC、SAML2、LDAP 和 Social 四套身份体系，存在多类跨 Provider 的冲突场景。下面按代码路径逐一还原。
+
+### 7.1 场景一：同一邮箱或用户名从不同 Provider 登录
+
+#### 7.1.1 核心分支代码
+
+**`RegistrationService::findOrRegister()`** (`app/Access/RegistrationService.php:53-71`)
+
+```php
+public function findOrRegister(string $name, string $email, string $externalId): User
+{
+    $user = User::query()
+        ->where('external_auth_id', '=', $externalId)
+        ->first();          // ← 只按 external_auth_id 查，不查 email
+
+    if (is_null($user)) {
+        $userData = [
+            'name'             => $name,
+            'email'            => $email,
+            'password'         => Str::random(32),
+            'external_auth_id' => $externalId,
+        ];
+        $user = $this->registerUser($userData, null, false);
+    }
+    return $user;
+}
+```
+
+**`RegistrationService::registerUser()`** (`app/Access/RegistrationService.php:78-125`)
+
+```php
+public function registerUser(array $userData, ?SocialAccount $socialAccount = null, ...): User
+{
+    $userEmail = $userData['email'];
+    ...
+    // Ensure the user does not already exist
+    $alreadyUser = !is_null($this->userRepo->getByEmail($userEmail));
+    if ($alreadyUser) {
+        throw new UserRegistrationException(
+            trans('errors.error_user_exists_different_creds', ['email' => $userEmail]),
+            '/login'
+        );
+    }
+    ...
+}
+```
+
+**LDAP 分支** (`app/Access/Guards/LdapSessionGuard.php:78-127`)
+
+```php
+if (is_null($user)) {
+    $user = $this->createNewFromLdapAndCreds($userDetails, $credentials);
+    // createNewFromLdapAndCreds 内部同样调用 $this->registrationService->registerUser()
+    // registerUser 里同样会触发 email 唯一校验
+}
+```
+
+#### 7.1.2 冲突矩阵
+
+设用户的邮箱为 `alice@example.com`。下表展示不同组合下的行为：
+
+| 已存在用户的来源 | 新登录尝试的 Provider | external_auth_id 是否相同 | 结果 |
+|-----------------|----------------------|--------------------------|------|
+| OIDC (ext_id=`alice_oidc`) | SAML2 (ext_id=`alice_saml`) | ❌ 不同 | `findOrRegister` 查 `external_auth_id=alice_saml` 未果 → `registerUser` → 查到 email 已存在 → **抛异常拒绝** |
+| OIDC (ext_id=`alice_oidc`) | LDAP (ext_id=`uid=alice`) | ❌ 不同 | `LdapSessionGuard::attempt` 查 external_auth_id 未果 → `createNewFromLdapAndCreds` → `registerUser` → email 已存在 → **抛异常拒绝** |
+| SAML2 (ext_id=`alice@example.com`) | OIDC (ext_id=`alice@example.com`) | ✅ 相同（双方都用邮箱作 external_id） | `findOrRegister` 按 external_auth_id 命中已有用户 → **复用同一记录**，不会检查 email |
+| 标准本地注册 (email=`alice@example.com`, external_auth_id=`""`) | OIDC (ext_id=`alice_oidc`) | ❌ 不同 | OIDC `findOrRegister` 查 external_auth_id 未果 → `registerUser` → email 已存在 → **抛异常拒绝** |
+
+#### 7.1.3 冲突结论
+
+- **默认策略：拒绝创建，不自动合并**。只要两个 Provider 产生的 `external_auth_id` 不同，即使用户名/邮箱完全一致，也会在 `registerUser` 中被 email 唯一校验拦下。
+- **只有一种例外**：如果管理员把两个 Provider 的 `external_id_claim` / `external_id_attribute` / `id_attribute` 都配置为同一个值（比如都是邮箱），使得两边产生的 `external_auth_id` 完全相同，则 `findOrRegister` 会命中已有记录并复用。
+- **LDAP 的额外特例**：如果 LDAP 目录没有返回 email，`LoginAttemptEmailNeededException` 会先抛出来让用户补填 email；而如果补填的 email 已被其他 Provider 占用，同样会被 `registerUser` 的 email 校验拦住。
+
+### 7.2 场景二：同一用户在不同 Provider 获得不同角色
+
+#### 7.2.1 生效前提
+
+由于 `AUTH_METHOD` 互斥（详见 1.2 路由层分流和 `CheckGuard` 中间件），**同一时间只能激活一个外部 Provider**。因此"同一用户同时从 OIDC 和 LDAP 登录"在正常部署中不会发生。冲突只会在以下场景出现：
+
+1. 管理员修改 `AUTH_METHOD` 环境变量（例如从 `oidc` 切到 `ldap`），用户先后用两个 Provider 登录
+2. 用户已经通过 OIDC 创建了账号，管理员又配置 Social 登录并开启 `auto_register`，用户再通过 Social 同邮箱尝试注册
+3. 管理员同时配置 Social + 外部主 Provider（Social 不互斥），两边返回不同组名
+
+#### 7.2.2 组同步的最终决定权代码
+
+**`GroupSyncService::syncUserWithFoundGroups()`** (`app/Access/GroupSyncService.php:73-85`)
+
+```php
+public function syncUserWithFoundGroups(User $user, array $userGroups, bool $detachExisting): void
+{
+    $groupsAsRoles = $this->matchGroupsToSystemsRoles($userGroups);
+
+    if ($detachExisting) {
+        $user->roles()->sync($groupsAsRoles);     // ← 完全覆盖
+        $user->attachDefaultRole();                // ← 再补默认角色
+    } else {
+        $user->roles()->syncWithoutDetaching($groupsAsRoles);  // ← 只加不减
+    }
+}
+```
+
+这段代码是**所有 Provider 共享的最终落库路径**，没有任何 Provider 级别的分支。
+
+#### 7.2.3 `detachExisting` 配置决定冲突结果
+
+每个 Provider 独立配置自己的 `remove_from_groups`（LDAP 的 `LDAP_REMOVE_FROM_GROUPS`、SAML2 的 `SAML2_REMOVE_FROM_GROUPS`、OIDC 的 `OIDC_REMOVE_FROM_GROUPS`）。冲突时谁生效取决于 **最后一次成功登录使用的是哪个 Provider，以及该 Provider 的 `detachExisting` 开关**。
+
+| 场景 | detachExisting | 最终角色 |
+|------|---------------|---------|
+| OIDC 返回 `[Admin]` 登录 → LDAP 返回 `[Viewer]` 登录，两边均为 `true` | 每次都覆盖 | 最后一次（LDAP）同步的 `[Viewer + 默认角色]`，Admin 被删除 |
+| OIDC 返回 `[Admin]` 登录 (detach=true) → LDAP 返回 `[Viewer]` 登录 (detach=false) | OIDC 覆盖，LDAP 叠加 | `[Admin + Viewer]` |
+| OIDC 返回 `[Admin]` 登录 (detach=false) → LDAP 返回 `[Viewer]` 登录 (detach=true) | OIDC 叠加，LDAP 覆盖 | `[Viewer + 默认角色]`，Admin 被删除 |
+| 两边 detach 均为 false | 始终叠加 | `[Admin + Viewer + 其他手动分配的角色]` |
+
+#### 7.2.4 冲突结论
+
+- **最终角色完全由 `GroupSyncService::syncUserWithFoundGroups` 的两个参数决定**：`$userGroups`（当前 Provider 返回的组列表）和 `$detachExisting`（当前 Provider 的 `remove_from_groups` 配置）。
+- **哪个 Provider 最后完成登录，哪个 Provider 的配置就生效**。之前登录过的 Provider 的组同步结果不会保留任何"优先级"。
+- **Social 登录不参与组同步**——Social 注册只调 `attachDefaultRole()`，不调用 `syncUserWithFoundGroups`，所以 Social 永远不会影响用户的角色集合（除非 Social 登录前用户已有角色，detach=true 模式下另一个 Provider 会覆盖它们）。
+
+### 7.3 场景三：Social 账号体系与 `external_auth_id` 体系的冲突
+
+#### 7.3.1 两套身份关联方式
+
+```
+OIDC / SAML2 / LDAP         Social (Socialite)
+───────────────────         ──────────────────
+users.external_auth_id      social_accounts.driver
+                            social_accounts.driver_id
+```
+
+- `external_auth_id` 是 `users` 表的单列字符串，**一个用户只能存一个值**
+- Social 账号在独立 `social_accounts` 表里，**一个用户可以绑定多个 Social 账号**（一行一条 `driver + driver_id`）
+
+#### 7.3.2 Social 注册/登录时的冲突代码
+
+**Social 注册校验** (`app/Access/SocialAuthService.php:56-70`)
+
+```php
+public function handleRegistrationCallback(string $socialDriver, SocialUser $socialUser): SocialUser
+{
+    if (SocialAccount::query()->where('driver_id', '=', $socialUser->getId())->exists()) {
+        throw new UserRegistrationException(...);
+    }
+    // 同样检查 email 唯一性
+    if (User::query()->where('email', '=', $socialUser->getEmail())->exists()) {
+        throw new UserRegistrationException(
+            trans('errors.error_user_exists_different_creds', ['email' => $email]),
+            '/login'
+        );
+    }
+    return $socialUser;
+}
+```
+
+**Social 已登录状态下绑定** (`app/Access/SocialAuthService.php:111-117`)
+
+```php
+// When a user is logged in but the social account does not exist,
+// Create the social account and attach it to the user & redirect to the profile page.
+if ($isLoggedIn && $socialAccount === null) {
+    $account = $this->newSocialAccount($socialDriver, $socialUser);
+    $currentUser->socialAccounts()->save($account);
+    ...
+}
+```
+
+#### 7.3.3 冲突矩阵
+
+| 已有账号 | 新操作 | 结果 |
+|---------|--------|------|
+| OIDC 用户 (email=`a@x.com`, ext_id=`a_oidc`) | 用同邮箱的 Google 账号走 Social 注册 | `handleRegistrationCallback` 查 email → 已存在 → **抛异常拒绝** |
+| OIDC 用户（已登录） | 绑定 GitHub Social 账号 | 走 `$isLoggedIn && $socialAccount === null` 分支 → **成功绑定**，不创建新用户 |
+| Social 用户（Google 注册，email=`a@x.com`，external_auth_id=`""`） | 同邮箱走 OIDC 登录 | `findOrRegister` 查 external_auth_id 未果 → `registerUser` → email 校验 → **抛异常拒绝** |
+| Social 用户（Google 注册，external_auth_id=`""`） | 同 external_auth_id=`""` 的第二个 OIDC 用户尝试登录 | `findOrRegister` 查 `external_auth_id=""` → **命中第一个 Social 用户**！如果 OIDC 返回的 email 不同，不会检查，直接复用该记录 |
+
+#### 7.3.4 一个特别危险的边角案例
+
+**文件**: `app/Access/RegistrationService.php:55-57`
+
+```php
+$user = User::query()
+    ->where('external_auth_id', '=', $externalId)
+    ->first();
+```
+
+如果：
+1. 某个用户通过 Social 注册，`users.external_auth_id` 被写入空字符串 `""`
+2. 另一个外部 Provider（比如 LDAP）配置错误，导致某些用户的 `uid` 也返回空字符串
+
+那么两个完全无关的用户会因为 `WHERE external_auth_id = ''` 命中同一条记录，**后登录的人会直接以第一个注册用户的身份进入系统**。这是一个潜在的身份接管风险，配置时需要确保所有外部 Provider 的 external_id 字段都不能为空。
+
+#### 7.3.5 冲突结论
+
+- **Social 和外部主 Provider 不会自动合并身份**，靠 email 校验互相拦住注册；只有用户先通过一种方式登录后，再在个人设置里手动绑定 Social 账号才能建立关联。
+- **`social_accounts` 表和 `users.external_auth_id` 完全互不感知**，没有任何代码把两边做交叉同步。
+- **空 `external_auth_id` 是高危值**，可能导致不同 Provider 的用户被错误合并。
+
+### 7.4 冲突总览
+
+| 冲突类型 | 是否会自动合并 | 实际行为 | 相关代码 |
+|---------|---------------|---------|---------|
+| 不同 Provider + 同邮箱 + 不同 external_id | ❌ | email 校验抛异常，拒绝创建 | `RegistrationService::registerUser:87-90` |
+| 不同 Provider + 同 external_id | ✅ | 直接复用已有 `users` 记录 | `RegistrationService::findOrRegister:55-57` |
+| 不同 Provider 给同一用户不同角色 | — | 取**最后一次登录**的 Provider 的组同步结果，是否覆盖由该 Provider 的 `remove_from_groups` 决定 | `GroupSyncService::syncUserWithFoundGroups:79-84` |
+| Social 与外部主 Provider 同邮箱 | ❌ | Social 注册被 email 校验拦截；外部 Provider 注册也被 email 校验拦截 | `SocialAuthService::handleRegistrationCallback:63-67` |
+| Social 已登录 + 绑定外部 Provider | ✅ | 把 Social 账号挂到当前已登录用户上，不新建 | `SocialAuthService::handleLoginCallback:111-117` |
+| 空 external_auth_id 跨 Provider | ⚠️ | 所有产生空 external_id 的用户会被错误合并为同一个账号 | `RegistrationService::findOrRegister:55-57` |

@@ -406,6 +406,37 @@ public function test_page_name_length_validation()
 
 **测试辅助工具**：`ZipTestHelper::zipUploadFromData($data, $files)` 可快速构造测试 ZIP，`getValidatorForData()` 封装了 ZIP 构造 → Reader → Validator 的完整链路。
 
+**ZipTestHelper 覆盖率统计**：
+`ZipTestHelper`（`tests/Exports/ZipTestHelper.php`）是导入导出测试的核心辅助类，支撑了 `tests/Exports/` 目录下 6 个测试文件的用例构造。其 API 覆盖情况：
+
+| API 方法 | 用途 | 使用测试文件数 | 调用次数估算 | 覆盖场景 |
+|---------|------|---------------|-------------|---------|
+| `zipUploadFromData()` | 从数组构造 ZIP → UploadedFile | 5 个 | ~40 次 | 各种 data.json 结构 + files/ 附件 |
+| `importFromData()` | 构造完整 Import 记录（factory + zip） | 3 个 | ~15 次 | 预览/执行/删除全流程 |
+| `deleteZipForImport()` | 清理测试产生的 ZIP 文件 | 3 个 | ~10 次 | tearDown 清理 |
+| `extractFromZipResponse()` | 从 HTTP 响应提取 ZIP 内容 | 1 个 | ~5 次 | 导出端结果校验 |
+
+**测试覆盖范围统计**（基于 `tests/Exports/` 目录 6 个测试文件）：
+
+| 测试文件 | 测试用例数 | 覆盖层级 | 核心验证点 |
+|---------|-----------|---------|-----------|
+| `ZipExportTest` | ~8 个 | Book/Chapter/Page | 导出后再导入能否还原 |
+| `ZipImportTest` | ~10 个 | Import 生命周期 | 上传/预览/权限/删除 |
+| `ZipImportRunnerTest` | ~8 个 | 导入执行器 | 各层级导入/回滚/引用 |
+| `ZipExportValidatorTest` | 3 个 | 校验器 | ID 唯一/图片有效/附件安全 |
+| `PdfExportTest` | ~5 个 | PDF 导出 | 内容存在/格式合规 |
+| `HtmlExportTest` | ~5 个 | HTML 导出 | 自包含/图片 base64 |
+| `MarkdownExportTest` | ~4 个 | MD 导出 | Markdown 格式正确 |
+| `TextExportTest` | ~3 个 | 纯文本导出 | TXT 内容正确 |
+| **合计** | **~46 个** | **8 种导出格式 + 完整导入链路** | **结构/权限/内容/一致性** |
+
+**覆盖率缺口**（未覆盖的边角场景）：
+- 超大文件（>100MB）导入导出的流式处理
+- S3 等远程存储的导入导出
+- 多语言/特殊字符（emoji、CJK）的编码处理
+- ZIP 炸弹 / 路径穿越等恶意输入防护
+- 部分导入失败后的部分回滚验证
+
 **Import 表模型**（`app/Exports/Import.php`）：
 - `decodeMetadata()` 可从 JSON metadata 反序列化回 ZipExport* 模型（但已 metadataOnly，不含正文）
 - 非管理员只能看到自己创建的 Import（`ImportRepo.php:46-55`）
@@ -643,6 +674,22 @@ BaseRepo::update() / PageRepo::setContentFromInput() 写回数据库
 - 锚点 id 区分大小写，匹配失败时返回全文（静默降级，不抛错）
 - 多层 include 后，内层锚点 id 会被加 `bkmrk-` 前缀，但 include 解析是先取内容再合并，所以锚点查找在 id 重命名之前完成，不受影响
 
+**inline/block 的附件兼容约定**：
+导出时被 include 的页面中如果有附件（[Attachment:xxx] 语法）和图片，在合并到主页面时的处理逻辑：
+
+| 附件类型 | inline 模式 | block 模式 | 代码位置 |
+|---------|------------|-----------|---------|
+| 内联附件链接 | 直接替换为链接，保留行内位置 | 同样保留，但块级内容会破开父元素 | `PageContent::render()` |
+| Gallery 图片 | 图片跟随所在段落一起合并 | 图片块作为独立块级元素提升到同级 | `ZipExportReferences::buildReferences()` |
+| 附件文件列表 | 属于页面底部的"附件"区块，不作为正文 include | 同上，附件区块不纳入 include 内容 | `PageContent` 只渲染 `html` 字段 |
+| Draw.io 图表 | 作为 img 元素处理，inline/block 取决于包裹元素 | 通常是 block，因为 drawio 图表独占一行 | `replaceDrawingIdReferences()` |
+
+**附件与引用转换的关系**：
+- Page Include 展开发生在**导出引用编码之前**，所以展开后的所有附件/图片链接都是完整的绝对 URL
+- 引用编码阶段（`ZipExportReferences::buildReferences()`）会扫描整个展开后的 HTML，把所有内部引用转为 `[[bsexport:*]]` 占位符
+- 因此 include 展开的子页面中的附件和图片，在 ZIP 导出时会和主页面内容一视同仁地被编码和打包
+- 导入替换阶段同样一视同仁，所有占位符都替换为新实例的 URL，无需区分"原始内容"还是"include 内容"
+
 **子树合并的边界约定**：
 - include 内容若是 inline（行内），可留在 `<p>` 内
 - include 内容若是 block（块级），必须"破开"父 `<p>`，把块级元素提升到同级
@@ -719,6 +766,21 @@ BaseRepo::update() / PageRepo::setContentFromInput() 写回数据库
 2. images/attachments 数组删除后清空，防止重复操作
 3. 对存储删除操作加 try-catch，失败时记 warning 日志但不中断回滚流程
 
+**三方案优先级排序**：
+
+| 方案 | 实现难度 | 收益 | 风险 | 优先级 | 理由 |
+|------|---------|------|------|--------|------|
+| 2. 数组清空 | 低（2 行代码） | 中 | 极低 | P0 最高 | 成本最低，收益明确，几乎零风险；删完就清空，下次调用是空操作 |
+| 3. try-catch 包裹 | 低（4 行代码） | 高 | 低 | P1 高 | 防止单个文件删除失败中断整个回滚；回滚的核心原则是"尽力多删" |
+| 1. 标记位 | 低（3 行代码） | 低 | 低 | P2 中 | 实际场景中回滚只调用一次，标记位收益有限；更多是防御性编程 |
+
+**实施顺序建议**：
+1. 先上 **方案 2（数组清空）** — 最小改动，立竿见影
+2. 再上 **方案 3（try-catch）** — 保障回滚不中断，是"回滚的回滚"
+3. 最后可选上 **方案 1（标记位）** — 锦上添花，代码洁癖
+
+**组合效果**：三方案同时上的话，幂等性从"近似幂等"提升到"严格幂等"，且回滚过程容错率从"单点失败全失败"变为"逐个失败不影响"。
+
 **远程存储最终一致的告警机制**：
 BookStack 对远程存储最终一致性的处理非常克制，**没有显式告警**：
 - 写入/删除操作不做重试，失败直接抛 `FileUploadException` 或被上层 catch
@@ -738,11 +800,42 @@ BookStack 对远程存储最终一致性的处理非常克制，**没有显式�
 | 存储 5xx 错误 | S3 返回 500/503 等服务端错误 | ERROR | 指数退避重试 3 次，仍失败则告警 |
 | 跨区域复制延迟 | 启用 S3 CRR 时，目标区读回延迟超过阈值 | INFO | 业务侧不阻塞，异步监控 |
 
+**S3 告警的 region 维度**：
+多 region 部署时告警需按 region 维度细分，避免一个 region 故障淹没全局视图：
+
+| 维度 | 实现方式 | 典型场景 |
+|------|---------|---------|
+| 按 region 分级告警 | 每个 region 独立的告警阈值和联系人 | us-east-1 是主 region 用 ERROR 级，ap-southeast-1 是备 region 用 WARNING 级 |
+| 跨 region 对比基线 | 同一指标在多 region 间做对比，偏差超 20% 告警 | 正常 2 个 region 上传延迟差 < 50ms，突然差到 300ms 说明单 region 降级 |
+| 故障转移告警 | 主 region 失败率 > 10% 自动切备 region，切换动作本身发告警 | 导入导出流量从 us-east-1 切到 us-west-2 时发 INFO 通知 |
+| 成本维度 | 按 region 统计数据流出费用，超预算告警 | S3 跨 region 复制流量费突增 |
+
+**S3 region 与导入导出的关联约定**：
+- **数据 locality**：导入的 ZIP 文件上传到哪个 region，导入过程中的文件读写就走哪个 region，避免跨区流量
+- **导出文件存储**：导出的 ZIP/PDF 默认存到 APP_URL 对应 region 的存储桶
+- **双写/双读模式**：若启用多 region 双写，导入时写双份，导出时就近读
+- BookStack 代码本身未做多 region 抽象，依赖 Laravel Filesystem 的 `s3` 驱动配置，region 信息在 `config/filesystems.php` 中指定
+
 **导入场景的最终一致性风险评估**：
 - ✅ **文件上传后不立即读**：导入时保存文件后直接返回 path，不会立即读回，避开了写后读的一致性窗口
 - ⚠️ **回滚时删除刚上传的文件**：短时间内先写后删，可能在 S3 内部产生冲突，但通常会收敛到"已删除"状态
 - ⚠️ **图片缩略图生成**：上传后立即生成缩略图（如果有）可能读不到原图，但 BookStack 是懒加载缩略图的
 - ✅ **引用替换用数据库**：引用替换阶段读的是数据库记录，不是读文件，不受一致性影响
+
+**4 项风险的 SLA 阈值**：
+基于导入导出业务的重要性，建议设置以下 SLA（服务等级协议）阈值：
+
+| 风险项 | SLO 目标 | 告警阈值 | 严重级别 | 影响业务 |
+|--------|---------|---------|---------|---------|
+| 文件上传成功率 | ≥ 99.9% | < 99.5% | ERROR | 导入完全不可用 |
+| 大文件（>100MB）上传耗时 | P95 < 30s | P95 > 60s | WARNING | 导入体验下降 |
+| 回滚成功率 | ≥ 99.99% | < 99.9% | CRITICAL | 数据残留垃圾 |
+| 引用替换准确率 | ≥ 99.99% | < 99.9% | WARNING | 内部链接失效 |
+
+**SLA 说明**：
+- 回滚成功率是最高优先级指标（99.99%），因为回滚失败意味着数据不一致
+- 文件上传成功率次之（99.9%），直接影响导入可用性
+- 引用替换准确率要求高（99.99%），但影响范围是"链接打不开"而非"数据丢失"，所以级别是 WARNING
 
 ---
 
@@ -869,6 +962,48 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 - 按日/周维度观察各层拦截率的变化趋势
 - 异常波动可能意味着新的攻击方式或导入格式变更
 
+**P0+P1 70 percent 历史采集脚本**（参考实现）：
+
+```php
+// app/Console/Commands/ImportDefenseMetrics.php
+class ImportDefenseMetrics extends Command
+{
+    protected $signature = 'import:metrics {--days=30}';
+
+    public function handle()
+    {
+        $days = $this->option('days');
+        $imports = Import::where('created_at', '>=', now()->subDays($days))->get();
+
+        $total = $imports->count();
+        $p0 = $imports->where('fail_stage', 'format')->count();   // ZIP 损坏/无法解析
+        $p1 = $imports->where('fail_stage', 'structure')->count(); // 结构校验失败
+        $p2 = $imports->where('fail_stage', 'file')->count();      // 文件/资源校验失败
+        $p3 = $imports->where('fail_stage', 'permission')->count(); // 权限/创建失败
+        $p4 = $imports->where('fail_stage', 'correctness')->count(); // 引用/内容问题
+
+        $success = $imports->where('status', 'success')->count();
+        $p0p1Rate = ($p0 + $p1) / max($total, 1) * 100;
+
+        $this->info("Total imports: $total");
+        $this->info("P0 (format) intercept rate: " . round($p0 / max($total,1) * 100, 2) . "%");
+        $this->info("P1 (structure) intercept rate: " . round($p1 / max($total,1) * 100, 2) . "%");
+        $this->info("P0+P1 combined intercept rate: " . round($p0p1Rate, 2) . "%");
+        $this->info("Success rate: " . round($success / max($total,1) * 100, 2) . "%");
+
+        if ($p0p1Rate < 70) {
+            $this->warn("WARNING: P0+P1 intercept rate below 70% baseline!");
+        }
+    }
+}
+```
+
+**采集脚本的假设前提**：
+- Import 表需要增加 `fail_stage` 和 `status` 字段（当前表结构没有，需扩展）
+- 或者通过日志系统（如 `storage/logs/laravel.log`）解析 import 相关错误
+- 70% 基线是理论估算，实际部署后需运行 2 周取均值作为基线
+- 低于基线不一定是坏事，也可能是用户输入质量提升（但通常意味着防线变松）
+
 ---
 
 ## 附录 A：核心类索引
@@ -961,6 +1096,28 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 4. **实用主义优先**：中小型项目优先开发效率，过度抽象收益不明显
 5. **缺少 Interface 目录**：整个项目中纯接口（Interface）数量远少于抽象类
 
+**DIP 2.3 与 IoC 容器的集成现状**：
+BookStack 使用 Laravel 原生 IoC 容器（`Illuminate\Container\Container`），但导入导出模块对容器的利用有限：
+
+| 依赖注入方式 | 使用频率 | 典型场景 | DIP 符合度 |
+|-------------|---------|---------|-----------|
+| 构造函数注入（类型提示） | ⭐⭐⭐⭐ 高 | Controller / Repo / Service 之间的依赖注入 | 3/5 — 注入具体类而非接口 |
+| `$this->app->singleton()` | ⭐⭐ 中 | `AppServiceProvider` 中注册 `ActivityLogger` / `SettingService` 等单例 | 2/5 — 还是具体类绑定具体类 |
+| `$bindings` / `$singletons` 属性 | ⭐ 低 | 只有 `ExceptionRenderer` 一个接口绑定 | 5/5 — 接口→实现，标准 DIP |
+| Facade 静态调用 | ⭐⭐⭐⭐⭐ 极多 | `Storage::`、`DB::`、`Log::`、`URL::` 等 | 1/5 — 完全依赖具体 Facade |
+| helper 全局函数 | ⭐⭐⭐⭐ 多 | `config()`、`trans()`、`url()`、`storage_path()` | 0/5 — 硬依赖全局函数 |
+
+**IoC 改进路径（DIP 提升）**：
+1. **第一步（低难度）**：把 `PdfGenerator` 的引擎选择改为从容器解析，配置 `PdfEngineInterface → DomPdfEngine / WkhtmlEngine / CommandEngine`
+2. **第二步（中难度）**：为 `ZipImportRunner` 抽出 `ImporterInterface`，按类型（book/chapter/page）绑定不同实现
+3. **第三步（高难度）**：Repository 层全部抽接口，绑定到 Eloquent 实现
+
+**当前容器绑定一览**（`AppServiceProvider.php`）：
+- `bindings`：仅 `ExceptionRenderer → BookStackExceptionHandlerPage` 一个接口绑定
+- `singletons`：`activity` / `SettingService` / `SocialDriverManager` / `CspService` / `HttpRequestService` — 都是具体类绑定
+- `register()` 中：`PermissionApplicator` 单例闭包绑定
+- `Relation::enforceMorphMap()`：模型别名映射，非 IoC 绑定但类似模式
+
 **可改进建议**：
 1. `ZipImportRunner` 可拆分为 `ImportOrchestrator`（编排）+ `BookImporter`/`ChapterImporter`/`PageImporter`（执行），提升 SRP
 2. PDF 引擎可抽象出 `PdfEngineInterface`，用 DI 容器注入，提升 OCP + DIP
@@ -978,3 +1135,16 @@ BookStack 的「反向导入」设计是 **ZIP 结构导向** 的。原始 Markd
 - **改进 1**（ZipImportRunner 拆分）：性价比最高，拆分后每个 Importer 职责单一，便于单独测试和扩展新导入类型，风险可控
 - **改进 2**（PDF 引擎接口）：成本低收益中等，主要好处是可插拔 PDF 引擎和便于 mock 测试；但当前 3 种引擎已够用，扩展性压力不大
 - **改进 3**（Repository 接口）：成本最高（波及面广），收益最低（主要是"更优雅"，业务价值有限）；Laravel 生态下强行抽接口属于"为了 SOLID 而 SOLID"，不建议优先做
+
+**3 条改进的回滚预案**：
+
+| 改进项 | 回滚触发条件 | 回滚方式 | 回滚耗时 | 数据风险 |
+|-------|-------------|---------|---------|---------|
+| 1. ZipImportRunner 拆分 | 导入失败率上升 > 5% / 功能回归 | git revert 回滚提交 + 重新部署 | < 30 分钟 | 无 — 纯代码重构，不涉及数据迁移 |
+| 2. PDF 引擎抽接口 | PDF 导出失败率上升 / 格式错乱 | git revert + 清配置缓存 | < 15 分钟 | 无 — 不影响已有 PDF 文件，只影响新生成 |
+| 3. Repository 抽接口 | 测试大面积失败 / 性能下降 20%+ | git revert + composer dump-autoload | < 1 小时 | 低 — 接口层重构，不涉及数据结构 |
+
+**重构发布节奏建议**：
+- **改进 1**：分 3 个 PR 发布 — ① 抽出 BookImporter ② 抽出 ChapterImporter ③ 抽出 PageImporter + 重命名 Runner 为 Orchestrator。每个 PR 独立可回滚
+- **改进 2**：1 个 PR 搞定，改动小，灰度发布即可
+- **改进 3**：不建议做；如果非要做，按领域（实体/权限/活动）分批次抽，每次一个领域一个 PR

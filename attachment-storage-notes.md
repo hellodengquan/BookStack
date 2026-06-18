@@ -694,9 +694,313 @@ php artisan bookstack:update-url https://old.example.com https://new.example.com
 
 ---
 
-## 七、三者串联关系
+## 七、权限校验失败时下载早期中断
 
-### 7.1 图片上传 → 存储 → 缩略图生成 链路
+### 7.1 中断总览
+
+附件和图片的下载链路都有"**权限前置校验**"设计，确保在任何字节被读取或发送给客户端之前，先完成所有权限验证。这是"早期中断"的核心机制 — 拒绝发生在磁盘 I/O、流式传输启动之前，避免资源浪费。
+
+```
+HTTP Request → [Middleware Pipeline] → [Controller Action]
+    ↓ (权限校验失败)
+  403/401 Response ← (无文件读取、无流打开)
+    ↓ (权限校验通过)
+  打开文件流 → StreamedResponse → 字节发送
+```
+
+### 7.2 附件下载的完整中断路径
+
+**路由**：`routes/web.php:160` `Route::get('/attachments/{id}', [AttachmentController::class, 'get']);`
+**Middleware 组**：`web`（不含 auth，权限校验在控制器内）
+
+**代码路径**（`app/Uploads/Controllers/AttachmentController.php:212`）：
+
+```
+AttachmentController::get($request, $attachmentId)
+  ↓ 步骤 1: 查数据库（无文件操作）
+  $attachment = Attachment::query()->findOrFail($attachmentId);
+    → 找不到 → 404（ModelNotFoundException）
+  
+  ↓ 步骤 2: 校验所属页面可见性（无文件操作）
+  try {
+      $page = $this->pageQueries->findVisibleByIdOrFail($attachment->uploaded_to);
+  } catch (NotFoundException $e) {
+      throw new NotFoundException(trans('errors.attachment_not_found'));
+      → 返回 404，不打开文件
+  }
+  
+  ↓ 步骤 3: 外链附件直接重定向（无文件操作）
+  if ($attachment->external) {
+      return redirect($attachment->path);
+  }
+  
+  ↓ 步骤 4: (通过校验) 打开流并发送
+  $fileName = $attachment->getFileName();
+  $attachmentStream = $this->attachmentService->streamAttachmentFromStorage($attachment);
+  $attachmentSize = $this->attachmentService->getAttachmentFileSize($attachment);
+  → 这里才真正打开文件句柄
+  
+  return $this->download()->streamedDirectly(...) 或 streamedInline(...)
+```
+
+**关键点**：
+- `findVisibleByIdOrFail()` 内部已包含 `PageView` 权限校验（查询 `visibleForList()` 作用域）
+- 任何一步失败都不会调用 `streamAttachmentFromStorage()`，即不会打开文件流
+- 完全不涉及磁盘 I/O，PHP 内存占用极低
+
+### 7.3 图片私有访问的完整中断路径
+
+**路由**：`routes/web.php` 中 `Route::get('/uploads/images/{path}', [ImageController::class, 'showImage']);`
+（local_secure / local_secure_restricted 模式下才会走到这里）
+
+**代码路径**（`app/Uploads/Controllers/ImageController.php:32`）：
+
+```
+ImageController::showImage($path)
+  ↓ 步骤 1: 综合权限校验（无文件操作，可能查 DB）
+  if (!$this->imageService->pathAccessibleInLocalSecure($path)) {
+      throw new NotFoundException(...);
+      → 返回 404，不打开文件
+  }
+  
+  ↓ 步骤 2: (通过校验) 流式返回
+  return $this->imageService->streamImageFromStorageResponse('gallery', $path);
+```
+
+`pathAccessibleInLocalSecure()` 的多层校验（`app/Uploads/ImageService.php:251`）：
+
+```
+pathAccessibleInLocalSecure($imagePath)
+  → usingSecureImages() ? (local_secure 配置检查，无 I/O)
+  
+  → pathAccessible($imagePath)
+      ├─ usingSecureRestrictedImages() ?
+      │   └─ checkUserHasAccessToRelationOfImageAtPath($imagePath)
+      │       ├─ 去掉 thumbs-/scaled- 目录前缀
+      │       ├─ Image::query()->where('path', '=', $fullPath)->first()  ← 查 DB
+      │       └─ 根据 type 校验可见性
+      │           gallery/drawio → pages.visibleForList()->where('id', '=', uploaded_to)
+      │           cover_book → books.visibleForList()
+      │           cover_bookshelf → shelves.visibleForList()
+      │           user/system → 直接允许
+      │
+      ├─ blockedBySecureImages() ?
+      │   └─ secure_images + !app-public + guest → 阻止
+      │
+      └─ imageFileExists($imagePath, 'gallery')  ← 最后一步才查磁盘
+```
+
+**关键顺序**：DB 查询和权限校验在前，`imageFileExists()`（磁盘 `exists()` 检查）在最后。如果权限不过，磁盘碰都不碰。
+
+### 7.4 权限校验的两种异常抛出方式
+
+#### 方式 A：Middleware 层抛出（路由级）
+
+`CheckUserHasPermission` 中间件（`app/Http/Middleware/CheckUserHasPermission.php:16`）：
+```php
+if (!user()->can($permission)) {
+    return $this->errorResponse($request);
+    // JSON → 403 {'error': '...'}
+    // HTML → redirect('/') + session flash error
+}
+```
+挂载在路由上如：`Route::get('/books', ...)->middleware('can:books-view-all')`
+
+#### 方式 B：Controller 内抛出（业务级，用于权限依赖动态数据）
+
+`Controller::checkPermission()` / `checkOwnablePermission()`（`app/Http/Controller.php:63`）：
+```php
+protected function checkPermission(string|Permission $permission): void
+{
+    if (!user()->can($permission)) {
+        $this->showPermissionError();
+    }
+}
+
+protected function showPermissionError(string $redirectLocation = '/'): never
+{
+    $message = request()->wantsJson() ? trans('errors.permissionJson') : trans('errors.permission');
+    throw new NotifyException($message, $redirectLocation, 403);
+}
+```
+`NotifyException` 是 BookStack 自定义异常，由异常处理器渲染为用户友好的通知页面。
+
+### 7.5 流式响应的中断时机（Range 请求）
+
+如果权限通过，进入流式响应阶段，`DownloadResponseFactory::streamedDirectly()`（`app/Http/DownloadResponseFactory.php:27`）会：
+1. 包装 `RangeSupportedStream`（支持断点续传）
+2. 解析 `Range` 请求头，返回 206 Partial Content
+3. `response()->stream()` 包装闭包，在闭包内才真正读取流并输出
+
+**即使到了这一步，如果客户端断开连接，PHP 会在 `stream_copy_to_stream()` 调用时检测到并终止，底层 `fclose()` 正常执行。**
+
+`RangeSupportedStream::outputAndClose()` at `app/Http/RangeSupportedStream.php:46`：
+```php
+public function outputAndClose(): void
+{
+    $outStream = fopen('php://output', 'w');
+    stream_copy_to_stream($this->stream, $outStream, $bytesToWrite);
+    // ← 如果客户端断开，这里会中断并进入 PHP 请求清理
+    fclose($this->stream);
+    fclose($outStream);
+}
+```
+
+**临时文件自动删除**：`streamedFileDirectly()` 中 `$deleteAfter=true` 时，注册了双重删除钩子：
+```php
+app()->terminating($callback);       // Laravel 正常结束
+register_shutdown_function($callback); // PHP 异常/中断结束
+```
+确保无论请求正常结束、异常抛出、用户断开，临时 ZIP 文件都会被删除。
+
+### 7.6 权限失败 vs 流式中断的对比
+
+| 场景 | 阶段 | 磁盘 I/O | 状态码 | 资源清理 |
+|---|---|---|---|---|---|
+| 无权限访问附件 | 控制器入口（findVisibleByIdOrFail 前） | ❌ 无 | 404 | 无需清理 |
+| 页面被删除/权限被撤 | 控制器入口（findVisibleByIdOrFail） | ❌ 无 | 404 | 无需清理 |
+| 图片 local_secure_restricted 无页面权限 | pathAccessible 校验 | ❌ 无（可能有 DB 查询） | 404 | 无需清理 |
+| 非 guest 但 secure_images + 非公开应用 | blockedBySecureImages 校验 | ❌ 无 | 404 | 无需清理 |
+| 图片/附件不存在 | imageFileExists / getReadStream 中 | ✅ 有（exists 或 fopen 失败） | 500 / 404 | 无需清理 |
+| 流式传输中客户端断开 | outputAndClose 的 stream_copy_to_stream | ✅ 有（已部分传输） | N/A | PHP 清理 + shutdown 函数删临时文件 |
+
+---
+
+## 八、迁移中途断电的恢复机制
+
+### 8.1 核心结论：无断点续传，仅靠幂等性兜底
+
+BookStack 的 ZIP 导入流程**没有断点续传（resume）** 能力。如果中途断电/进程被杀/网络断开，只能重新运行导入。但是系统通过以下设计提供了"**幂等安全 + 失败清理 + 可手动重试**"的恢复能力。
+
+### 8.2 导入流程的三个阶段与事务边界
+
+```
+阶段 1: 上传并验证 ZIP (ImportRepo::storeFromUpload)
+  → 解压 ZIP 读取 metadata
+  → 验证完整性 (ZipExportValidator)
+  → 保存 ZIP 到磁盘（FileStorage::uploadFile）
+  → 写入 imports 表一条记录（pending 状态）
+  → 事务外，提交后持久化
+  ← 断电后果：imports 表无记录，文件可能残留（可手动删 / 自动被下次覆盖）
+
+阶段 2: 确认导入 (用户点击"开始导入")
+  ← 此时断电无影响，imports 表有记录，重新进入 /import/{id} 可继续
+
+阶段 3: 执行导入 (ImportRepo::runImport)
+  → DB::beginTransaction()
+  → ZipImportRunner::run()
+      ├─ 解压到临时文件
+      ├─ 逐资源写入目标磁盘（图片 → ImageService，附件 → AttachmentService）
+      │   每成功一个就记录到 ZipImportReferences
+      ├─ replaceReferences() 更新 HTML 中的资源引用
+      └─ 写入 pages/books/chapters 等表
+  → DB::commit()
+  → deleteImport() 删除导入 ZIP 文件和 imports 表记录
+  → 成功重定向到新页面
+  
+  ← 断电后果：
+     1. DB 事务回滚（DB 无残留）
+     2. 但磁盘上已写入的图片/附件文件已持久化（不会回滚）
+     3. 需手动触发清理（见 8.3）
+```
+
+> 关键：**磁盘写入不在 DB 事务内**。DB 事务只能回滚数据库记录，不能回滚磁盘文件。这是 Laravel/Life Cycle 的通用限制。
+
+### 8.3 失败时的清理机制
+
+#### 8.3.1 异常回滚（代码内捕获）
+
+`ImportRepo::runImport()` at `app/Exports/ImportRepo.php:117`
+```php
+DB::beginTransaction();
+try {
+    $model = $this->importer->run($import, $parentModel);
+} catch (ZipImportException $e) {
+    DB::rollBack();
+    $this->importer->revertStoredFiles();  // ← 手动回滚磁盘文件
+    throw $e;
+}
+DB::commit();
+```
+
+`ZipImportRunner::revertStoredFiles()` at `app/Exports/ZipExports/ZipImportRunner.php:103`
+```php
+public function revertStoredFiles(): void
+{
+    foreach ($this->references->images() as $image) {
+        $this->imageService->destroyFileAtPath($image->type, $image->path);
+    }
+    foreach ($this->references->attachments() as $attachment) {
+        if (!$attachment->external) {
+            $this->attachmentService->deleteFileInStorage($attachment);
+        }
+    }
+    $this->cleanup(); // 删除所有临时文件
+}
+```
+
+**关键点**：
+- `ZipImportReferences` 在导入过程中**实时记录**每一个成功写入的 Image/Attachment 模型
+- 回滚时遍历这些记录，调用各自的 Service 删除磁盘文件
+- 缩略图会被 `destroyFileAtPath()` 自动连带删除（`destroyAllMatchingNameFromPath` 文件名匹配）
+
+#### 8.3.2 断电/进程被杀时的残留清理（代码外）
+
+如果 PHP 进程在 `catch` 块执行前被中断（断电、`kill -9`、服务器重启），上述清理逻辑不会运行。此时：
+
+**数据库层面**：
+- 事务未 commit，导入的 page/book/chapter/image/attachment 记录全部回滚
+- imports 表中有导入记录（因为阶段 1 已提交），状态仍为"pending"
+
+**磁盘层面**：
+- 已写入的图片和附件文件作为**孤儿文件**遗留在磁盘上
+- 导入 ZIP 文件本身留在 `uploads/files/imports/` 目录
+
+**恢复步骤**：
+1. 重新访问 `/import` 页面，看到 pending 的导入记录
+2. 可以选择**重新运行导入**（会再写一遍文件，但 DB 记录会覆盖）
+3. 或者**删除导入**（`ImportController::delete()` → `ImportRepo::deleteImport()` → 仅删除 ZIP 文件和 imports 记录，不清理孤儿文件）
+4. 孤儿文件需要运行孤儿清理：
+   ```bash
+   php artisan bookstack:cleanup-images --force
+   ```
+   这会扫描 gallery/drawio 类型图片，未在 `entity_page_data.html` 中引用的会被删除（包括缩略图）
+5. 附件孤儿文件**无法自动清理** — 因为附件没有孤儿清理机制，需要手动对比 `attachments` 表和磁盘文件列表后手动删除
+
+### 8.4 临时文件的自动清理
+
+导入过程中产生的各种临时文件通过以下机制清理：
+
+| 临时文件 | 位置 | 清理时机 | 清理方式 |
+|---|---|---|---|
+| ZIP 解压的单个资源临时文件 | `sys_get_temp_dir()/bszipextract-*` | 导入完成 / 异常回滚 | `ZipImportRunner::cleanup()` 遍历 `$tempFilesToCleanup` unlink |
+| S3 下载的 ZIP 临时副本 | `sys_get_temp_dir()/bszip-import-*` | 同上 | 同上 |
+| 导出用临时文件 | `sys_get_temp_dir()/bszipfile-*` / `bszipimage-*` | 导出完成后立即 | `ZipExportFiles::extractEach()` 回调中 unlink |
+| 最终导出 ZIP 文件 | `sys_get_temp_dir()/bszip-*` | 流式下载完成 / 中断 | `streamedFileDirectly($deleteAfter=true)` 注册 `app()->terminating()` + `register_shutdown_function()` 双保险 |
+| 用户上传的导入 ZIP | `uploads/files/imports/` | 导入成功 / 用户手动删除 | `ImportRepo::deleteImport()` → `FileStorage::delete()` |
+
+### 8.5 导入幂等性分析
+
+**不支持断点续传，但支持安全重试**：
+- 导入失败后重试，磁盘上可能存在上一次遗留下的同名文件
+- `FileStorage::uploadFile()` 会生成 `Str::random(16)` 文件名，每次都不同，不会冲突
+- 图片上传如果指定了原始文件名，会在文件名后追加随机后缀避免冲突
+- 重试产生的额外文件会成为孤儿，可通过 `bookstack:cleanup-images` 清理
+- 数据库层面因为每次事务独立，重试时会分配新的 page/image/attachment ID，不会有主键冲突
+
+### 8.6 导出过程中的断电恢复
+
+导出比导入简单得多：
+- 导出时不写任何数据库记录
+- 所有中间文件都在 `sys_get_temp_dir()`，PHP 进程被杀后由操作系统的临时目录清理机制自动清理（通常 reboot 或定期 `tmpwatch`）
+- `streamedFileDirectly($deleteAfter=true)` 的双保险删除钩子在进程被杀时可能来不及运行，但文件在 tmp 目录，无需担心
+- 用户看到下载中断，重新点击导出即可，无任何状态需要恢复
+
+---
+
+## 九、三者串联关系
+
+### 9.1 图片上传 → 存储 → 缩略图生成 链路
 
 ```
 GalleryImageController::create()
@@ -715,7 +1019,7 @@ GalleryImageController::create()
 - 上传时 `shouldCreate=true` 强制生成缩略图
 - 缩略图与原图存在同一目录下的 `thumbs-/scaled-` 子目录中
 
-### 7.2 图片访问 → 缩略图懒加载 链路
+### 9.2 图片访问 → 缩略图懒加载 链路
 
 ```
 ImageController::edit() / GalleryImageController::list()
@@ -726,7 +1030,7 @@ ImageController::edit() / GalleryImageController::list()
           └─ 都没有 → 生成新缩略图
 ```
 
-### 7.3 孤儿清理 → 存储 → 缩略图删除 链路
+### 9.3 孤儿清理 → 存储 → 缩略图删除 链路
 
 ```
 CleanupImagesCommand::handle()
@@ -743,7 +1047,7 @@ CleanupImagesCommand::handle()
           └─ Image::delete()
 ```
 
-### 7.4 数据模型关系
+### 9.4 数据模型关系
 
 ```
 Image 模型 (images 表)
@@ -759,9 +1063,9 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 八、关键设计模式
+## 十、关键设计模式
 
-### 8.1 存储抽象层
+### 10.1 存储抽象层
 
 `ImageStorage` 作为工厂 + 门面，`ImageStorageDisk` 作为具体磁盘封装。
 好处：
@@ -769,13 +1073,13 @@ Attachment 模型 (attachments 表)
 - 屏蔽不同磁盘（local/s3）的差异
 - 提供图片特定的操作（如批量删除同名文件）
 
-### 8.2 缩略图懒生成 + 缓存
+### 10.2 缩略图懒生成 + 缓存
 
 - 不提前生成，按需创建
 - 内存缓存（1周）避免每次都查磁盘
 - 多级查找：缓存 → 磁盘 → 生成
 
-### 8.3 孤儿清理策略
+### 10.3 孤儿清理策略
 
 - 基于文件名模糊匹配（LIKE），简单但可能误判
 - 只清理 gallery 和 drawio 类型（用户上传的内容图片）
@@ -784,7 +1088,7 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 九、附件 vs 图片对比
+## 十一、附件 vs 图片对比
 
 | 特性 | 图片 | 附件 |
 |---|---|---|
@@ -800,22 +1104,22 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 十、补充发现
+## 十二、补充发现
 
-### 10.1 关于签名 URL（Presigned URL）
+### 12.1 关于签名 URL（Presigned URL）
 
 BookStack **完全不使用 S3 签名 URL**。策略如下：
 - S3 图片：`put()` 时设置 `Visibility::PUBLIC`，桶公开读权限，直接通过 S3 公共 URL 访问
 - 本地私有图片：走应用路由 `/uploads/images/{path}`，经 `ImageService::pathAccessibleInLocalSecure()` 校验权限后 `streamImageFromStorageResponse()` 流式返回
 - 附件：始终走 `/attachments/{id}` 路由，经 `AttachmentController::get()` 校验后下载
 
-### 10.2 关于 Queue 队列
+### 12.2 关于 Queue 队列
 
 整个上传/缩略图/清理流程**全部同步执行**，不使用队列。
 代码库中唯一使用 `ShouldQueue` 的是 `DispatchWebhookJob`（Webhook 回调），与附件图片系统无关。
 原因：图片上传和缩略图生成通常在用户交互时完成，需要即时反馈。
 
-### 10.3 关于 GD vs Imagick
+### 12.3 关于 GD vs Imagick
 
 BookStack 明确只支持 GD：
 - composer.json 未安装 `intervention/image-imagick`
@@ -825,7 +1129,7 @@ BookStack 明确只支持 GD：
 
 ---
 
-## 十一、代码位置索引
+## 十三、代码位置索引
 
 | 功能 | 文件:行 |
 |---|---|
@@ -857,3 +1161,14 @@ BookStack 明确只支持 GD：
 | ZIP 导入仓库（事务+回滚） | `app/Exports/ImportRepo.php` |
 | 导入控制器（Web 入口） | `app/Exports/Controllers/ImportController.php` |
 | URL 更新命令（非文件迁移） | `app/Console/Commands/UpdateUrlCommand.php` |
+| 附件下载控制器（权限前置校验） | `app/Uploads/Controllers/AttachmentController.php:212` |
+| 图片私有访问控制器（权限前置校验） | `app/Uploads/Controllers/ImageController.php:32` |
+| 图片路径权限校验（多层） | `app/Uploads/ImageService.php:251` |
+| 图片关联权限检查（按类型） | `app/Uploads/ImageService.php:314` |
+| Controller 基类权限检查方法 | `app/Http/Controller.php:63` |
+| 权限中间件（路由级） | `app/Http/Middleware/CheckUserHasPermission.php` |
+| 下载响应工厂（流式响应） | `app/Http/DownloadResponseFactory.php` |
+| Range 支持流（断点续传） | `app/Http/RangeSupportedStream.php` |
+| 导入模型（imports 表） | `app/Exports/Import.php` |
+| 导入引用追踪（回滚用） | `app/Exports/ZipExports/ZipImportReferences.php` |
+| 导入失败回滚磁盘文件 | `app/Exports/ZipExports/ZipImportRunner.php:103` |

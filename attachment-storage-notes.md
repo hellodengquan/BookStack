@@ -998,9 +998,238 @@ public function revertStoredFiles(): void
 
 ---
 
-## 九、三者串联关系
+## 九、附件版本控制
 
-### 9.1 图片上传 → 存储 → 缩略图生成 链路
+### 9.1 核心结论：附件没有版本控制
+
+**与页面（Page）不同，附件（Attachment）完全没有版本控制机制。**
+
+证据链：
+1. `attachments` 表没有 `revision_id`、`version` 等版本相关字段
+2. 没有 `attachment_revisions` 表
+3. `page_revisions` 表只存 `html` 和 `text`（页面内容），不存附件信息
+4. 附件更新时直接覆盖旧文件，不保留历史
+
+### 9.2 attachments 表完整字段
+
+`database/migrations/2016_10_09_142037_create_attachments_table.php:16`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | increments | 主键 |
+| `name` | string | 显示名称（文件名） |
+| `path` | string | 存储路径（随机16字符文件名）或外链URL |
+| `extension` | string(20) | 文件扩展名（外链时为空） |
+| `uploaded_to` | integer | 所属页面 ID（有索引） |
+| `external` | boolean | 是否为外链附件 |
+| `order` | integer | 排序序号 |
+| `created_by` | integer | 创建者用户 ID |
+| `updated_by` | integer | 更新者用户 ID |
+| `created_at` | timestamp | 创建时间 |
+| `updated_at` | timestamp | 更新时间 |
+
+**对比页面版本**：`page_revisions` 表存 `page_id`、`name`、`html`、`text`、`created_by`，每页可保留 100 个历史版本（`revision_limit` 配置，默认 100）。附件没有类似机制。
+
+### 9.3 附件更新是覆盖式的
+
+`AttachmentService::saveUpdatedUpload()` at `app/Uploads/AttachmentService.php:65`
+
+```php
+public function saveUpdatedUpload(UploadedFile $uploadedFile, Attachment $attachment): Attachment
+{
+    if (!$attachment->external) {
+        $this->deleteFileInStorage($attachment);  // ← 先删旧文件
+    }
+
+    $attachmentName = $uploadedFile->getClientOriginalName();
+    $attachmentPath = $this->putFileInStorage($uploadedFile);  // ← 存新文件（新随机名）
+
+    $attachment->name = $attachmentName;
+    $attachment->path = $attachmentPath;  // ← path 也变了
+    $attachment->external = false;
+    $attachment->extension = $uploadedFile->getClientOriginalExtension();
+    $attachment->save();  // ← 直接 update，不创建新记录
+
+    return $attachment;
+}
+```
+
+**关键点**：
+- 旧文件立即被删除（不可恢复）
+- 新文件生成全新的随机 16 字符文件名（不复用旧 path）
+- 数据库记录原地更新，ID 不变
+- 没有任何历史快照
+
+### 9.4 与页面修订的关系
+
+页面保存时创建的 `page_revisions` 只包含 HTML 和纯文本内容，**不包含附件列表的快照**。这意味着：
+- 回滚页面版本不会回滚附件
+- 无法通过页面修订历史查看某版本时附件是什么状态
+- 附件删除了就是删了，跟页面版本没关系
+
+**间接关联**：页面 HTML 中可能包含指向附件的链接（`/attachments/{id}`），回滚页面 HTML 时这些链接 ID 仍然有效，只要附件没被删除。
+
+### 9.5 外链附件的"版本"行为
+
+`AttachmentService::updateFile()` at `app/Uploads/AttachmentService.php:117`
+- 修改外链 URL：直接更新 `path` 字段，旧 URL 不保留
+- 上传文件替换外链：删除外链状态，`external=false`，写入磁盘文件
+- 将文件改为外链：删除磁盘文件，`external=true`，`path` 存 URL
+
+全部都是**直接覆盖**，无历史记录。
+
+---
+
+## 十、上传配额限制
+
+### 10.1 核心配置
+
+**单一全局配置，图片和附件共用**。
+
+`app/Config/app.php:38`
+```php
+'upload_limit' => env('FILE_UPLOAD_SIZE_LIMIT', 50),  // 单位：MB
+```
+
+环境变量：`FILE_UPLOAD_SIZE_LIMIT`
+默认值：50 MB
+作用范围：图片上传 + 附件上传 + ZIP 导入文件大小检查 + 嵌入 base64 图片
+
+> 注意：没有针对不同类型（图片/附件/头像）的单独配额，也没有按用户/角色的配额。
+
+### 10.2 单位换算的差异
+
+代码中有**两种不同的换算方式**，需要注意：
+
+| 位置 | 乘法因子 | 换算基准 | 50MB 结果 |
+|---|---|---|---|
+| Laravel `max:` 验证规则 | × 1000 | KB（千字节，1000 字节） | 50,000 KB |
+| ZIP 导入 size 检查 | × 1000000 | 字节（1000×1000） | 50,000,000 字节 |
+| 嵌入 base64 图片检查 | × 1000000 | 字节 | 50,000,000 字节 |
+
+**差异原因**：Laravel 的 `max` 验证规则的"max:50000"单位是 KB（kilobytes），但 Laravel 用的是 1000 字节 = 1KB（十进制），不是 1024。而代码中其他地方直接乘 1000000 也是十进制兆字节。两者实际上是一致的（都是十进制 MB），但实现路径不同。
+
+验证：`config('app.upload_limit') * 1000` KB = `50 * 1000 * 1000` 字节 = `50 * 1000000` 字节 ✓
+
+### 10.3 六个挂载点
+
+#### 挂载点 1：Web 附件上传（新建）
+
+`app/Uploads/Controllers/AttachmentController.php:37`
+```php
+$this->validate($request, [
+    'file' => array_merge(['required'], $this->attachmentService->getFileValidationRules()),
+]);
+```
+调用 `AttachmentService::getFileValidationRules()` → `['file', 'max:' . (config('app.upload_limit') * 1000)]`
+
+#### 挂载点 2：Web 附件上传（更新）
+
+`app/Uploads/Controllers/AttachmentController.php:66`
+```php
+$this->validate($request, [
+    'file' => array_merge(['required'], $this->attachmentService->getFileValidationRules()),
+]);
+```
+与新建相同的验证规则。
+
+#### 挂载点 3：API 附件上传
+
+`app/Uploads/Controllers/AttachmentApiController.php:51` + `rules()` 方法
+```php
+// create 规则
+'file' => array_merge(['required_without:link'], $this->attachmentService->getFileValidationRules()),
+
+// update 规则（可选文件）
+'file' => $this->attachmentService->getFileValidationRules(),
+```
+API 创建时 file 和 link 二选一；更新时 file 可选。
+
+#### 挂载点 4：图片上传（Web + API 通用）
+
+`app/Http/Controller.php:163` — 基类方法
+```php
+protected function getImageValidationRules(): array
+{
+    return ['image_extension', 'mimes:jpeg,png,gif,webp,avif', 'max:' . (config('app.upload_limit') * 1000)];
+}
+```
+被以下位置调用：
+- `ImageGalleryApiController` 的 `create` 和 `readDataForUrl` 规则
+- `GalleryImageController::create()` at line 61
+- `DrawioImageController::create()` at line 59
+- `ImageController::updateFile()` at line 48
+- `FaviconHandler`（间接，通过 ImageService）
+
+#### 挂载点 5：ZIP 导入文件大小检查
+
+**两处检查**：
+
+a) data.json 大小检查（`ZipExportReader::readData()` at line 66）
+```php
+$maxSize = max(intval(config()->get('app.upload_limit')), 1) * 1000000;
+if ($info['size'] > $maxSize) {
+    throw new ZipExportException(trans('errors.import_zip_data_too_large'));
+}
+```
+防止 data.json 过大导致内存溢出。
+
+b) 单个附件/图片文件检查（`ZipFileReferenceRule` at line 25）
+```php
+if (!$this->context->zipReader->fileWithinSizeLimit($value)) {
+    $fail('validation.zip_file_size')->translate([
+        'attribute' => $value,
+        'size' => config('app.upload_limit'),  // 显示 MB 数
+    ]);
+}
+```
+`fileWithinSizeLimit()` 内部也是用 `upload_limit * 1000000` 字节比较。
+
+> 注意：ZIP 文件本身的大小不受 `upload_limit` 限制，只限制 ZIP 内的单个文件和 data.json。
+
+#### 挂载点 6：页面 HTML 中嵌入的 base64 图片
+
+`PageContent::extractTagsAndSaveImages()` at `app/Entities/Tools/PageContent.php:160`
+```php
+// Validate that the content is not over our upload limit
+$uploadLimitBytes = (config('app.upload_limit') * 1000000);
+if (strlen($imageInfo['data']) > $uploadLimitBytes) {
+    return '';  // 超过大小直接丢弃，不保存
+}
+```
+用户在编辑器里粘贴 base64 图片时的检查。超过限制的图片不会被转为正式图片上传，直接忽略。
+
+### 10.4 PHP 层面的额外限制
+
+除了 BookStack 自身的 `upload_limit`，还受到 PHP.ini 配置限制：
+- `upload_max_filesize` — 单个上传文件上限
+- `post_max_size` — POST 请求体总大小上限
+- `memory_limit` — 内存上限（图像处理时会用到）
+
+这些是 PHP 层面的硬限制，优先级高于 BookStack 的 `upload_limit`。
+BookStack 的 `upload_limit` 不能超过 PHP 的 `upload_max_filesize`，否则验证通过但 PHP 层面会先报错。
+
+### 10.5 错误消息
+
+| 场景 | 错误消息 key | 位置 |
+|---|---|---|
+| 附件/图片上传超大 | `validation.max`（Laravel 默认） | 由 `max:` 验证规则抛出 |
+| ZIP 导入 data.json 超大 | `errors.import_zip_data_too_large` | `ZipExportReader::readData()` |
+| ZIP 内单个文件超大 | `validation.zip_file_size` | `ZipFileReferenceRule` |
+| 嵌入 base64 图片超大 | 静默返回空字符串 | `PageContent` |
+
+### 10.6 配额限制与多 disk 的关系
+
+`upload_limit` 与存储驱动无关：
+- local / local_secure / local_secure_restricted / s3 都用同一个限制
+- 校验发生在控制器层（验证规则），写入磁盘之前
+- 切换磁盘不会改变配额限制
+
+---
+
+## 十一、三者串联关系
+
+### 11.1 图片上传 → 存储 → 缩略图生成 链路
 
 ```
 GalleryImageController::create()
@@ -1019,7 +1248,7 @@ GalleryImageController::create()
 - 上传时 `shouldCreate=true` 强制生成缩略图
 - 缩略图与原图存在同一目录下的 `thumbs-/scaled-` 子目录中
 
-### 9.2 图片访问 → 缩略图懒加载 链路
+### 11.2 图片访问 → 缩略图懒加载 链路
 
 ```
 ImageController::edit() / GalleryImageController::list()
@@ -1030,7 +1259,7 @@ ImageController::edit() / GalleryImageController::list()
           └─ 都没有 → 生成新缩略图
 ```
 
-### 9.3 孤儿清理 → 存储 → 缩略图删除 链路
+### 11.3 孤儿清理 → 存储 → 缩略图删除 链路
 
 ```
 CleanupImagesCommand::handle()
@@ -1047,7 +1276,7 @@ CleanupImagesCommand::handle()
           └─ Image::delete()
 ```
 
-### 9.4 数据模型关系
+### 11.4 数据模型关系
 
 ```
 Image 模型 (images 表)
@@ -1063,9 +1292,9 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 十、关键设计模式
+## 十二、关键设计模式
 
-### 10.1 存储抽象层
+### 12.1 存储抽象层
 
 `ImageStorage` 作为工厂 + 门面，`ImageStorageDisk` 作为具体磁盘封装。
 好处：
@@ -1073,13 +1302,13 @@ Attachment 模型 (attachments 表)
 - 屏蔽不同磁盘（local/s3）的差异
 - 提供图片特定的操作（如批量删除同名文件）
 
-### 10.2 缩略图懒生成 + 缓存
+### 12.2 缩略图懒生成 + 缓存
 
 - 不提前生成，按需创建
 - 内存缓存（1周）避免每次都查磁盘
 - 多级查找：缓存 → 磁盘 → 生成
 
-### 10.3 孤儿清理策略
+### 12.3 孤儿清理策略
 
 - 基于文件名模糊匹配（LIKE），简单但可能误判
 - 只清理 gallery 和 drawio 类型（用户上传的内容图片）
@@ -1088,7 +1317,7 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 十一、附件 vs 图片对比
+## 十三、附件 vs 图片对比
 
 | 特性 | 图片 | 附件 |
 |---|---|---|
@@ -1104,22 +1333,22 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 十二、补充发现
+## 十四、补充发现
 
-### 12.1 关于签名 URL（Presigned URL）
+### 14.1 关于签名 URL（Presigned URL）
 
 BookStack **完全不使用 S3 签名 URL**。策略如下：
 - S3 图片：`put()` 时设置 `Visibility::PUBLIC`，桶公开读权限，直接通过 S3 公共 URL 访问
 - 本地私有图片：走应用路由 `/uploads/images/{path}`，经 `ImageService::pathAccessibleInLocalSecure()` 校验权限后 `streamImageFromStorageResponse()` 流式返回
 - 附件：始终走 `/attachments/{id}` 路由，经 `AttachmentController::get()` 校验后下载
 
-### 12.2 关于 Queue 队列
+### 14.2 关于 Queue 队列
 
 整个上传/缩略图/清理流程**全部同步执行**，不使用队列。
 代码库中唯一使用 `ShouldQueue` 的是 `DispatchWebhookJob`（Webhook 回调），与附件图片系统无关。
 原因：图片上传和缩略图生成通常在用户交互时完成，需要即时反馈。
 
-### 12.3 关于 GD vs Imagick
+### 14.3 关于 GD vs Imagick
 
 BookStack 明确只支持 GD：
 - composer.json 未安装 `intervention/image-imagick`
@@ -1129,7 +1358,7 @@ BookStack 明确只支持 GD：
 
 ---
 
-## 十三、代码位置索引
+## 十五、代码位置索引
 
 | 功能 | 文件:行 |
 |---|---|
@@ -1172,3 +1401,14 @@ BookStack 明确只支持 GD：
 | 导入模型（imports 表） | `app/Exports/Import.php` |
 | 导入引用追踪（回滚用） | `app/Exports/ZipExports/ZipImportReferences.php` |
 | 导入失败回滚磁盘文件 | `app/Exports/ZipExports/ZipImportRunner.php:103` |
+| 附件表迁移（字段定义） | `database/migrations/2016_10_09_142037_create_attachments_table.php` |
+| 页面修订表迁移（无附件字段） | `database/migrations/2015_08_09_093534_create_page_revisions_table.php` |
+| 附件更新（覆盖式，无版本） | `app/Uploads/AttachmentService.php:65` |
+| 附件详情更新 | `app/Uploads/AttachmentService.php:117` |
+| 全局上传配额配置 | `app/Config/app.php:38` |
+| 附件上传验证规则 | `app/Uploads/AttachmentService.php:183` |
+| 图片上传验证规则（基类） | `app/Http/Controller.php:163` |
+| ZIP 导入 data.json 大小检查 | `app/Exports/ZipExports/ZipExportReader.php:66` |
+| ZIP 导入单文件大小检查 | `app/Exports/ZipExports/ZipExportReader.php:86` |
+| ZIP 导入文件大小验证规则 | `app/Exports/ZipExports/ZipFileReferenceRule.php:25` |
+| 嵌入 base64 图片大小检查 | `app/Entities/Tools/PageContent.php:160` |

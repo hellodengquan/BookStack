@@ -451,9 +451,252 @@ bookstack:cleanup-images
 
 ---
 
-## 五、三者串联关系
+## 五、附件下载并发限流
 
-### 5.1 图片上传 → 存储 → 缩略图生成 链路
+### 5.1 限流总览
+
+BookStack 使用 Laravel 内置的 `RateLimiter`（`Illuminate\Support\Facades\RateLimiter`）实现请求限流。
+
+限流配置集中在 `RouteServiceProvider::configureRateLimiting()` at `app/App/Providers/RouteServiceProvider.php:79`
+
+### 5.2 四种限流策略
+
+| 限流名称 | 挂载位置 | 速率限制 | 限流 Key | 说明 |
+|---|---|---|---|---|
+| `api` | `api` middleware group 全局 | 60 次/分钟 | 登录用户 ID，未登录则 IP | 所有 API 路由统一限流 |
+| `public` | 特定匿名路由（注册/密码重置） | 10 次/分钟 | IP | 只用于未登录公开操作 |
+| `exports` | 导出控制器构造函数 | 访客 4 次/分钟, 登录 10 次/分钟 | 访客用 IP, 登录用 user.id | 控制 PDF/ZIP/HTML 等导出压力 |
+| `ThrottleApiRequests` 中间件 | 覆盖 `api` 配置 | 读取 `api.requests_per_minute` 配置 | 同上 | 可通过配置项动态调整 API 限流 |
+
+> **重要结论：附件下载路由 `/attachments/{id}` 本身没有挂载任何 throttle 中间件。**
+> 路由定义：`routes/web.php:160` `Route::get('/attachments/{id}', ...)` — 只有 `web` middleware group，不含限流。
+> 图片私有访问路由（`/uploads/images/{path}`）同样不限流。
+
+### 5.3 限流代码挂载点详解
+
+**限流定义（RouteServiceProvider）**
+`app/App/Providers/RouteServiceProvider.php:79`
+```php
+RateLimiter::for('api', function (Request $request) {
+    return Limit::perMinute(60)->by($request->user()?->id ?: $request->ip());
+});
+
+RateLimiter::for('public', function (Request $request) {
+    return Limit::perMinute(10)->by($request->ip());
+});
+
+RateLimiter::for('exports', function (Request $request) {
+    $user = user();
+    $attempts = $user->isGuest() ? 4 : 10;
+    $key = $user->isGuest() ? $request->ip() : $user->id;
+    return Limit::perMinute($attempts)->by($key);
+});
+```
+
+**exports 限流挂载（3 个控制器构造函数）**
+```php
+// BookExportController::__construct  at app/Exports/Controllers/BookExportController.php:20
+$this->middleware('throttle:exports');
+
+// ChapterExportController::__construct  at app/Exports/Controllers/ChapterExportController.php:20
+$this->middleware('throttle:exports');
+
+// PageExportController::__construct  at app/Exports/Controllers/PageExportController.php:21
+$this->middleware('throttle:exports');
+```
+
+**public 限流挂载（路由层）**
+`routes/web.php`
+```
+Route::post('/register/confirm/accept', ...)->middleware('throttle:public');  // line 345
+Route::post('/register', ...)->middleware('throttle:public');                  // line 346
+Route::get('/register/invite/{token}', ...)->middleware('throttle:public');    // line 366
+Route::post('/register/invite/{token}', ...)->middleware('throttle:public');   // line 367
+Route::post('/password/email', ...)->middleware('throttle:public');            // line 371
+Route::post('/password/reset', ...)->middleware('throttle:public');            // line 375
+```
+
+**api 限流（中间件组 + 可配置覆盖）**
+`app/Http/Kernel.php:41` — api 组挂载 `ThrottleApiRequests`
+```php
+// ThrottleApiRequests 继承自 Laravel 默认 ThrottleRequests
+// 但重写了 resolveMaxAttempts()，从配置读取
+// app/Http/Middleware/ThrottleApiRequests.php:12
+protected function resolveMaxAttempts($request, $maxAttempts): int
+{
+    return (int) config('api.requests_per_minute');
+}
+```
+配置文件 `app/Config/api.php:13`：`'requests_per_minute' => env('API_REQUESTS_PER_MINUTE', 180),`
+即默认 180 次/分钟，但 `RateLimiter::for('api')` 定义的 60 次/分钟仍然生效？——实际上两者并不冲突：`ThrottleApiRequests` 是 Laravel 原生 throttle 中间件的子类，在 api middleware 组中使用，而 `RateLimiter::for('api')` 是通过 `->middleware('throttle:api')` 显式挂载时使用。经检查路由，api.php 的 attachment 路由未单独加 throttle，只靠 `api` 组的 `ThrottleApiRequests`。
+
+### 5.4 限流测试佐证
+
+`tests/Exports/ZipExportTest.php:479` — ZIP 导出限流测试：
+```php
+// 前 4 次成功（访客 4 次/分钟）
+for ($i = 0; $i < 4; $i++) {
+    $this->get($page->getUrl("/export/zip"))->assertOk();
+}
+// 第 5 次触发 429 Too Many Attempts
+$this->get($page->getUrl("/export/zip"))->assertTooManyRequests();
+
+// 登录用户放宽到 10 次/分钟
+for ($i = 0; $i < 10; $i++) { ...assertOk() }
+$this->get(...)->assertTooManyRequests();
+```
+
+### 5.5 附件/图片下载为何不限流？
+
+设计权衡：
+1. 附件和图片下载前置了**权限校验**（`PageView` 权限），匿名用户本来就访问不了大部分内容
+2. 实际文件读取走流式响应（`streamedDirectly`），不会一次性读入内存，并发压力相对可控
+3. 如果需要限流，可自行在路由或控制器中追加 `->middleware('throttle:exports')` 或自定义限流器
+
+---
+
+## 六、多 Disk 切换时的旧资源迁移路径
+
+### 6.1 核心结论：BookStack 没有内置的 storage 迁移工具
+
+**证据链**：
+1. Artisan 命令列表中（`app/Console/Commands/` 共 17 条命令）**没有任何 storage/disk/fs 迁移相关命令**
+   - 现有关联命令：`bookstack:cleanup-images`、`bookstack:update-url`、`bookstack:regenerate-*`
+   - 完全没有 `bookstack:storage-migrate` / `copy-storage` / `move-files` 之类的命令
+2. 代码库中全局搜索 `copy.*disk|move.*disk|storage.*migrate|transfer`，没有相关逻辑
+3. `app/Console/Kernel.php:17` 的 `schedule()` 方法为空，无迁移调度
+4. **唯一跨 disk 读写路径是 ZIP 导出/导入流程**（见 6.2 节）
+
+管理员从 local 切到 S3（或反向），必须手动用 `aws s3 sync` / `rclone` / 自写脚本迁移 `uploads/` 下的文件。
+
+### 6.2 间接迁移路径：ZIP 导出 → ZIP 导入
+
+虽然没有直接的存储迁移工具，但 ZIP 导出/导入机制提供了一个**跨实例跨 disk 的内容迁移通道**，且会自动将资源写入目标实例当前配置的磁盘。
+
+#### 6.2.1 导出侧（从任意磁盘读文件 → 写入本地临时 ZIP）
+
+`ZipExportBuilder::build()` at `app/Exports/ZipExports/ZipExportBuilder.php:67`
+```
+ZipExportFiles::extractEach(callback)
+  ├─ 遍历所有引用的附件
+  │   └─ AttachmentService::streamAttachmentFromStorage($attachment)
+  │       → 不管原始文件在 local / local_secure / s3，都返回 PHP stream
+  │       → 保存到 sys_get_temp_dir() 临时文件
+  │
+  └─ 遍历所有引用的图片
+      └─ ImageService::getImageStream($image)
+          → 同样从配置磁盘读取 stream
+          → 保存到临时文件
+  
+  → 所有临时文件被 ZipArchive::addFile() 打包
+  → 最终 ZIP 返回给用户下载
+```
+
+关键点：`streamAttachmentFromStorage()` 和 `getImageStream()` 内部调用的是 `FileStorage::getReadStream()` 或 `ImageStorageDisk::get()`，它们根据当前配置的磁盘适配路径，从正确位置读取。这意味着即便原始文件在 S3，也能被透明地读入 ZIP。
+
+#### 6.2.2 导入侧（从 ZIP 解包 → 写入目标磁盘）
+
+`ZipImportRunner::run()` at `app/Exports/ZipExports/ZipImportRunner.php:51`
+
+**第一步：获取 ZIP 文件路径（本身就支持跨 disk）**
+```php
+// ZipImportRunner::getZipPath() at line 353
+if (!$this->storage->isRemote()) {
+    // 本地磁盘直接返回绝对路径
+    return $this->storage->getSystemPath($import->path);
+}
+
+// 远程磁盘（S3）：先流式下载到本地临时文件
+$tempFilePath = tempnam(sys_get_temp_dir(), 'bszip-import-');
+$stream = $this->storage->getReadStream($import->path);
+stream_copy_to_stream($stream, fopen($tempFilePath, 'wb'));
+return $tempFilePath;
+```
+
+**第二步：逐个资源解包 → 存到目标磁盘**
+```
+ZipImportRunner::importAttachment() / importImage()
+  → zipFileToUploadedFile()
+      → ZipExportReader::streamFile() 从 ZIP 中读取文件流
+      → 拷贝到 sys_get_temp_dir() 临时文件
+      → 包装为 UploadedFile
+  
+  → saveNewUpload() / saveNewFromUpload()
+      → FileStorage::uploadFile() / ImageStorageDisk::put()
+          → 根据目标实例当前配置（STORAGE_TYPE / STORAGE_IMAGE_TYPE）
+          → 写入对应磁盘（local / local_secure / s3）
+          → 路径适配自动生效
+```
+
+**第三步：失败回滚（事务 + 文件清理）**
+`ImportRepo::runImport()` at `app/Exports/ImportRepo.php:117`
+```php
+DB::beginTransaction();
+try {
+    $model = $this->importer->run($import, $parentModel);
+} catch (ZipImportException $e) {
+    DB::rollBack();
+    $this->importer->revertStoredFiles();  // ← 删除已写入磁盘的图片和附件
+    throw $e;
+}
+DB::commit();
+```
+
+`revertStoredFiles()` 遍历已导入的 Image/Attachment，调用各自的 Service 删除磁盘上的文件。
+
+#### 6.2.3 导入文件存储路径
+
+`ImportRepo::storeFromUpload()` at `app/Exports/ImportRepo.php:73`
+```php
+$path = $this->storage->uploadFile(
+    $file,
+    'uploads/files/imports/',   // 上传的 ZIP 文件存放在这个路径
+    '',
+    'zip'
+);
+```
+导入 ZIP 本身走 `FileStorage`，即使用附件的存储配置（`STORAGE_ATTACHMENT_TYPE`）。
+
+### 6.3 手动迁移参考方案（官方未提供，需自行实现）
+
+由于 BookStack 不提供 storage 迁移命令，切换磁盘时需手动操作：
+
+```bash
+# 方案 A: local → s3
+# 1. 切换配置
+STORAGE_IMAGE_TYPE=s3
+STORAGE_ATTACHMENT_TYPE=s3
+# 2. 同步图片（从 public/uploads/images 或 storage/uploads/images）
+aws s3 sync public/uploads/images/ s3://your-bucket/uploads/images/
+# 3. 同步附件（从 storage/uploads/files/）
+aws s3 sync storage/uploads/files/ s3://your-bucket/uploads/files/
+# 4. 用 php artisan bookstack:update-url 更新数据库中的 URL（如有需要）
+
+# 方案 B: s3 → local
+# 反向操作即可，注意路径前缀匹配：
+# local_secure_images 的 root 已是 storage/uploads/images/
+# 因此 s3 对象 key uploads/images/gallery/... 需要对应到 gallery/...
+```
+
+路径前缀注意事项（与 2.3 节呼应）：
+- 迁移到 **local_secure_images**：S3 中 `uploads/images/gallery/2024-01/a.jpg` → 本地 `storage/uploads/images/gallery/2024-01/a.jpg`（去掉前缀 `uploads/images/`，因为磁盘 root 已经是那个目录）
+- 迁移到 **local（public）**：`public/uploads/images/gallery/2024-01/a.jpg`（保留完整前缀）
+- 迁移到 **S3**：保留 `uploads/images/` 和 `uploads/files/` 前缀
+
+### 6.4 URL 切换：`bookstack:update-url` 命令
+
+虽然不能迁移文件，但有个配套命令用于更新数据库中存储的 URL：
+`app/Console/Commands/UpdateUrlCommand.php`
+```bash
+php artisan bookstack:update-url https://old.example.com https://new.example.com
+```
+用途：当域名或 APP_URL 变更时，批量替换 `entity_page_data.html`、`page_revisions.html` 等字段中引用的旧 URL。与存储驱动无关，但切换 storage 类型后如果图片 URL 前缀变化，可能需要配合使用。
+
+---
+
+## 七、三者串联关系
+
+### 7.1 图片上传 → 存储 → 缩略图生成 链路
 
 ```
 GalleryImageController::create()
@@ -472,7 +715,7 @@ GalleryImageController::create()
 - 上传时 `shouldCreate=true` 强制生成缩略图
 - 缩略图与原图存在同一目录下的 `thumbs-/scaled-` 子目录中
 
-### 5.2 图片访问 → 缩略图懒加载 链路
+### 7.2 图片访问 → 缩略图懒加载 链路
 
 ```
 ImageController::edit() / GalleryImageController::list()
@@ -483,7 +726,7 @@ ImageController::edit() / GalleryImageController::list()
           └─ 都没有 → 生成新缩略图
 ```
 
-### 5.3 孤儿清理 → 存储 → 缩略图删除 链路
+### 7.3 孤儿清理 → 存储 → 缩略图删除 链路
 
 ```
 CleanupImagesCommand::handle()
@@ -500,7 +743,7 @@ CleanupImagesCommand::handle()
           └─ Image::delete()
 ```
 
-### 5.4 数据模型关系
+### 7.4 数据模型关系
 
 ```
 Image 模型 (images 表)
@@ -516,9 +759,9 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 六、关键设计模式
+## 八、关键设计模式
 
-### 6.1 存储抽象层
+### 8.1 存储抽象层
 
 `ImageStorage` 作为工厂 + 门面，`ImageStorageDisk` 作为具体磁盘封装。
 好处：
@@ -526,13 +769,13 @@ Attachment 模型 (attachments 表)
 - 屏蔽不同磁盘（local/s3）的差异
 - 提供图片特定的操作（如批量删除同名文件）
 
-### 6.2 缩略图懒生成 + 缓存
+### 8.2 缩略图懒生成 + 缓存
 
 - 不提前生成，按需创建
 - 内存缓存（1周）避免每次都查磁盘
 - 多级查找：缓存 → 磁盘 → 生成
 
-### 6.3 孤儿清理策略
+### 8.3 孤儿清理策略
 
 - 基于文件名模糊匹配（LIKE），简单但可能误判
 - 只清理 gallery 和 drawio 类型（用户上传的内容图片）
@@ -541,7 +784,7 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 七、附件 vs 图片对比
+## 九、附件 vs 图片对比
 
 | 特性 | 图片 | 附件 |
 |---|---|---|
@@ -557,22 +800,22 @@ Attachment 模型 (attachments 表)
 
 ---
 
-## 八、补充发现
+## 十、补充发现
 
-### 8.1 关于签名 URL（Presigned URL）
+### 10.1 关于签名 URL（Presigned URL）
 
 BookStack **完全不使用 S3 签名 URL**。策略如下：
 - S3 图片：`put()` 时设置 `Visibility::PUBLIC`，桶公开读权限，直接通过 S3 公共 URL 访问
 - 本地私有图片：走应用路由 `/uploads/images/{path}`，经 `ImageService::pathAccessibleInLocalSecure()` 校验权限后 `streamImageFromStorageResponse()` 流式返回
 - 附件：始终走 `/attachments/{id}` 路由，经 `AttachmentController::get()` 校验后下载
 
-### 8.2 关于 Queue 队列
+### 10.2 关于 Queue 队列
 
 整个上传/缩略图/清理流程**全部同步执行**，不使用队列。
 代码库中唯一使用 `ShouldQueue` 的是 `DispatchWebhookJob`（Webhook 回调），与附件图片系统无关。
 原因：图片上传和缩略图生成通常在用户交互时完成，需要即时反馈。
 
-### 8.3 关于 GD vs Imagick
+### 10.3 关于 GD vs Imagick
 
 BookStack 明确只支持 GD：
 - composer.json 未安装 `intervention/image-imagick`
@@ -582,7 +825,7 @@ BookStack 明确只支持 GD：
 
 ---
 
-## 九、代码位置索引
+## 十一、代码位置索引
 
 | 功能 | 文件:行 |
 |---|---|
@@ -602,3 +845,15 @@ BookStack 明确只支持 GD：
 | 文件系统配置（disks 定义） | `app/Config/filesystems.php` |
 | 清理 Web 路由 | `routes/web.php:231` |
 | 清理维护页面视图 | `resources/views/settings/maintenance.blade.php:34` |
+| 限流配置（RateLimiter 定义） | `app/App/Providers/RouteServiceProvider.php:79` |
+| API 限流中间件（可配置覆盖） | `app/Http/Middleware/ThrottleApiRequests.php` |
+| HTTP Kernel（middleware groups） | `app/Http/Kernel.php` |
+| 限流 API 配置 | `app/Config/api.php` |
+| 附件下载路由（不限流） | `routes/web.php:160` |
+| 导出控制器（挂载 `throttle:exports`） | `app/Exports/Controllers/BookExportController.php:20` |
+| ZIP 导出构建器（跨 disk 读取文件） | `app/Exports/ZipExports/ZipExportBuilder.php` |
+| ZIP 文件引用管理（stream 读取） | `app/Exports/ZipExports/ZipExportFiles.php` |
+| ZIP 导入执行器（跨 disk 写入） | `app/Exports/ZipExports/ZipImportRunner.php` |
+| ZIP 导入仓库（事务+回滚） | `app/Exports/ImportRepo.php` |
+| 导入控制器（Web 入口） | `app/Exports/Controllers/ImportController.php` |
+| URL 更新命令（非文件迁移） | `app/Console/Commands/UpdateUrlCommand.php` |

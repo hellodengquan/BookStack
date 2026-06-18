@@ -967,6 +967,160 @@ $table->string('external_auth_id')->index();
 
 数据库层和应用层都没有针对空 `external_auth_id` 的防护，也没有对 `external_auth_id` 做全局唯一性约束。一旦空值进入 `findOrRegister`，就会直接命中第一个空值用户并完成登录。
 
+##### 7.3.4.4 接管后的横向提权路径
+
+如果被接管的账号本身不是 admin，攻击者是否还能进一步提升权限？
+
+**直接路径：用户管理功能**
+
+**文件**: `app/Users/Controllers/UserController.php:35-224`
+
+```
+/user/create  → checkPermission(Permission::UsersManage)
+/user/{id}/edit → checkPermission(Permission::UsersManage)
+/user/{id}/update → checkPermission(Permission::UsersManage)
+```
+
+- `UserController@update` 接收 `roles` 数组，通过 `UserRepo::update → setUserRoles → $user->roles()->sync($roles)` 直接修改角色
+- 如果被接管账号本身不具备 `UsersManage` 权限，以上路径全部被 `checkPermission` 拦截
+- 如果被接管账号本身就是 admin（默认接管的 id=1），则可直接通过页面操作：新建带 admin 角色的用户、给自己或其他用户追加 admin 角色
+
+**间接路径：组同步改写角色**
+
+**文件**: `app/Access/GroupSyncService.php:73-85`
+
+如果管理员同时开启了组同步（如 `OIDC_USER_TO_GROUPS=true` + `OIDC_REMOVE_FROM_GROUPS=true`）：
+
+1. 攻击者用空值 OIDC 账号登录 → 被接管为某普通用户 A
+2. 如果 IdP 侧给攻击者的账号配置了 admin 对应的组名
+3. 每次登录都会跑 `syncUserWithFoundGroups(user, ['Admin'], true)` → `roles()->sync([adminRoleId])` → 覆盖为 admin
+4. 但这需要被接管的用户 A 已经存在，且**是用户 A 的后续登录触发了组同步**，攻击者无法主动给其他用户同步
+
+结论：**组同步不会让攻击者横向提权到其他账号**，但如果被接管的账号恰好开启了 `remove_from_groups=true` 的组同步，且攻击者 IdP 账号含有 admin 映射组，则可以在后续登录中**自我提升**为 admin。
+
+**API Token 路径**
+
+**文件**: `app/Users/Controllers/UserApiController.php`
+
+同理，创建 API Token 需要 `Permission::ApiTokensManage` 权限，admin 用户可以直接创建长期有效的 API Token，供后续脚本化操作使用。
+
+##### 7.3.4.5 Admin 关键路径上的防护核查：IP 限制 / MFA / 审批拦截
+
+**IP 限制 — 完全没有**
+
+**文件**: `app/Config/app.php:97` + 全站搜索 `ip_whitelist`/`allowed_ips`
+
+```php
+'ip_address_precision' => env('IP_ADDRESS_PRECISION', 4),
+```
+
+- `ip_address_precision` 只是控制**日志存储时 IP 的掩码精度**（0=全隐，4=全存），不是访问控制
+- `UserController`、`RoleController`、`SettingController` 等管理控制器没有任何 IP 白名单中间件
+- 结论：**没有任何 IP 层面的访问限制**，攻击者从任意 IP 均可操作管理功能
+
+**MFA 二步验证 — 只挡登录入口，不挡后续管理操作**
+
+**文件**: `app/Access/LoginService.php:36-60` + `app/Http/Kernel.php`
+
+```php
+// LoginService::login() 中
+if ($this->awaitingEmailConfirmation($user) || $this->needsMfaVerification($user)) {
+    $this->setLastLoginAttemptedForUser($user, $method, $remember);
+    throw new StoppedAuthenticationException($user, $this);
+}
+```
+
+```php
+// Http/Kernel.php — 路由中间件
+'auth' => \BookStack\Http\Middleware\Authenticate::class,
+'mfa-setup' => \BookStack\Http\Middleware\AuthenticatedOrPendingMfa::class,
+```
+
+- MFA 校验**只在 `LoginService::login()` 时执行一次**
+- `AuthenticatedOrPendingMfa` 中间件只放行 MFA 设置流程相关页面（mfa-setup），不保护管理页面
+- 一旦通过 login 流程（MFA 也通过），后续访问 `/settings/users/{id}/update` 等敏感端点只检查 `auth()` 登录态和 `Permission::UsersManage`，**不再二次校验 MFA**
+- 对身份接管场景的影响：如果被接管的 admin 账号**没有配置 MFA**，攻击者一次登录即可永久畅通；如果 admin **配置了 MFA**，攻击会被 MFA 校验拦下
+- 但注意：MFA 是按**被接管的用户**来检查的，不是按攻击者。如果被接管的 admin 没有 MFA，就直接通过。
+
+**审批拦截 — 完全没有**
+
+代码中不存在任何需要二次审批的操作机制。用户角色变更、系统设置修改等敏感操作一经提交立即落库，没有审批流，没有审批人通知，也没有"待审批状态"。
+
+**Demo 模式保护**
+
+**文件**: `UserController.php:145, 202, 218`
+
+```php
+$this->preventAccessInDemoMode();
+```
+
+`update / destroy / resetMfa` 等路径有 Demo 模式保护（环境变量 `APP_ENV=demo` 时禁止），但生产环境 `APP_ENV=production` 时此保护不生效。
+
+##### 7.3.4.6 Audit Log 字段核查：能否事后追责到攻击者？
+
+**Activity 表结构**
+
+**文件**: `database/migrations/2015_08_16_142133_create_activities_table.php` + 后续迁移
+
+activities 表包含的关键字段：
+
+| 字段 | 类型 | 内容 |
+|------|------|------|
+| `id` | int | 主键 |
+| `type` | string | 事件类型，如 `auth_login`、`user_update` |
+| `user_id` | int | 当前登录用户 ID |
+| `ip` | string(45) | 来源 IP，受 `IP_ADDRESS_PRECISION` 控制精度（默认 4 = 完整 IP） |
+| `detail` | text | 事件详情（`logDescriptor()` 或自定义字符串） |
+| `loggable_id` | int | 关联实体 ID（可选） |
+| `loggable_type` | string | 关联实体类型（可选） |
+| `created_at` | datetime | 事件时间 |
+
+**登录事件记录**
+
+**文件**: `app/Access/LoginService.php:50`
+
+```php
+Activity::add(ActivityType::AUTH_LOGIN, "{$method}; {$user->logDescriptor()}");
+```
+
+`detail` 字段内容示例：`"oidc; (1) Admin"`
+
+- `method`：登录方式（`standard` / `ldap` / `saml2` / `oidc` / `google` 等 Social driver 名）
+- `logDescriptor()`：`({$user->id}) {$user->name}` —— **记录的是被接管用户的 ID 和 name，不是外部身份 ID**
+
+**敏感操作事件**
+
+| 操作 | Activity Type | 记录 detail |
+|------|--------------|------------|
+| 新建用户 | `USER_CREATE` | `(user_id) User Name` |
+| 修改用户 | `USER_UPDATE` | `(user_id) User Name` |
+| 删除用户 | `USER_DELETE` | `(user_id) User Name` |
+| 重置 MFA | `USER_MFA_RESET` | `(user_id) User Name` |
+| 新建角色 | `ROLE_CREATE` | `(role_id) Role Display Name` |
+| 修改角色 | `ROLE_UPDATE` | `(role_id) Role Display Name` |
+| 修改系统设置 | `SETTINGS_UPDATE` | 空字符串 |
+| 登录 | `AUTH_LOGIN` | `方法; (userId) 用户名` |
+| 注册 | `AUTH_REGISTER` | `(userId) 用户名` |
+
+**追责能力评估**
+
+| 追责维度 | 是否能从 log 中还原 | 说明 |
+|---------|-------------------|------|
+| 操作发生时间 | ✅ | `created_at` 精确记录 |
+| 操作类型 | ✅ | `type` 完整枚举 |
+| 操作人（本地用户 ID） | ✅ | `user_id` 记录的是当前登录态用户 ID，即**被接管的本地用户** |
+| 操作人真实身份（OIDC sub / SAML NameID） | ❌ | **没有任何地方记录外部身份的原始 ID**。接管时外部 ID 为空字符串，`detail` 里只存本地用户 ID 和方法名 |
+| 来源 IP | ⚠️ 部分 | 依赖 `IP_ADDRESS_PRECISION` 配置，默认 4 可完整记录；如果设为 0/1/2/3 则 IP 被掩码，无法精确溯源 |
+| 被修改对象 | ✅ | `loggable_id + loggable_type` 关联实体，或 `detail` 中的 logDescriptor |
+| 操作前后的变化（Diff） | ❌ | `USER_UPDATE` 只记录一条 "update" 事件，**不记录改了哪些字段、原值是什么**（比如角色从 Viewer 改成 Admin 没有日志痕迹） |
+| 具体改了哪个用户的角色 | ❌ | `USER_UPDATE` 的 detail 是被修改用户的 logDescriptor，但**不区分改了 name / email / roles / external_auth_id 中的哪一项** |
+
+**最关键的追责缺陷**：
+
+1. **外部身份 ID 完全不入库**——即使是正常登录，外部 `sub` / NameID / DN 也只用于 `findOrRegister` 的查找，不会写入任何日志。身份接管时 external_id 是空字符串，日志里根本区分不了"正常 admin 登录"和"攻击者用空 external_id 登录成 admin"。
+2. **USER_UPDATE 无 Diff**——攻击者把自己的角色从普通用户改为 admin，日志里只有一条 `user_update`，不记录 roles 变化；事后审计需要额外对比 `activities.created_at` 时间点前后的 `role_user` 表快照才能发现。
+3. **无法区分攻击者和真实用户**——攻击者使用被接管账号操作时，`user_id` 就是被接管用户的 ID，IP 也可能重合（如同一企业网络出口），没有独立的身份指纹。
+
 #### 7.3.5 冲突结论
 
 - **Social 和外部主 Provider 不会自动合并身份**，靠 email 校验互相拦住注册；只有用户先通过一种方式登录后，再在个人设置里手动绑定 Social 账号才能建立关联。

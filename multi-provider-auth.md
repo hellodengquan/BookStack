@@ -1121,6 +1121,214 @@ Activity::add(ActivityType::AUTH_LOGIN, "{$method}; {$user->logDescriptor()}");
 2. **USER_UPDATE 无 Diff**——攻击者把自己的角色从普通用户改为 admin，日志里只有一条 `user_update`，不记录 roles 变化；事后审计需要额外对比 `activities.created_at` 时间点前后的 `role_user` 表快照才能发现。
 3. **无法区分攻击者和真实用户**——攻击者使用被接管账号操作时，`user_id` 就是被接管用户的 ID，IP 也可能重合（如同一企业网络出口），没有独立的身份指纹。
 
+##### 7.3.4.7 IP_ADDRESS_PRECISION 取值对审计日志的影响
+
+`IP_ADDRESS_PRECISION` 控制的是**仅 `activities.ip` 一个字段**的掩码精度，不会影响其他任何日志字段（detail、user_id、type 等均不受影响）。
+
+**代码路径**: `app/Activity/Tools/IpFormatter.php:10-47`
+
+```php
+public function __construct(string $ip, int $precision)
+{
+    $this->ip = trim($ip);
+    $this->precision = max(0, min($precision, 4));  // 钳位到 0~4
+}
+```
+
+**不同精度下的截断规则**：
+
+| 精度值 | IPv4 示例 (原始: 192.168.1.100) | IPv6 示例 (原始: 2001:db8::1) | 说明 |
+|-------|--------------------------------|------------------------------|------|
+| `4` (默认) | `192.168.1.100` | `2001:db8:0:0:0:0:0:1` | 完整保留，不截断 |
+| `3` | `192.168.1.x` | `2001:db8:0:0:0:0:x:x` | IPv4 隐藏最后 1 段；IPv6 隐藏最后 2 段（16 段中的 2 段） |
+| `2` | `192.168.x.x` | `2001:db8:0:0:x:x:x:x` | IPv4 隐藏最后 2 段；IPv6 隐藏最后 4 段 |
+| `1` | `192.x.x.x` | `2001:db8:x:x:x:x:x:x` | IPv4 隐藏最后 3 段；IPv6 隐藏最后 6 段 |
+| `0` | `x.x.x.x` | `x:x:x:x:x:x:x:x` | 全部隐藏 |
+
+**关键代码逻辑** (`IpFormatter::maskIpv4` + `maskIpv6`):
+
+- IPv4: `maskGroupCount = 4 - precision`，从最后一段往前逐段替换为 `'x'`
+- IPv6: `maskGroupCount = 8 - (precision * 2)`，从最后一段往前逐段替换为 `'x'`
+- IPv6 简写格式会先被 `explodeAndExpandIp` 展开为 8 段后再掩码
+
+**受影响的日志类型**：所有调用 `Activity::add()` 写入的活动记录都带 `ip` 字段，包括登录、用户修改、角色修改、页面操作等，共 30+ 种事件类型。
+
+##### 7.3.4.8 代理环境下真实 IP 获取与回退路径
+
+**配置入口**: `app/Config/app.php:162` + `app/Http/Middleware/TrustProxies.php:33-42`
+
+```php
+// TrustProxies 中间件
+$setProxies = config('app.proxies');
+if ($setProxies !== '**' && $setProxies !== '*' && $setProxies !== '') {
+    $setProxies = explode(',', $setProxies);
+}
+$this->proxies = $setProxies;
+```
+
+**配置值说明**：
+
+| `APP_PROXIES` 值 | 含义 |
+|-----------------|------|
+| `''` (默认空) | 不信任任何代理，`request()->ip()` 返回直连 IP |
+| `'*'` / `'**'` | 信任所有代理，从 X-Forwarded-For 取最左真实 IP |
+| `'10.0.0.1,10.0.0.2'` | 信任指定的多个代理 IP |
+
+**IP 获取链**：
+
+```
+request()->ip()
+  → Laravel Request::ip()
+    → 若有信任代理 → 从 X-Forwarded-For 头取第一个地址
+    → 若无信任代理 → 从 $_SERVER['REMOTE_ADDR'] 取直连地址
+```
+
+**回退代码路径**（默认配置 `APP_PROXIES=''` 时）：
+
+1. BookStack `TrustProxies` 中间件 → `$this->proxies = ''` → Laravel 认为**没有可信代理**
+2. Laravel `Request::getClientIp()` → 不解析 `X-Forwarded-For`
+3. 直接使用 `$_SERVER['REMOTE_ADDR']` → **取到的是代理服务器/负载均衡器的 IP，不是用户真实 IP**
+4. `IpFormatter::fromCurrentRequest()` → `request()->ip() ?? ''` → 拿到代理 IP 后写入 `activities.ip`
+
+**影响**：在反向代理部署（Nginx/Apache/CDN）且未配置 `APP_PROXIES` 的场景下，审计日志中的 `ip` 字段全都是代理服务器 IP，**无法追溯到真实用户 IP**。这对身份接管后的追责是雪上加霜——不仅不知道是谁的账号，连从哪来的 IP 都不准。
+
+**附加发现**：demo 环境强制写死为 `127.0.0.1`
+
+```php
+// IpFormatter::fromCurrentRequest()
+if (config('app.env') === 'demo') {
+    $ip = '127.0.0.1';
+}
+```
+
+##### 7.3.4.9 Admin 角色变更事件落地改造清单
+
+如果要让 admin 角色变更可追溯，需要新增独立的事件类型（而不是复用模糊的 `USER_UPDATE`），并在所有角色变更入口处派发。下面是需要修改的完整代码点。
+
+**1. 新增 ActivityType 常量**
+
+**文件**: `app/Activity/ActivityType.php`
+
+需要新增：
+- `USER_ROLES_UPDATE = 'user_roles_update'` — 用户角色变更（手动通过用户编辑页）
+- `USER_ROLES_SYNC = 'user_roles_sync'` — 组同步自动触发的角色变更
+
+```php
+// ActivityType.php 中需追加
+const USER_ROLES_UPDATE = 'user_roles_update';
+const USER_ROLES_SYNC = 'user_roles_sync';
+```
+
+**2. UserRepo 手动角色变更派发点**
+
+**文件**: `app/Users/UserRepo.php:283-292`
+
+`setUserRoles()` 是所有手动角色变更的汇聚点（`create` 和 `update` 都走这里），需要在 `roles()->sync()` 前后记录差异并派发事件：
+
+```php
+protected function setUserRoles(User $user, array $roles): void
+{
+    $roles = array_filter(array_values($roles));
+    if ($this->demotingLastAdmin($user, $roles)) {
+        throw new UserUpdateException(...);
+    }
+
+    // 新增：记录变更前角色
+    $beforeRoleIds = $user->roles()->pluck('id')->sort()->values()->toArray();
+
+    $user->roles()->sync($roles);
+
+    // 新增：记录变更后角色 + 派发事件
+    $afterRoleIds = $user->roles()->pluck('id')->sort()->values()->toArray();
+    if ($beforeRoleIds !== $afterRoleIds) {
+        Activity::add(ActivityType::USER_ROLES_UPDATE,
+            "({$user->id}) {$user->name}; " .
+            "before:" . implode(',', $beforeRoleIds) . "; " .
+            "after:" . implode(',', $afterRoleIds));
+    }
+}
+```
+
+**3. GroupSyncService 组同步角色变更派发点**
+
+**文件**: `app/Access/GroupSyncService.php:73-85`
+
+组同步是自动触发的角色变更路径，需要区分于手动变更：
+
+```php
+public function syncUserWithFoundGroups(User $user, array $userGroups, bool $detachExisting): void
+{
+    $groupsAsRoles = $this->matchGroupsToSystemsRoles($userGroups);
+    $beforeRoleIds = $user->roles()->pluck('id')->sort()->values()->toArray();
+
+    if ($detachExisting) {
+        $user->roles()->sync($groupsAsRoles);
+        $user->attachDefaultRole();
+    } else {
+        $user->roles()->syncWithoutDetaching($groupsAsRoles);
+    }
+
+    // 新增：派发组同步角色变更事件
+    $afterRoleIds = $user->roles()->pluck('id')->sort()->values()->toArray();
+    if ($beforeRoleIds !== $afterRoleIds) {
+        Activity::add(ActivityType::USER_ROLES_SYNC,
+            "({$user->id}) {$user->name}; " .
+            "detach:" . ($detachExisting ? 'true' : 'false') . "; " .
+            "before:" . implode(',', $beforeRoleIds) . "; " .
+            "after:" . implode(',', $afterRoleIds));
+    }
+}
+```
+
+**4. attachDefaultRole 注册默认角色派发点**
+
+**文件**: `app/Users/Models/User.php:145-151`
+
+新用户注册时会调用 `attachDefaultRole()` 附加默认注册角色，这也是一种角色变更：
+
+```php
+public function attachDefaultRole(): void
+{
+    $roleId = intval(setting('registration-role'));
+    if ($roleId && $this->roles()->where('id', '=', $roleId)->count() === 0) {
+        $this->roles()->attach($roleId);
+        // 可选：此处也派发一个事件，但通常注册已有 AUTH_REGISTER 事件
+    }
+}
+```
+
+**5. PermissionsRepo 角色删除时用户迁移派发点**
+
+**文件**: `app/Permissions/PermissionsRepo.php:140-146`
+
+删除角色并迁移用户时，批量用户的角色会发生变化：
+
+```php
+if ($migrateRoleId !== 0) {
+    $newRole = Role::query()->find($migrateRoleId);
+    if ($newRole) {
+        $users = $role->users()->pluck('id')->toArray();
+        $newRole->users()->sync($users);
+        // 新增：这里涉及批量用户角色变更，需循环或批量记录
+    }
+}
+```
+
+**6. AuditLogController 过滤选项补充**
+
+**文件**: `app/Activity/Controllers/AuditLogController.php:27-33`
+
+审计日志页面的筛选事件列表会自动枚举 `ActivityType::all()`，新增常量后无需额外修改。但如果需要单独筛选角色变更事件，可在前端视图 `settings.audit` 中增加快捷筛选。
+
+**改造后的收益**：
+
+| 改造前问题 | 改造后效果 |
+|-----------|-----------|
+| `USER_UPDATE` 无法区分改了什么 | `USER_ROLES_UPDATE` / `USER_ROLES_SYNC` 明确标识角色变更 |
+| 无前后对比，不知道加了还是减了 | detail 中携带 `before:` / `after:` 角色 ID 列表 |
+| 组同步静默改角色，无痕迹 | `USER_ROLES_SYNC` 事件单独记录，还带 `detach:` 标记 |
+| 身份接管后提权无法追溯 | 通过角色变更事件 + IP + 时间线，可定位提权操作 |
+
 #### 7.3.5 冲突结论
 
 - **Social 和外部主 Provider 不会自动合并身份**，靠 email 校验互相拦住注册；只有用户先通过一种方式登录后，再在个人设置里手动绑定 Social 账号才能建立关联。

@@ -807,21 +807,165 @@ if ($isLoggedIn && $socialAccount === null) {
 | Social 用户（Google 注册，email=`a@x.com`，external_auth_id=`""`） | 同邮箱走 OIDC 登录 | `findOrRegister` 查 external_auth_id 未果 → `registerUser` → email 校验 → **抛异常拒绝** |
 | Social 用户（Google 注册，external_auth_id=`""`） | 同 external_auth_id=`""` 的第二个 OIDC 用户尝试登录 | `findOrRegister` 查 `external_auth_id=""` → **命中第一个 Social 用户**！如果 OIDC 返回的 email 不同，不会检查，直接复用该记录 |
 
-#### 7.3.4 一个特别危险的边角案例
+#### 7.3.4 空 `external_auth_id` 身份接管路径深度分析
 
-**文件**: `app/Access/RegistrationService.php:55-57`
+这是一个需要严肃对待的安全边界。下面从三个维度逐层核对代码。
+
+##### 7.3.4.1 哪些 Provider 配置错误时 external_id 会落空？各 Provider 有无前置校验？
+
+**OIDC — 风险最高**
+
+**文件**: `app/Access/Oidc/OidcUserDetails.php:40` + `app/Access/Oidc/OidcService.php:221-225`
 
 ```php
-$user = User::query()
-    ->where('external_auth_id', '=', $externalId)
-    ->first();
+// OidcUserDetails::populate()
+$this->externalId = $claims->getClaim($idClaim) ?? $this->externalId;
 ```
 
-如果：
-1. 某个用户通过 Social 注册，`users.external_auth_id` 被写入空字符串 `""`
-2. 另一个外部 Provider（比如 LDAP）配置错误，导致某些用户的 `uid` 也返回空字符串
+- `$idClaim` 取自 `OIDC_EXTERNAL_ID_CLAIM`（默认 `sub`）
+- 如果管理员把 `OIDC_EXTERNAL_ID_CLAIM` 配成了一个**不存在**的 claim，`getClaim()` 返回 `null`，`??` 运算符保留原值（初始为 `null`）
+- 若同时配置了 userinfo 端点且组同步开启，`isFullyPopulated()` 会触发 userinfo 补充；但如果组同步关闭或 userinfo 也没有该 claim，`externalId` 仍为 `null`
+- **关键漏洞点**：`findOrRegister(string $externalId)` 参数类型声明为 `string`，传入 `null` 时 PHP 非严格模式下**隐式转换为空字符串 `''`**
 
-那么两个完全无关的用户会因为 `WHERE external_auth_id = ''` 命中同一条记录，**后登录的人会直接以第一个注册用户的身份进入系统**。这是一个潜在的身份接管风险，配置时需要确保所有外部 Provider 的 external_id 字段都不能为空。
+```php
+// OidcService::processAccessTokenCallback() — 注意没有 externalId 非空校验
+if (empty($userDetails->email)) {
+    throw new OidcException(trans('errors.oidc_no_email_address'));
+}
+if (empty($userDetails->name)) {
+    $userDetails->name = $userDetails->externalId;
+}
+// ↓ 直接传入，无 empty 校验
+$user = $this->registrationService->findOrRegister(
+    $userDetails->name,
+    $userDetails->email,
+    $userDetails->externalId   // 可能为 null → 隐式转成 ''
+);
+```
+
+**OIDC 有无前置校验？** 没有。`processAccessTokenCallback` 只校验了 `email` 和 `name`，**完全没有校验 `externalId` 是否为空**。只要 ID Token 验证通过（签名有效、过期时间正常等），就直接传入 `findOrRegister`。
+
+---
+
+**SAML2 — 风险较低**
+
+**文件**: `app/Access/Saml2Service.php:256-264` + `app/Access/Saml2Service.php:360-372`
+
+```php
+protected function getExternalId(array $samlAttributes, string $defaultValue)
+{
+    $userNameAttr = $this->config['external_id_attribute'];
+    if ($userNameAttr === null) {
+        return $defaultValue;   // ← 默认为 NameID，SAML 规范下不会空
+    }
+    return $this->getSamlResponseAttribute($samlAttributes, $userNameAttr, $defaultValue);
+}
+```
+
+- 如果不配置 `SAML2_EXTERNAL_ID_ATTRIBUTE`，external_id 始终取 NameID，不会为空
+- 如果配置了但属性**不存在**，`getSamlResponseAttribute` 会回退到默认值 NameID，也不会为空
+- 只有一种场景会产生空值：配置的属性**存在但值就是空字符串**（如 `['']`），`simplifyValue` 会返回 `''`
+- SAML2 同样没有校验 `external_id` 非空的代码
+
+**SAML2 有无前置校验？** 没有。`processLoginCallback` 只校验了 `email`，没有校验 `external_id`。
+
+---
+
+**LDAP — 风险较低**
+
+**文件**: `app/Access/LdapService.php:121` + `app/Access/LdapService.php:144-162`
+
+```php
+// getUserDetails() 中
+'uid' => $this->getUserResponseProperty($user, $idAttr, $user['dn']),
+```
+
+- 默认 `id_attribute = dn`，而 DN 在 LDAP 搜索结果中一定存在，不会为空
+- 如果配置了自定义 `id_attribute` 但属性**不存在**，`getUserResponseProperty` 回退到默认值 `$user['dn']`，也不会为空
+- 只有当配置的属性**存在但值就是空字符串**时，uid 才会是空字符串
+- LDAP Guard 也没有校验 uid 非空的代码
+
+**LDAP 有无前置校验？** 没有。`LdapSessionGuard::attempt()` 直接把 `uid` 传给 `retrieveByCredentials`，不做空值检查。
+
+---
+
+**标准注册 / Social 注册 — 始终产生空值**
+
+**文件**: `app/Users/UserRepo.php:66`
+
+```php
+$user->external_auth_id = $data['external_auth_id'] ?? '';
+```
+
+- 标准注册（`RegisterController@postRegister`）和 Social 注册（`socialRegisterCallback`）都不传 `external_auth_id`
+- 因此所有本地注册用户和 Social 用户的 `external_auth_id` 都是空字符串 `''`
+- 这意味着**几乎每个 BookStack 实例都至少有一个 `external_auth_id = ''` 的用户**（初始 admin 用户也是空值，见迁移 `2016_01_11_210908_add_external_auth_to_users` 直接加列不带 default，旧数据全部变 `''`）
+
+##### 7.3.4.2 攻击者触发接管的前置条件、路径与最高权限
+
+**触发前提**
+
+| 条件 | 说明 |
+|------|------|
+| 系统中存在 `external_auth_id = ''` 的用户 | 几乎必然满足（初始 admin、标准注册用户、Social 用户均为空） |
+| 外部 Provider 的 external_id 能被控制为空字符串 | OIDC 最易触发（配错 `OIDC_EXTERNAL_ID_CLAIM`）；SAML2/LDAP 需 IdP 侧返回空值 |
+| 该外部 Provider 处于激活状态 | `AUTH_METHOD` 设为对应值 |
+
+**攻击路径（以 OIDC 为例）**
+
+```
+1. 管理员将 AUTH_METHOD 设为 oidc
+2. 管理员配置 OIDC_EXTERNAL_ID_CLAIM=my_custom_claim
+   （该 claim 在 IdP 侧不存在或对某些用户为空）
+3. 攻击者拥有一个合法的 OIDC 账号（能正常完成认证流程）
+   但该账号的 my_custom_claim 值为空字符串 / 不存在
+4. 攻击者访问 /oidc/login → 跳转 IdP → 登录 → 回调 /oidc/callback
+5. OidcService::processAccessTokenCallback()
+   → ID Token 验签通过（签名合法，是真用户）
+   → externalId = getClaim('my_custom_claim') → null
+   → 无空值校验，直接传给 findOrRegister
+   → PHP 类型隐式转换：null → ''
+6. findOrRegister('')
+   → WHERE external_auth_id = '' → first()
+   → 命中 id 最小的那个空 external_auth_id 用户
+   → 通常是 admin 用户（id=1）
+7. 直接以该用户身份登录 → 身份接管成功
+```
+
+**可接管的最高权限**
+
+取决于 `external_auth_id = ''` 的用户中 id 最小的那个是谁：
+- **默认部署下，id=1 是初始 admin 用户**，拥有全部权限（用户管理、角色管理、系统设置等）
+- 如果管理员后来修改过 admin 的 `external_auth_id`，那接管的就是最早注册的普通用户
+- 接管后，组同步（如果开启）还会根据攻击者 OIDC 账号的组重新设置角色，可能扩大权限
+
+**补充：Social 路径不会触发此问题**
+
+Social 登录通过 `social_accounts` 表关联，不走 `findOrRegister` + `external_auth_id` 路径，因此不会命中空值接管。
+
+##### 7.3.4.3 兜底机制核查：DB 唯一约束与应用层校验
+
+**数据库层面 — 无兜底**
+
+**文件**: `database/migrations/2016_01_11_210908_add_external_auth_to_users.php:15`
+
+```php
+$table->string('external_auth_id')->index();
+```
+
+- 只有普通索引（`index`），**没有唯一约束（`unique`）**
+- 允许多个用户拥有完全相同的 `external_auth_id`（包括空字符串）
+- 数据库层面不提供任何防止重复的保护
+
+**应用层 — 不校验空值，也不校验唯一性**
+
+- `findOrRegister`：只查 `external_auth_id`，找到就返回，不检查是否有多个匹配（`first()` 只取第一条）
+- `registerUser`：只校验 email 唯一性，**完全不校验 `external_auth_id` 唯一性**，也不校验是否为空
+- 三个 Provider 的登录回调（OIDC/SAML2/LDAP）均未在调用 `findOrRegister` 前检查 external_id 是否为空
+
+**结论：零兜底**
+
+数据库层和应用层都没有针对空 `external_auth_id` 的防护，也没有对 `external_auth_id` 做全局唯一性约束。一旦空值进入 `findOrRegister`，就会直接命中第一个空值用户并完成登录。
 
 #### 7.3.5 冲突结论
 
@@ -838,4 +982,4 @@ $user = User::query()
 | 不同 Provider 给同一用户不同角色 | — | 取**最后一次登录**的 Provider 的组同步结果，是否覆盖由该 Provider 的 `remove_from_groups` 决定 | `GroupSyncService::syncUserWithFoundGroups:79-84` |
 | Social 与外部主 Provider 同邮箱 | ❌ | Social 注册被 email 校验拦截；外部 Provider 注册也被 email 校验拦截 | `SocialAuthService::handleRegistrationCallback:63-67` |
 | Social 已登录 + 绑定外部 Provider | ✅ | 把 Social 账号挂到当前已登录用户上，不新建 | `SocialAuthService::handleLoginCallback:111-117` |
-| 空 external_auth_id 跨 Provider | ⚠️ | 所有产生空 external_id 的用户会被错误合并为同一个账号 | `RegistrationService::findOrRegister:55-57` |
+| 空 external_auth_id 身份接管 | ⚠️ 高危 | OIDC 配错 external_id_claim 时，externalId 为 null → PHP 隐式转空字符串 → `findOrRegister('')` 命中第一个空值用户（通常是 admin）；DB 无 unique 约束，应用层无空值校验，零兜底 | `RegistrationService::findOrRegister:55-57` + `OidcService:221-225` |

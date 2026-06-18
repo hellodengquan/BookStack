@@ -42,16 +42,98 @@ STORAGE_TYPE / STORAGE_IMAGE_TYPE / STORAGE_ATTACHMENT_TYPE
 > **注意**：system 类型图片（如 Logo）即使配置了 local_secure 也会使用 local 磁盘，确保公开可访问。
 > 见 `ImageStorage::getDiskName()` at `app/Uploads/ImageStorage.php:67`
 
-### 2.3 路径适配机制
+### 2.3 多 Disk 路径前缀适配详解
 
-`ImageStorageDisk::adjustPathForDisk()` at `app/Uploads/ImageStorageDisk.php:34`
-- local_secure_images 磁盘：去掉 `uploads/images/` 前缀（因为 root 已经指向那里）
-- 其他磁盘：保留 `uploads/images/` 前缀
+#### 2.3.1 图片存储路径的双重适配
+
+路径适配发生在两层：
+
+**第一层：`ImageStorage::getDiskName()` — 选择实际磁盘**
+`app/Uploads/ImageStorage.php:67`
+```
+配置值 filesystems.images
+  ├─ "local" + type="system" → disk = "local"
+  ├─ "local"                 → disk = "local"
+  ├─ "local_secure" / "local_secure_restricted" + type="system" → disk = "local"
+  ├─ "local_secure" / "local_secure_restricted"                 → disk = "local_secure_images"
+  └─ "s3"                    → disk = "s3"
+```
+
+**第二层：`ImageStorageDisk::adjustPathForDisk()` — 调整路径前缀**
+`app/Uploads/ImageStorageDisk.php:34`
+```
+输入: /uploads/images/gallery/2024-01/photo.jpg
+
+disk = "local_secure_images"
+  → 去掉 "uploads/images/" 前缀
+  → 结果: gallery/2024-01/photo.jpg
+  → 因为 local_secure_images 的 root 已经是 storage_path('uploads/images/')
+
+disk = "local" (即 public_path())
+  → 保留 "uploads/images/" 前缀
+  → 结果: uploads/images/gallery/2024-01/photo.jpg
+  → 最终文件在 public/uploads/images/gallery/2024-01/photo.jpg
+
+disk = "s3"
+  → 保留 "uploads/images/" 前缀
+  → 结果: uploads/images/gallery/2024-01/photo.jpg
+  → S3 桶中的对象 key = uploads/images/gallery/2024-01/photo.jpg
+```
+
+#### 2.3.2 附件存储路径适配
 
 `FileStorage::adjustPathForStorageDisk()` at `app/Uploads/FileStorage.php:121`
-- 同理，对 local_secure_attachments 做路径裁剪
+```
+disk = "local_secure_attachments"
+  → 去掉 "uploads/files/" 前缀
+  → 因为 root 已经是 storage_path('uploads/files/')
 
-### 2.4 图片类型
+其他 disk (如 s3)
+  → 保留 "uploads/files/" 前缀
+```
+
+> **设计意图**：local_secure 系列磁盘的 Laravel root 配置已经限定到具体子目录，因此路径上不需要再写前缀，防止路径穿越到其他目录。而 local（public）和 S3 的 root 更顶层，必须保留前缀才能定位到正确目录。
+
+### 2.4 URL 生成机制（无签名 URL）
+
+BookStack **不使用 S3 签名 URL（presigned/temporary URL）**，而是以下两种模式：
+
+#### 2.4.1 图片公共 URL 生成
+
+`ImageStorage::getPublicUrl()` at `app/Uploads/ImageStorage.php:124`
+→ 调用 `getPublicBaseUrl()` at `app/Uploads/ImageStorage.php:135`
+
+```
+优先级：
+1. 配置项 filesystems.url (即 STORAGE_URL 环境变量)
+   → 如果设置了，直接用它作为 base URL
+   
+2. 未配置 STORAGE_URL 且 filesystems.images = "s3"
+   → 自动猜测 S3 公共 URL
+     ├─ bucket 不含点号: https://{bucket}.s3.amazonaws.com
+     └─ bucket 含点号:   https://s3-{region}.amazonaws.com/{bucket}
+   
+3. 其他情况 (默认)
+   → url('/') 即 BookStack 应用自身的域名
+```
+
+最终 URL 格式：`{baseUrl}/uploads/images/{type}/{Y-m}/{filename}`
+
+**代码挂载点**：
+- 图片保存时：`ImageService::saveNew()` at `app/Uploads/ImageService.php:98`
+  `'url' => $this->storage->getPublicUrl($fullPath)`
+- 缩略图返回时：`ImageResizer::resizeToThumbnailUrl()` 中 5 处调用 getPublicUrl()
+- 附件下载链接走应用路由：`Attachment::getUrl()` at `app/Uploads/Attachment.php:77`
+  `url('/attachments/' . $this->id)` → 经控制器鉴权后流式返回
+
+#### 2.4.2 为什么不使用签名 URL？
+
+- 代码中完全没有 `temporaryUrl()`、`signedUrl()`、`getTemporaryUrl()` 的调用
+- S3 图片默认通过桶的公共权限直接访问（配合 `setVisibility(PUBLIC)`）
+- 私有图片（local_secure_restricted）走 BookStack 自己的鉴权路由 `ImageController::showImage()`，经权限校验后 `streamImageFromStorageResponse()` 返回
+  见 `routes/web.php` 对应路由 + `app/Uploads/ImageService.php:251` pathAccessibleInLocalSecure()
+
+### 2.5 图片类型
 
 图片按 `type` 字段分类存储在不同子目录：
 - `gallery` - 图库图片
@@ -131,16 +213,199 @@ STORAGE_TYPE / STORAGE_IMAGE_TYPE / STORAGE_ATTACHMENT_TYPE
 - gallery: 150x150 裁剪
 - display: 1680 宽等比缩放
 
+### 3.5 缩略图失败回退与异常处理路径
+
+BookStack **只使用 GD 驱动，完全没有使用 Imagick 驱动**。
+证据：`composer.json` 只依赖 `intervention/image ^3.5`，代码中仅使用 `Intervention\Image\Drivers\Gd\Driver`。
+`ImageResizer::interventionFromImageData()` at `app/Uploads/ImageResizer.php:161`
+```php
+$manager = new ImageManager(new Driver(), autoOrientation: false);
+// Driver 即 Intervention\Image\Drivers\Gd\Driver
+```
+
+#### 3.5.1 异常路径总览
+
+```
+缩略图生成异常分为 4 个层级，每层有不同的回退策略：
+
+层级 1: OutOfMemoryHandler (控制器外层)
+  → 内存溢出保护，预留 4MB 内存用于返回友好错误
+  → 位置: ImageController / GalleryImageController / FaviconHandler
+
+层级 2: loadGalleryThumbnailsForImage 的 try-catch
+  → 单张图片缩略图失败不影响整体流程，静默跳过
+  → 位置: ImageResizer.php:46
+
+层级 3: interventionFromImageData 中 GD 扩展缺失
+  → 显式检查 extension_loaded('gd')，缺失则抛 ImageUploadException
+  → 错误消息: "The PHP "gd" extension is required to resize images, but is missing."
+
+层级 4: resizeImageData 中 Intervention 解码/处理异常
+  → 捕获任意 Exception，记录 Log，转抛 ImageUploadException
+  → 错误消息: errors.cannot_create_thumbs (多语言: "服务器无法创建缩略图，请检查您是否安装了GD PHP扩展")
+```
+
+#### 3.5.2 各层级详细代码路径
+
+**层级 1 — OOM 内存保护（控制器层挂载）**
+
+工具类：`app/Util/OutOfMemoryHandler.php`
+原理：预先分配 4MB 内存作为储备，PHP 内存溢出触发时释放储备并执行回调。
+
+挂载点（3 处）：
+```
+1. GalleryImageController::create()  上传图片时
+   → OutOfMemoryHandler(fn() => jsonError(trans('errors.image_upload_memory_limit')))
+
+2. GalleryImageController::list()    列出图库时
+   → OutOfMemoryHandler(fn() => response()->view(..., ['warning' => trans('errors.image_gallery_thumbnail_memory_limit')]))
+
+3. ImageController::edit()           编辑图片时
+   → OutOfMemoryHandler(fn() => response()->view(..., ['warning' => trans('errors.image_thumbnail_memory_limit')]))
+
+4. ImageController::updateFile()     替换图片文件时
+   → OutOfMemoryHandler(fn() => jsonError(trans('errors.image_upload_memory_limit')))
+
+5. ImageController::rebuildThumbnails() 重建缩略图时
+   → OutOfMemoryHandler(fn() => jsonError(trans('errors.image_thumbnail_memory_limit')))
+```
+
+**层级 2 — 静默容错（缩略图批量加载）**
+
+`ImageResizer::loadGalleryThumbnailsForImage()` at `app/Uploads/ImageResizer.php:42`
+```php
+try {
+    $thumbs['gallery'] = $this->resizeToThumbnailUrl($image, 150, 150, false, $shouldCreate);
+    $thumbs['display'] = $this->resizeToThumbnailUrl($image, 1680, null, true, $shouldCreate);
+} catch (Exception $exception) {
+    // Prevent thumbnail errors from stopping execution
+    // 即便是单张图生成失败，也不会中断整个列表的渲染
+}
+$image->setAttribute('thumbs', $thumbs); // 可能为 null
+```
+视图层对 `thumbs` 为 null 做容错处理。
+
+**层级 3 — GD 扩展显式检查**
+
+`ImageResizer::interventionFromImageData()` at `app/Uploads/ImageResizer.php:163`
+```php
+if (!extension_loaded('gd')) {
+    throw new ImageUploadException('The PHP "gd" extension is required to resize images, but is missing.');
+}
+```
+这是硬检查，GD 不可用则立即失败，不做任何回退。
+
+**层级 4 — Intervention 图像处理异常**
+
+`ImageResizer::resizeImageData()` at `app/Uploads/ImageResizer.php:125`
+```php
+try {
+    $thumb = $this->interventionFromImageData($imageData, $format);
+} catch (Exception $e) {
+    Log::error('Failed to resize image with error:' . $e->getMessage());
+    throw new ImageUploadException(trans('errors.cannot_create_thumbs'));
+}
+```
+捕获 Intervention 解码失败、内存不足、格式不支持等所有异常，写日志后转抛为用户友好错误。
+
+#### 3.5.3 特殊格式的"软回退"（返回原图）
+
+这些不是异常，而是策略性地跳过缩略图生成，直接返回原图 URL：
+
+| 条件 | 位置 | 说明 |
+|---|---|---|
+| GIF + keepRatio=true | `ImageResizer.php:71` | GIF 动画缩略图后会丢失动画，索性返回原图 |
+| APNG（动态 PNG）+ keepRatio=true | `ImageResizer.php:98` | 检测 PNG 数据中是否含 `acTL` chunk |
+| 动画 AVIF + keepRatio=true | `ImageResizer.php:98` | 解析 `stsz` box 判断 frame 数 > 1 |
+| keepRatio 且缩略图体积 > 原图 | `ImageResizer.php:149` | 缩放反而更大，无意义 |
+
 ---
 
 ## 四、孤儿资源清理
 
-### 4.1 触发入口
+### 4.1 触发入口（无内置 Cron / Queue）
 
-| 入口 | 位置 | 说明 |
-|---|---|---|
-| Artisan 命令 | `app/Console/Commands/CleanupImagesCommand.php` | `php artisan bookstack:cleanup-images` |
-| Web 管理后台 | `app/Settings/MaintenanceController.php:cleanupImages()` | 设置 → 维护 → 图片清理 |
+**重要结论：BookStack 没有为孤儿清理配置任何计划任务（cron）或队列（queue），清理完全是手动触发。**
+
+证据：
+- `app/Console/Kernel.php:17` 的 `schedule()` 方法为空
+- 清理命令 `CleanupImagesCommand` 不实现 `ShouldQueue`
+- 整个代码库中没有任何地方 dispatch 清理相关的 Job
+- 唯一使用 Queue 的是 `DispatchWebhookJob`（Webhook 发送），与图片清理无关
+
+#### 4.1.1 入口一：Artisan CLI
+
+文件：`app/Console/Commands/CleanupImagesCommand.php`
+
+```bash
+# Dry run（默认）：只列出将要删除的图片，不执行
+php artisan bookstack:cleanup-images
+php artisan bookstack:cleanup-images -v  # 详细模式，列出具体路径
+
+# 真正执行删除
+php artisan bookstack:cleanup-images --force
+php artisan bookstack:cleanup-images -f    # 简写
+php artisan bookstack:cleanup-images --force --no-interaction  # 脚本化调用
+
+# 同时删除仅存在于旧版本（revision）中的图片
+php artisan bookstack:cleanup-images --force --all
+php artisan bookstack:cleanup-images -f -a
+```
+
+命令执行流程：
+```
+CleanupImagesCommand::handle()
+  ├─ 解析参数: --all → $checkRevisions=false, --force → $dryRun=false
+  ├─ --force 模式: 输出警告 + confirm() 二次确认 (非交互模式跳过)
+  ├─ ImageService::deleteUnusedImages($checkRevisions, $dryRun)
+  ├─ dryRun: 显示统计 + "Run with -f or --force to perform deletions"
+  └─ force: 显示统计 + 输出 "X image(s) deleted"
+```
+
+#### 4.1.2 入口二：Web 管理后台
+
+路由：`routes/web.php:231`
+```php
+Route::delete('/settings/maintenance/cleanup-images', [MaintenanceController::class, 'cleanupImages']);
+```
+
+控制器：`app/Settings/MaintenanceController.php:36`
+
+```
+MaintenanceController::cleanupImages()
+  ├─ 权限检查: Permission::SettingsManage
+  ├─ 记录审计日志: ActivityType::MAINTENANCE_ACTION_RUN, 'cleanup-images'
+  ├─ 解析表单:
+  │   ├─ ignore_revisions=true → $checkRevisions=false
+  │   └─ 存在 confirm 参数 → $dryRun=false
+  ├─ ImageService::deleteUnusedImages($checkRevisions, $dryRun)
+  │
+  ├─ 结果为 0: showWarningNotification → "未找到需要清理的图片"
+  │
+  ├─ dryRun:
+  │   └─ session()->flash('cleanup-images-warning', "将删除 X 张图片")
+  │      （前端显示确认按钮，用户点击后带 confirm 参数再次提交）
+  │
+  └─ force:
+      └─ showSuccessNotification → "已成功删除 X 张图片"
+```
+
+UI 流程：`resources/views/settings/maintenance.blade.php:34`
+```
+1. 用户进入 设置 → 维护 → 清理图片 区域
+2. 可勾选"忽略旧版本中的图片引用"
+3. 点击"扫描未使用的图片" → dry-run，显示警告+确认按钮
+4. 点击确认（表单带 confirm 字段）→ 真正执行删除
+```
+
+#### 4.1.3 如何配置自动清理（需用户自行实现）
+
+由于 BookStack 不提供内置 cron，管理员需要手动配置：
+
+```bash
+# crontab -e 示例：每周日凌晨 3 点清理
+0 3 * * 0 cd /path/to/bookstack && php artisan bookstack:cleanup-images --force --no-interaction >> /var/log/bookstack-cleanup.log 2>&1
+```
 
 ### 4.2 核心逻辑
 
@@ -282,25 +547,58 @@ Attachment 模型 (attachments 表)
 |---|---|---|
 | 存储类 | `ImageStorage` + `ImageStorageDisk` | `FileStorage` |
 | 服务类 | `ImageService` | `AttachmentService` |
-| 缩略图 | 有（`ImageResizer`） | 无 |
-| 孤儿清理 | 有（`deleteUnusedImages`） | 无 |
+| 缩略图 | 有（`ImageResizer`，仅 GD 驱动） | 无 |
+| 孤儿清理 | 有（`deleteUnusedImages`，手动触发） | 无 |
 | 路径命名 | 语义化文件名（可能加随机前缀） | 纯随机 16 字符 |
 | 安全模式 | local_secure / local_secure_restricted | 统一 local_secure_attachments |
 | 数据库表 | images | attachments |
+| URL 模式 | 公共 URL（S3/应用域名）或鉴权路由 | 始终走鉴权路由 `/attachments/{id}` |
+| 图像处理驱动 | Intervention Image (GD only) | 不处理 |
 
 ---
 
-## 八、代码位置索引
+## 八、补充发现
+
+### 8.1 关于签名 URL（Presigned URL）
+
+BookStack **完全不使用 S3 签名 URL**。策略如下：
+- S3 图片：`put()` 时设置 `Visibility::PUBLIC`，桶公开读权限，直接通过 S3 公共 URL 访问
+- 本地私有图片：走应用路由 `/uploads/images/{path}`，经 `ImageService::pathAccessibleInLocalSecure()` 校验权限后 `streamImageFromStorageResponse()` 流式返回
+- 附件：始终走 `/attachments/{id}` 路由，经 `AttachmentController::get()` 校验后下载
+
+### 8.2 关于 Queue 队列
+
+整个上传/缩略图/清理流程**全部同步执行**，不使用队列。
+代码库中唯一使用 `ShouldQueue` 的是 `DispatchWebhookJob`（Webhook 回调），与附件图片系统无关。
+原因：图片上传和缩略图生成通常在用户交互时完成，需要即时反馈。
+
+### 8.3 关于 GD vs Imagick
+
+BookStack 明确只支持 GD：
+- composer.json 未安装 `intervention/image-imagick`
+- `ImageResizer` 中硬编码 `new Driver()` 即 `Gd\Driver`
+- `interventionFromImageData()` 显式检查 `extension_loaded('gd')`
+- 代码中没有任何 Imagick 相关的引用或回退逻辑
+
+---
+
+## 九、代码位置索引
 
 | 功能 | 文件:行 |
 |---|---|
 | 图片存储工厂 | `app/Uploads/ImageStorage.php` |
-| 图片磁盘封装 | `app/Uploads/ImageStorageDisk.php` |
+| 图片磁盘封装（路径适配+CRUD） | `app/Uploads/ImageStorageDisk.php` |
 | 附件存储 | `app/Uploads/FileStorage.php` |
-| 图片服务（CRUD + 清理） | `app/Uploads/ImageService.php` |
+| 图片服务（CRUD + 清理 + 权限） | `app/Uploads/ImageService.php` |
 | 附件服务 | `app/Uploads/AttachmentService.php` |
-| 缩略图生成器 | `app/Uploads/ImageResizer.php` |
-| 图片仓库（协调层） | `app/Uploads/ImageRepo.php` |
-| 清理命令 | `app/Console/Commands/CleanupImagesCommand.php` |
-| 维护页面控制器 | `app/Settings/MaintenanceController.php:36` |
-| 文件系统配置 | `app/Config/filesystems.php` |
+| 缩略图生成器（GD 驱动 + 异常处理） | `app/Uploads/ImageResizer.php` |
+| 图片仓库（协调存储与缩略图） | `app/Uploads/ImageRepo.php` |
+| OOM 内存保护工具 | `app/Util/OutOfMemoryHandler.php` |
+| 清理 Artisan 命令 | `app/Console/Commands/CleanupImagesCommand.php` |
+| 调度 Kernel（schedule 为空） | `app/Console/Kernel.php:17` |
+| 维护页面控制器（清理入口） | `app/Settings/MaintenanceController.php:36` |
+| Webhook Job（队列唯一使用者） | `app/Activity/DispatchWebhookJob.php` |
+| Favicon 处理（也用 ImageResizer） | `app/Uploads/FaviconHandler.php` |
+| 文件系统配置（disks 定义） | `app/Config/filesystems.php` |
+| 清理 Web 路由 | `routes/web.php:231` |
+| 清理维护页面视图 | `resources/views/settings/maintenance.blade.php:34` |

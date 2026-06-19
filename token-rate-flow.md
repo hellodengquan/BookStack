@@ -124,6 +124,63 @@ class StartSessionIfCookieExists extends Middleware
 
 此外，`RouteServiceProvider` 中定义的 `RateLimiter::for('api')` 限流器（60次/分钟）**不会被使用**——因为 `ThrottleApiRequests` 继承自 `ThrottleRequests`，走的是 `handle()` → `resolveMaxAttempts()` 路径，而非 `RateLimiter` 命名限流器路径。这个命名限流器目前只存在于定义层面，未被任何路由或中间件引用。
 
+### 2.6 超长查询参数与重复 retry 场景下的计数行为
+
+**核心结论**：限流计数器只以 `sha1(user_id)` 或 `sha1(ip)` 为 bucket key，**与 URL 路径、查询参数、请求方法均无关**。这带来了几个重要行为：
+
+#### 2.6.1 超长查询参数不影响计数
+
+```
+/api/pages?search=abc             → 同一个 bucket (sha1(ip))
+/api/pages?search=xyz             → 同一个 bucket
+/api/pages?filter[id][]=1&...     → 同一个 bucket (参数长度无影响)
+/api/books/1                      → 同一个 bucket
+/api/books/2                      → 同一个 bucket
+```
+
+无论查询参数多长、多复杂，只要来源 IP 相同（或用户相同），所有 API 请求都计入同一个计数器。这意味着：
+- 攻击者无法通过"变换参数"绕过限流
+- 但也无法对不同 API 路径做差异化限流
+- 整个 API 系统共享同一个全局限流配额
+
+#### 2.6.2 重复 retry 会持续累加计数
+
+每次 HTTP 请求进入 `ThrottleRequests::handle()` 都会调用 `$limiter->hit($key)` 使计数 +1，无论请求成功或失败：
+
+```
+第 1 次请求 → hit → count=1   → 200 OK
+第 2 次请求 → hit → count=2   → 401 Unauthorized (Token 错误)
+第 3 次请求 → hit → count=3   → 403 Forbidden (权限不足)
+第 4 次请求 → hit → count=4   → 500 Server Error
+...
+第 180 次 → hit → count=180   → 429 Too Many Requests
+```
+
+**重试惩罚效应**：客户端遇到 4xx/5xx 错误后重试，每次重试都会继续消耗限流配额。在高频失败重试场景下，可能快速耗尽配额导致正常请求也被拒绝。
+
+#### 2.6.3 计数底层实现
+
+限流计数通过 Laravel 的 `Illuminate\Cache\RateLimiter` 实现，底层依赖应用缓存驱动（`app/Config/cache.php` 配置，默认 `file` 驱动）。
+
+计数键的实际结构（Laravel 内部）：
+```
+// 键名
+throttle:xxxxxxxxxxxxx   ← sha1(key) 哈希后的 bucket 标识
+
+// 值结构（缓存中存储）
+[
+    'key' => 'throttle:xxx',
+    'time' => 1718888888,  // 窗口起始时间
+    'decay' => 60,          // 衰减秒数
+]
+```
+
+Laravel 的 RateLimiter 使用**固定时间窗口**算法，每次 hit 时检查距离 `time` 是否超过 `decay` 秒：
+- 未超过 → 计数 +1
+- 已超过 → 重置 time 为当前时间，计数归 1
+
+这意味着在窗口边界附近可能出现"突刺"现象：窗口快结束时打满 180 次，紧接着下一个窗口开始又可以打 180 次，短时间内可能出现接近 2× 的请求量。
+
 ---
 
 ## 三、Token 认证层（ApiAuthenticate + ApiTokenGuard）
@@ -286,7 +343,69 @@ if ($token->expires_at <= $now) {
 
 过期的 Token 记录会永久保留在数据库中，仅在请求时通过 `expires_at` 字段拒绝访问。默认过期时间为 100 年（`app/Api/ApiToken.php:43-46`），因此实际场景下 Token 过期并不常见。若需清理，只能通过用户在 UI 中手动删除（`UserApiTokenController::destroy`）。
 
-### 3.5 Token 模型
+### 3.5 Token scope 字段与 API 路径鉴权细分
+
+**核心结论：BookStack 的 API Token 没有 scope 字段，API 路径的鉴权细分完全依赖用户角色权限系统。**
+
+#### 3.5.1 Token 数据库字段全景
+
+`api_tokens` 表只有以下字段（`database/migrations/2019_12_29_120917_add_api_auth.php`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | bigint | 自增主键 |
+| `user_id` | bigint | 所属用户 |
+| `name` | varchar | Token 名称（用户自定义） |
+| `token_id` | varchar(32) | 明文 Token ID，用于查询 |
+| `secret` | varchar | bcrypt 哈希后的 secret |
+| `expires_at` | timestamp | 过期时间 |
+| `created_at` / `updated_at` | timestamp | 时间戳 |
+
+**没有 `scope`、`permissions`、`endpoint` 等任何限定 Token 权限范围的字段。**
+
+#### 3.5.2 API 鉴权细分的实际实现路径
+
+API 的权限细分完全通过**用户角色权限系统**实现，Token 只承担身份认证的职责：
+
+```
+Token 认证 → 识别出用户 → 查询用户角色 → 角色权限决定能访问哪些 API
+```
+
+权限细分的三层机制（详见第四章）：
+
+1. **系统级**：`Permission::AccessApi` — 能否访问 API 整体
+2. **实体级**：`Permission::PageView`、`Permission::BookCreate` 等 — 对各类实体的操作权限
+3. **实例级**：实体 ACL（entity_permissions 表）— 对特定实体的权限覆盖
+
+**同一用户的所有 Token 拥有完全相同的权限**，无法为不同 Token 分配不同的 API 访问范围。
+
+#### 3.5.3 API 路由层面的权限控制点
+
+API 路由本身没有额外的 scope 校验中间件。权限检查发生在两个层面：
+
+**层面 1：认证阶段的系统级检查**（`app/Api/ApiTokenGuard.php:135-137`）
+```php
+if (!$token->user->can(Permission::AccessApi)) {
+    throw new ApiAuthException(trans('errors.api_user_no_api_permission'), 403);
+}
+```
+
+**层面 2：控制器中的细粒度检查**（以 `PageApiController` 为例）
+- `index()` / `list()` → `findVisibleBy...` → 通过 `restrictEntityQuery` 过滤可见实体
+- `read()` → `findVisibleByIdOrFail` + 隐式权限检查
+- `create()` → `checkOwnablePermission(Permission::PageCreate, $parent)`
+- `update()` → `checkOwnablePermission(Permission::PageUpdate, $page)`
+- `delete()` → `checkOwnablePermission(Permission::PageDelete, $page)`
+
+每个 API 端点的权限由业务逻辑内嵌的 `checkOwnablePermission` / `restrictEntityQuery` 控制，而非 Token scope。
+
+#### 3.5.4 设计影响
+
+- **优点**：权限模型统一，Web 和 API 使用同一套角色权限体系
+- **局限**：无法创建"只读 Token"、"特定范围 Token"等受限凭证
+- **替代方案**：可通过创建低权限用户 + 为该用户生成 Token 的方式间接实现
+
+### 3.6 Token 模型
 
 **文件**：`app/Api/ApiToken.php`
 
@@ -553,7 +672,104 @@ return null;  // 回退到角色级权限
 
 角色级规则 > fallback 规则；多角色中任一允许即判定允许。
 
-#### 4.5.4 JointPermissionBuilder — 预计算视图权限缓存
+#### 4.5.4 嵌套场景下的权限继承递归路径
+
+实体权限继承链的深度和方向是固定的，**没有真正的递归，只有线性的 2-3 步向上追溯**。
+
+##### 继承链完整图谱
+
+```
+Bookshelf
+    │
+    │  ← 不在 ACL 继承链中！通过"主动复制"机制传递权限
+    ▼
+  Book
+    │
+    │  ← 继承链第 3 级（优先级最低）
+    ▼
+ Chapter
+    │
+    │  ← 继承链第 2 级
+    ▼
+   Page    ← 继承链第 1 级（自身，优先级最高）
+```
+
+不同实体类型的实际继承链：
+
+| 实体类型 | 继承链 | 长度 |
+|---------|--------|------|
+| Page（有 chapter） | page → chapter → book | 3 层 |
+| Page（无 chapter，直接在 book 下） | page → book | 2 层 |
+| Chapter | chapter → book | 2 层 |
+| Book | book | 1 层 |
+| Bookshelf | bookshelf | 1 层 |
+
+##### 追溯终止条件
+
+继承链的向上追溯不是一定走完全程，**遇到 fallback 规则（role_id=0）就停止**：
+
+```
+假设：chapter 上设置了 fallback 权限，book 上也设置了 fallback 权限
+
+page 权限评估流程：
+  1. 检查 page 自身 → 无 fallback → 继续向上
+  2. 检查 chapter  → 有 fallback → 停止！不再看 book
+  3. 以 chapter 的 fallback 规则为准
+```
+
+这意味着：**子实体的 fallback 规则会"屏蔽"父实体的 fallback 规则**，实现了"越具体的规则优先级越高"的语义。
+
+##### Bookshelf 的特殊地位：主动复制而非实时继承
+
+**Shelf 不在 ACL 实时继承链中**。评估 book/chapter/page 的权限时，永远不会向上追溯到 shelf。
+
+Shelf → Book 的权限传递通过**主动复制**机制实现：
+
+```php
+// PermissionsUpdater::updateBookPermissionsFromShelf() — app/Entities/Tools/PermissionsUpdater.php:145-163
+public function updateBookPermissionsFromShelf(Bookshelf $shelf, $checkUserPermissions = true): int
+{
+    $shelfPermissions = $shelf->permissions()->get([...])->toArray();
+    $shelfBooks = $shelf->books()->get(['id', 'owned_by']);
+
+    foreach ($shelfBooks as $book) {
+        if ($checkUserPermissions && !userCan(Permission::RestrictionsManage, $book)) {
+            continue;
+        }
+        $book->permissions()->delete();          // 清空 book 原有权限
+        $book->permissions()->createMany($shelfPermissions);  // 写入 shelf 的权限副本
+        $book->rebuildPermissions();               // 重建 joint_permissions 缓存
+        $updatedBookCount++;
+    }
+    return $updatedBookCount;
+}
+```
+
+**触发方式**（3 种）：
+
+| 触发方式 | 代码位置 | 说明 |
+|---------|---------|------|
+| UI 手动点击 | `PermissionsController::copyShelfPermissionsToBooks()` | 用户在 shelf 权限页面点击"复制到书籍" |
+| CLI 命令 | `CopyShelfPermissionsCommand` | `php artisan bookstack:copy-shelf-permissions` |
+| 代码调用 | 直接调用 `PermissionsUpdater::updateBookPermissionsFromShelf()` | 程序内部调用 |
+
+**重要特性**：
+- 这是**一次性快照复制**，不是实时联动
+- 复制后 book 的权限独立存在，后续修改 shelf 权限不会自动同步到 book
+- 复制时会跳过当前用户无 `RestrictionsManage` 权限的 book
+- book 下的 chapter/page 通过正常的继承链自动继承 book 的新权限（通过 `rebuildPermissions()` 触发 `JointPermissionBuilder` 更新缓存）
+
+##### 没有更深的嵌套
+
+BookStack 的实体层级是**扁平的固定结构**，不存在深层递归：
+- Book 不能包含 Book
+- Chapter 不能包含 Chapter
+- Page 不能包含 Page
+- Shelf 不能包含 Shelf
+
+因此权限计算也永远是 O(1) 的固定几步查询，没有递归深度问题。
+
+#### 4.5.5 JointPermissionBuilder — 预计算视图权限缓存
 
 **文件**：`app/Permissions/JointPermissionBuilder.php`
 
@@ -611,7 +827,7 @@ public function restrictEntityQuery(Builder $query): Builder
 
 条件语义：**用户任一角色的 status 为 IMPLICIT_ALLOW(1) 或 EXPLICIT_ALLOW(3)**，或者 **owner_id 匹配当前用户且 status 不是 EXPLICIT_DENY(2)**。
 
-#### 4.5.5 实体级 ACL 的两条路径对比
+#### 4.5.6 实体级 ACL 的两条路径对比
 
 | 场景 | 使用机制 | 数据来源 | 适用范围 |
 |------|---------|---------|---------|
@@ -688,6 +904,12 @@ public function restrictEntityQuery(Builder $query): Builder
 
 7. **实体级 ACL 双路径**：单实体操作实时计算（EntityPermissionEvaluator），列表查询使用预计算缓存（JointPermission），两条路径共享同一评估核心保证一致性。
 
+8. **Token 无 scope**：API Token 没有 scope 字段，权限细分完全依赖用户角色权限体系，同一用户的所有 Token 权限相同。
+
+9. **Shelf 权限主动复制**：Bookshelf 不在 ACL 实时继承链中，shelf → book 的权限通过主动复制机制传递，复制后独立存在。
+
+10. **限流全局共享**：所有 API 路径共享同一个限流计数器，与 URL、参数、方法无关；重试会持续消耗配额。
+
 ---
 
 ## 六、关键文件索引
@@ -713,11 +935,18 @@ public function restrictEntityQuery(Builder $query): Builder
 | 实体权限模型 | `app/Permissions/Models/EntityPermission.php` |
 | 联合权限模型 | `app/Permissions/Models/JointPermission.php` |
 | 轻量实体数据 | `app/Permissions/SimpleEntityData.php` |
+| 权限更新工具 | `app/Entities/Tools/PermissionsUpdater.php` |
+| 权限控制器（Web） | `app/Permissions/PermissionsController.php` |
+| Shelf 模型 | `app/Entities/Models/Bookshelf.php` |
 | API 认证异常 | `app/Exceptions/ApiAuthException.php` |
 | 全局异常处理器 | `app/Exceptions/Handler.php` |
 | 路由服务提供者（限流配置） | `app/App/Providers/RouteServiceProvider.php` |
 | 认证配置 | `app/Config/auth.php` |
 | API 配置 | `app/Config/api.php` |
+| 缓存配置 | `app/Config/cache.php` |
 | 辅助函数（userCan） | `app/App/helpers.php` |
 | API 路由 | `routes/api.php` |
 | 定时任务调度 | `app/Console/Kernel.php` |
+| 数据库迁移（api_tokens） | `database/migrations/2019_12_29_120917_add_api_auth.php` |
+| 复制 Shelf 权限命令 | `app/Console/Commands/CopyShelfPermissionsCommand.php` |
+| MFA 限流器（参考实现） | `app/Access/Mfa/MfaVerificationLimiter.php` |

@@ -422,6 +422,151 @@ class ApiToken extends Model
 }
 ```
 
+### 3.7 API Token vs User Token vs Webhook：三种 Token 类概念辨析
+
+BookStack 代码中存在多种 "token" 概念，容易混淆。下表从**用途、存储、有效期、生成方式**四个维度进行对比：
+
+| 维度 | API Token (Personal Access Token) | User Token (邮件/重置令牌) | Webhook |
+|------|-----------------------------------|---------------------------|---------|
+| **用途** | API 接口调用认证 | 邮箱确认、密码重置、邀请等一次性操作 | 出站事件通知（不是认证凭证） |
+| **存储表** | `api_tokens` | `user_tokens` | `webhooks` + `webhook_tracked_events` |
+| **服务类** | `ApiTokenGuard` + `UserApiTokenController` | `UserTokenService` | `DispatchWebhookJob` + `WebhookFormatter` |
+| **生成方式** | `Str::random(32)` × 2 (token_id + secret) | `Str::random(24-25)` | 无 token，只配置 endpoint URL |
+| **存储形式** | `token_id` 明文 + `secret` bcrypt 哈希 | `token` 明文存储 | 无 secret，直接 POST 到 URL |
+| **有效期** | 默认 100 年 (可配置) | 24 小时 (`$expiryTime = 24`) | 无过期，永久有效（webhook 配置本身） |
+| **认证方向** | 入站（外部调用 BookStack API） | 入站（用户点击邮件链接） | 出站（BookStack 调用外部服务） |
+| **关联用户** | 有 `user_id` 外键，1:N | 有 `user_id` 外键，1:N | 有 `initiator`（触发者），但不是认证关系 |
+
+#### 3.7.1 User Token 详解
+
+**文件**：`app/Access/UserTokenService.php`
+
+User Token 是用于邮件确认、密码重置等的一次性令牌，与 API Token 完全是两套独立体系：
+
+```php
+// UserTokenService — 核心逻辑
+protected int $expiryTime = 24;    // 24 小时过期
+
+protected function generateToken(): string
+{
+    $token = Str::random(24);
+    while ($this->tokenExists($token)) {
+        $token = Str::random(25);     // 碰撞后增加到 25 位
+    }
+    return $token;
+}
+
+protected function entryExpired(stdClass $tokenEntry): bool
+{
+    return Carbon::now()->subHours($this->expiryTime)
+        ->gt(new Carbon($tokenEntry->created_at));
+}
+```
+
+**关键差异**：
+- **明文存储**：User Token 的 `token` 字段明文存储（因为需要直接查询），不像 API Token 的 secret 用 bcrypt
+- **一次性语义**：使用后通常由业务逻辑删除（`deleteByUser`）
+- **短有效期**：24 小时，远短于 API Token 的 100 年
+
+#### 3.7.2 Webhook 详解
+
+**文件**：`app/Activity/DispatchWebhookJob.php` + `app/Activity/Models/Webhook.php`
+
+Webhook 是**出站通知机制**，不是入站认证凭证。它没有 token/secret 字段，BookStack 直接向配置的 endpoint 发送 POST 请求：
+
+```php
+// DispatchWebhookJob::handle() — 发送逻辑
+$client = $http->buildClient($this->webhook->timeout, [
+    'connect_timeout' => 10,
+    'allow_redirects' => ['strict' => true],
+]);
+
+$response = $client->sendRequest(
+    $http->jsonRequest('POST', $this->webhook->endpoint, $this->webhookData)
+);
+```
+
+Webhook 配置仅包含：`name`、`endpoint`（URL）、`timeout`、`active`、`tracked_events`，**没有任何认证 token**。接收方如果需要认证，只能通过在 URL 中加查询参数或通过 `ThemeEvents::WEBHOOK_CALL_BEFORE` 主题事件自定义。
+
+> **注意**：用户口中的 "webhook token" 在 BookStack 中并不存在。如果讨论的是"通过 webhook 调用 API"，那实际使用的是普通 API Token。
+
+### 3.8 Guest 用户与 Admin Token 的权限隔离边界
+
+#### 3.8.1 Guest 用户的本质
+
+**文件**：`app/Users/Models/User.php:95-106` + `app/App/Providers/AuthServiceProvider.php:68-70`
+
+Guest（游客）不是一种 Token 类型，而是一个**系统内置的特殊用户**：
+
+```php
+public static function getGuest(): self
+{
+    return app()->make('users.default');
+}
+
+public function isGuest(): bool
+{
+    return $this->system_name === 'public';
+}
+```
+
+- `system_name = 'public'` 的用户就是 Guest 用户
+- 以单例形式注册在容器中，整个请求共享
+- 未登录用户的 `user()` 辅助函数返回的就是这个 Guest 用户
+
+**Guest 用户不能创建 API Token**——因为无法登录 UI 也无法通过 API 管理 Token。换句话说，BookStack **不存在 "guest API key" 这种东西**。未携带有效 Token 的 API 请求会直接被 `ApiAuthenticate` 中间件拒绝。
+
+#### 3.8.2 Guest 用户的权限矩阵
+
+Guest 用户的权限来自其绑定的 **Public 角色**（`system_name = 'public'`），这是一个系统角色。权限由两个层面控制：
+
+| 控制层 | 机制 | 说明 |
+|--------|------|------|
+| 应用级开关 | `app-public` 设置 | 决定整个应用是否对游客开放 |
+| 角色权限 | Public 角色的 permission 列表 | 具体能看什么、做什么 |
+| 实体级 ACL | `entity_permissions` 表 | 特定实体对 Public 角色的权限覆盖 |
+
+`User::hasAppAccess()` 方法体现了这两层判断：
+
+```php
+public function hasAppAccess(): bool
+{
+    return !$this->isGuest() || setting('app-public');
+}
+```
+
+- 非游客：永远有基础访问权
+- 游客：必须 `app-public` 开启才有基础访问权
+
+#### 3.8.3 Admin Token 与普通用户 Token 的隔离边界
+
+Admin Token 和普通用户 Token 在**认证机制上完全相同**——都是 API Token，都走 `ApiTokenGuard`。区别仅在于**用户角色权限不同**：
+
+```
+Admin Token → 识别出 admin 用户 → admin 角色 → 拥有全部权限
+普通用户 Token → 识别出普通用户 → 普通角色 → 有限权限
+Guest → 无 Token → 不能调用 API
+```
+
+**隔离边界在权限系统，不在 Token 系统**：
+
+1. **系统级**：`$user->can(Permission::SettingsManage)` 等系统权限
+2. **实体级**：`page-create-all` / `page-delete-own` 等角色权限
+3. **实例级**：`entity_permissions` 表的实体级 ACL 覆盖
+
+Admin 角色的特殊地位体现在 `EntityPermissionEvaluator` 的快捷放行：
+
+```php
+// EntityPermissionEvaluator::isUserSystemAdmin()
+protected function isUserSystemAdmin($userRoleIds): bool
+{
+    $adminRoleId = Role::getSystemRole('admin')->id;
+    return in_array($adminRoleId, $userRoleIds);
+}
+```
+
+如果用户是 admin 角色，`evaluateEntityForUser()` 直接返回 `true`，跳过整个 ACL 计算。
+
 ---
 
 ## 四、权限判断层
@@ -880,7 +1025,128 @@ public function restrictEntityQuery(Builder $query): Builder
    │<── 200 JSON Response ──────┤<───────────────────────────┤<─────────────────────────┤<────────────────────────│
 ```
 
-### 5.2 协作关键点总结
+### 5.2 API 错误响应：Token 失效 vs Rate Limit 的错误码区分
+
+所有 API 错误响应都由 `Handler::renderApiException()` 统一格式化，结构一致：
+
+```json
+{
+    "error": {
+        "code": 429,
+        "message": "Too Many Attempts."
+    }
+}
+```
+
+**核心识别方式**：通过 `error.code` 字段（即 HTTP 状态码）区分错误类型。
+
+#### 5.2.1 各类错误的状态码与触发路径
+
+| 错误类型 | 异常类 | HTTP 状态码 | 触发位置 | message 典型内容 |
+|---------|--------|------------|---------|-----------------|
+| **Token 格式错误** | `ApiAuthException` | 401 | `ApiTokenGuard::validateTokenHeaderValue()` | "No authorization token found" / "Bad authorization format" |
+| **Token 不存在** | `ApiAuthException` | 401 | `ApiTokenGuard::validateToken()` | "Token not found" |
+| **Token secret 错误** | `ApiAuthException` | 401 | `ApiTokenGuard::validateToken()` | "Incorrect token secret" |
+| **Token 已过期** | `ApiAuthException` | **403** | `ApiTokenGuard::validateToken()` | "Token expired" |
+| **用户无 API 权限** | `ApiAuthException` | **403** | `ApiTokenGuard::validateToken()` | "No API permission" |
+| **邮箱未确认** | `ApiAuthException` | 401 | `ApiTokenGuard::user()` | "Email confirmation awaiting" |
+| **速率限制超限** | `ThrottleRequestsException` (Laravel 内置) | **429** | `ThrottleRequests::handle()` | "Too Many Attempts." |
+| **实体权限不足** | `NotifyException` | **403** | `Controller::showPermissionError()` | 权限拒绝的具体描述 |
+| **数据不存在** | `ModelNotFoundException` | 404 | 模型查询 | "" (空消息) |
+| **验证失败** | `ValidationException` | 422 | 表单验证 | "The given data was invalid." + `validation` 字段 |
+
+#### 5.2.2 Token 失效的状态码差异
+
+一个容易混淆的点：**Token 相关错误不都是 401**，部分是 403。具体规则：
+
+```
+ApiAuthException 状态码分配：
+  ├─ 认证凭证问题（格式/不存在/secret错） → 401
+  ├─ 邮箱未确认 → 401
+  ├─ Token 已过期 → 403
+  └─ 用户无 AccessApi 权限 → 403
+```
+
+代码中的体现（`app/Api/ApiTokenGuard.php`）：
+
+```php
+// 格式错误 → 401（默认）
+throw new ApiAuthException(trans('errors.api_no_authorization_found'));
+
+// Token 不存在 → 401（默认）
+throw new ApiAuthException(trans('errors.api_token_not_found'));
+
+// Token 过期 → 403
+throw new ApiAuthException(trans('errors.api_user_token_expired'), 403);
+
+// 无 API 权限 → 403
+throw new ApiAuthException(trans('errors.api_user_no_api_permission'), 403);
+```
+
+设计逻辑：401 = "你是谁无法确认"，403 = "知道你是谁，但你不能做这件事"。
+
+#### 5.2.3 Rate Limit 触发的响应特征
+
+速率限制超限由 Laravel 框架的 `ThrottleRequests` 中间件抛出 `ThrottleRequestsException`，状态码固定为 **429**。
+
+响应中额外包含限流相关的 HTTP 响应头（Laravel 自动设置）：
+
+```
+X-RateLimit-Limit: 180
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1718888888
+Retry-After: 45
+```
+
+其中：
+- `X-RateLimit-Limit`：每分钟配额上限
+- `X-RateLimit-Remaining`：当前窗口剩余次数
+- `X-RateLimit-Reset`：窗口重置的 Unix 时间戳
+- `Retry-After`：建议的重试等待秒数
+
+这些 header 通过 `$e->getHeaders()` 传入 `renderApiException`，最终原样输出到响应中。
+
+#### 5.2.4 统一响应格式化路径
+
+所有 API 异常的处理入口是 `Handler::render()` → `isApiRequest()` → `renderApiException()`：
+
+```php
+// Handler::renderApiException() — app/Exceptions/Handler.php:119-148
+protected function renderApiException(Throwable $e): JsonResponse
+{
+    $code = 500;
+    $headers = [];
+
+    if ($e instanceof HttpExceptionInterface) {
+        $code = $e->getStatusCode();   // 从异常中读取状态码
+        $headers = $e->getHeaders();   // 从异常中读取额外 header（如限流头）
+    }
+
+    if ($e instanceof ModelNotFoundException) {
+        $code = 404;
+    }
+
+    $responseData = ['error' => ['message' => $e->getMessage()]];
+
+    if ($e instanceof ValidationException) {
+        $responseData['error']['message'] = 'The given data was invalid.';
+        $responseData['error']['validation'] = $e->errors();
+        $code = $e->status;
+    }
+
+    $responseData['error']['code'] = $code;  // code 字段等于 HTTP 状态码
+
+    return new JsonResponse($responseData, $code, $headers);
+}
+```
+
+**关键结论**：
+- `error.code` 与 HTTP 状态码始终一致
+- 区分 Token 失效和 Rate Limit：**看状态码是 4xx 还是 429**
+- 区分不同 Token 失效原因：看 `error.message` 文本，状态码只是粗粒度区分
+- 限流错误额外带 `X-RateLimit-*` 和 `Retry-After` 响应头
+
+### 5.3 协作关键点总结
 
 1. **速率限制最先执行**：在任何认证逻辑之前，避免恶意请求消耗认证资源。
 
@@ -896,9 +1162,10 @@ public function restrictEntityQuery(Builder $query): Builder
 4. **限流标识联动**：速率限制中间件优先使用认证后的 `user()->id` 作为限流 key，未认证则回退到 IP 地址。但由于限流在认证之前执行，Token 认证场景下限流 Key 始终为 IP，而非用户 ID。
 
 5. **异常处理**：
-   - 速率限制：返回 `429 Too Many Requests`（Laravel 框架默认）
+   - 速率限制：返回 `429 Too Many Requests`（Laravel 框架默认），带 `X-RateLimit-*` 响应头
    - Token 认证失败：`ApiAuthException` 实现 `HttpExceptionInterface`，由 `Handler::renderApiException()` 统一转换为 JSON 响应 `{'error': {'message': '...', 'code': 401/403}}`
    - 权限不足：`NotifyException` 同样实现 `HttpExceptionInterface`，转换为 `{'error': {'message': '...', 'code': 403}}`
+   - 所有 API 错误响应结构统一：`{error: {code, message}}`，code 等于 HTTP 状态码
 
 6. **Token 安全**：secret 以 bcrypt 哈希存储，明文仅创建时展示一次；无定时清理过期 Token 的机制，过期检查仅在请求时执行。
 
@@ -909,6 +1176,10 @@ public function restrictEntityQuery(Builder $query): Builder
 9. **Shelf 权限主动复制**：Bookshelf 不在 ACL 实时继承链中，shelf → book 的权限通过主动复制机制传递，复制后独立存在。
 
 10. **限流全局共享**：所有 API 路径共享同一个限流计数器，与 URL、参数、方法无关；重试会持续消耗配额。
+
+11. **三种 Token 概念**：API Token（API 认证，长有效期）、User Token（邮件确认/重置，24 小时过期）、Webhook（出站通知，无 token），三者是完全独立的体系。
+
+12. **Guest 无 API Token**：BookStack 不存在 "guest API key"，未认证 API 请求直接被拒绝。Admin Token 与普通 Token 的差异在权限层，不在认证层。
 
 ---
 
@@ -950,3 +1221,13 @@ public function restrictEntityQuery(Builder $query): Builder
 | 数据库迁移（api_tokens） | `database/migrations/2019_12_29_120917_add_api_auth.php` |
 | 复制 Shelf 权限命令 | `app/Console/Commands/CopyShelfPermissionsCommand.php` |
 | MFA 限流器（参考实现） | `app/Access/Mfa/MfaVerificationLimiter.php` |
+| User Token 服务（邮件/重置令牌） | `app/Access/UserTokenService.php` |
+| User Token 过期异常 | `app/Exceptions/UserTokenExpiredException.php` |
+| Webhook 模型 | `app/Activity/Models/Webhook.php` |
+| Webhook 任务调度 | `app/Activity/DispatchWebhookJob.php` |
+| Webhook 格式化器 | `app/Activity/Tools/WebhookFormatter.php` |
+| Webhook 控制器（Web） | `app/Activity/Controllers/WebhookController.php` |
+| 用户模型（含 Guest 逻辑） | `app/Users/Models/User.php` |
+| 角色模型 | `app/Users/Models/Role.php` |
+| 认证服务提供者 | `app/App/Providers/AuthServiceProvider.php` |
+| NotifyException（权限拒绝） | `app/Exceptions/NotifyException.php` |

@@ -833,3 +833,457 @@ Webhook 调用失败时：
 └───────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## 专项深挖 4：通知中心未读 / 已读状态的存储模式与索引
+
+### 结论先行：BookStack **没有** 通知中心
+
+系统不存在"站内通知中心"、"未读消息红点"、"已读 / 未读状态"等功能。以下是完整证据链。
+
+### 4.1 数据库层：不存在 notifications 表的迁移
+
+`database/migrations/` 目录下的所有迁移中搜索 `notifications` 表相关迁移，唯一匹配的是：
+
+- `2023_07_25_124945_add_receive_notifications_role_permissions.php` — 只是加了一个角色权限常量，与数据表无关
+
+**Laravel 默认的 `notifications` 表（DatabaseNotification）从未在 BookStack 中被创建或使用。** 代码中搜索 `HasDatabaseNotifications`、`unreadNotifications`、`readNotifications`、`markAsRead`、`read_at` 均无结果。
+
+### 4.2 模型层：User 只 `use Notifiable`，无 DatabaseNotification 能力
+
+`app/Users/Models/User.php:53`：
+
+```php
+use Notifiable;
+```
+
+`Illuminate\Notifications\Notifiable` trait 提供的是 `routeNotificationForMail()` 等通用路由方法，`DatabaseNotification` 能力需要额外 `use HasDatabaseNotifications` trait，BookStack 的 User 模型没有使用。
+
+### 4.3 通知消息层：`via()` 只返回 `['mail']`
+
+所有通知消息类继承 `MailNotification` (`app/App/MailNotification.php:28`)：
+
+```php
+public function via($notifiable)
+{
+    return ['mail'];
+}
+```
+
+没有任何子类覆盖 `via()` 加入 `'database'` 通道，也没有实现 `toDatabase()` 方法。
+
+### 4.4 前端层：无通知铃铛 / 未读计数 / 标记已读 UI
+
+搜索 `notification` 相关的 Blade 视图，只有 `users/account/notifications.blade.php` —— 这是**用户偏好设置页面**，用于开关邮件通知、管理 Watch 订阅，不是"通知中心"列表页。
+
+Header 中 (`layouts/parts/header.blade.php`) 无铃铛图标、无未读计数。搜索 `bell` / `notification-badge` / `unread-count` 无结果。
+
+### 4.5 对照：哪些表是真实存在且有索引的
+
+虽然没有站内通知中心，但系统有三张与活动 / 通知相关的核心表，其索引如下：
+
+#### `activities` 表 — 活动日志
+
+| 字段 | 类型 | 索引 | 迁移 |
+|------|------|------|------|
+| `id` | int | PK | `2015_08_16_142133_create_activities_table` |
+| `type` (原 `key`) | string | INDEX | `2020_09_19_094251_add_activity_indexes` |
+| `created_at` | timestamp | INDEX | `2020_09_19_094251_add_activity_indexes` |
+| `ip` | string(45) | INDEX (`activities_ip_index`) | `2021_11_26_070438_add_index_for_user_ip` |
+| `loggable_id` (原 `entity_id`) | int nullable | 无单独索引 | `2024_05_04_154409_rename_activity_relation_columns` |
+| `loggable_type` (原 `entity_type`) | string nullable | 无单独索引 | 同上 |
+| `user_id` | int | 无单独索引（由 Eloquent 查询负责） | — |
+| `detail` (原 `extra`) | text | 无索引 | — |
+
+**重要缺失**：`(loggable_type, loggable_id)` 组合列无索引。`ActivityQueries::entityActivity()` 和 `EntityWatchers::getRelevantWatches()` 中频繁使用 `WHERE loggable_type = ? AND loggable_id = ?` 查询，数据库端需走全表扫描。
+
+#### `watches` 表 — 用户订阅
+
+迁移 `2023_07_31_104430_create_watches_table`：
+
+| 字段 | 类型 | 索引 |
+|------|------|------|
+| `id` | int | PK |
+| `user_id` | int | INDEX |
+| `level` | tinyint unsigned | INDEX |
+| `(watchable_id, watchable_type)` | — | COMPOSITE INDEX `watchable_index` |
+
+索引设计合理：
+- `user_id` 索引用于查询"某用户的所有 Watch"（`/my-account/notifications` 页面列表）
+- `(watchable_id, watchable_type)` 复合索引用于 `EntityWatchers::getRelevantWatches()` 查询某实体的所有订阅者
+- `level` 索引可辅助按等级筛选
+
+#### `mention_history` 表 — @提及通知历史
+
+迁移 `2025_12_15_140219_create_mention_history_table`：
+
+| 字段 | 类型 | 索引 |
+|------|------|------|
+| `id` | int | PK |
+| `mentionable_type` | string(50) | INDEX |
+| `mentionable_id` | unsignedBigInt | INDEX |
+| `from_user_id` | unsignedInt | 无索引 |
+| `to_user_id` | unsignedInt | 无索引 |
+| `created_at` / `updated_at` | timestamp | 无索引 |
+
+**注意**：`(mentionable_type, mentionable_id)` 是两个独立单列索引，不是复合索引。`CommentMentionNotificationHandler::getPreviouslyNotifiedUserIds()` 查询 `WHERE mentionable_id = ? AND mentionable_type = ?`，数据库可能只能命中一个索引再过滤。
+
+#### `settings` 表 — 用户偏好（通知偏好存在这里）
+
+迁移 `2015_08_30_125859_create_settings_table` + `2021_01_30_225441_add_settings_type_column`：
+
+| 字段 | 类型 | 索引 |
+|------|------|------|
+| `setting_key` | string | PK（主键即索引） |
+| `value` | text | 无索引 |
+| `type` | string(50) | 无索引 |
+| `created_at` / `updated_at` | nullable timestamp | 无索引 |
+
+用户级偏好通过 `user:{userId}:{key}` 前缀存储，主键索引可直接命中。
+
+---
+
+## 专项深挖 5：移动端通知点击回跳的 Deep Link 路由与参数传递
+
+### 结论先行：BookStack **没有** 原生移动端 App，也没有 Deep Link / Universal Link / App Link 机制
+
+所谓"通知点击回跳"就是邮件里的普通 HTTP 链接直接打开浏览器，路由完全是标准 Web 路由。
+
+### 5.1 通知邮件里的链接构建方式
+
+所有 4 种活动通知邮件都通过 `->action()` 方法或 MessageParts 构建链接，**全部使用 `Entity::getUrl()` 生成标准 Web URL**。
+
+#### Page 通知 — `Page::getUrl()`
+
+`app/Entities/Models/Page.php:114`
+
+```php
+public function getUrl(string $path = ''): string
+{
+    $parts = [
+        'books',
+        urlencode($this->book_slug ?? $this->book->slug),
+        $this->draft ? 'draft' : 'page',
+        $this->draft ? $this->id : urlencode($this->slug),
+        trim($path, '/'),
+    ];
+    return url('/' . implode('/', $parts));
+}
+```
+
+示例输出：`https://bookstack.example.com/books/my-book/page/my-page-slug`
+
+Page 还有 `getPermalink()` 方法生成 ID 链接：`https://bookstack.example.com/link/{id}`，但通知邮件中未使用。
+
+#### Comment 通知 — 带锚点
+
+```php
+// CommentCreationNotification / CommentMentionNotification
+->action(
+    $locale->trans('notifications.action_view_comment'),
+    $page->getUrl('#comment' . $comment->local_id)
+)
+```
+
+生成 URL 示例：`https://bookstack.example.com/books/book-slug/page/page-slug#comment12`
+
+`local_id` 是评论在页面内的局部 ID，锚点滚动到具体评论。
+
+#### 其他通知邮件中的链接
+
+| 链接组件 | 类 | 构建方式 |
+|---------|----|---------|
+| 实体名称超链接 | `EntityLinkMessageLine` | `$entity->getUrl()` |
+| Book > Chapter 路径 | `EntityPathMessageLine` | 多个 `EntityLinkMessageLine` 用 ` > ` 拼接 |
+| 底部"管理通知偏好"链接 | `BaseActivityNotification::buildReasonFooterLine()` | `url('/my-account/notifications')` |
+| 邀请 / 重置密码链接 | `UserInviteNotification` / `ResetPasswordNotification` | `url('/register/invite/{token}')` / `url('password/reset/{token}')` |
+
+### 5.2 Web 路由（标准 HTTP）
+
+所有通知链接指向的路由定义在 `routes/web.php`，由 `web` middleware group 处理（Session / CSRF / Localization / CSP 等）：
+
+| URL 模式 | 路由处理 |
+|---------|---------|
+| `/books/{bookSlug}/page/{pageSlug}` | Page 详情页（由实体路由注册） |
+| `/books/{bookSlug}/chapter/{chapterSlug}` | Chapter 详情页 |
+| `/books/{bookSlug}` | Book 详情页 |
+| `/link/{id}` | 永久链接（ID 跳转） |
+| `/my-account/notifications` | `UserAccountController::showNotifications()` |
+| `/register/invite/{token}` | 邀请注册 |
+| `/password/reset/{token}` | 重置密码 |
+
+### 5.3 无任何 App 级 Deep Link 基础设施
+
+搜索关键字全部无结果：
+
+| 搜索项 | 结果 |
+|--------|------|
+| `deeplink` / `deep-link` / `deepLink` | ❌ |
+| `app://` schema | ❌ |
+| `intent://` | ❌ |
+| `universal link` / `App Link` / `association` | ❌ |
+| `apple-app-site-association` / `assetlinks.json` | ❌ |
+| `notification_click` / `pendingIntent` / `intent-filter` | ❌ |
+
+邮件模板也没有条件分支判断是否在 App 内打开（例如 `@if(app->runningInConsole())` 之类的逻辑）。如果后续要做移动端 App，需要：
+
+1. 在邮件模板中增加 App Schema 或 Universal Link 分支
+2. 服务端提供 `.well-known/apple-app-site-association` 和 `.well-known/assetlinks.json` 路由
+3. 路由层增加 App Deep Link 参数解析与自动跳转
+
+### 5.4 参数传递路径总结
+
+```
+通知构建（Message 类）
+    │
+    ├─ PageCreation / PageUpdate
+    │     └─ $page->getUrl()
+    │           └─ /books/{bookSlug}/page/{pageSlug}
+    │
+    ├─ CommentCreation / CommentMention
+    │     └─ $page->getUrl('#comment' . $comment->local_id)
+    │           └─ /books/{bookSlug}/page/{pageSlug}#comment{local_id}
+    │
+    ├─ EntityLinkMessageLine（邮件正文内联）
+    │     └─ $entity->getUrl()
+    │
+    └─ 底部"管理通知偏好"链接
+          └─ url('/my-account/notifications')
+                └─ /my-account/notifications
+    │
+    ▼
+Laravel MailMessage::action() / ->line() 渲染
+    │
+    ▼
+邮件发送（mail channel）
+    │
+    ▼
+用户点击链接
+    │
+    ▼
+标准 Web 路由（routes/web.php）→ Controller → View
+    ├─ 无额外跳转层
+    ├─ 无 App Deep Link 检测
+    └─ 无通知来源 / 来源追踪参数（如 utm_source / notification_id）
+```
+
+**注意**：通知链接中没有附带 `notification_id` / `activity_id` 等元信息参数，点击打开后服务端无法追踪哪封通知被点击了，也没有自动标记"已读"的逻辑（因为根本没有站内通知中心）。
+
+---
+
+## 专项深挖 6：用户偏好 — Mute / 频道选择 / 频率限制的落库与读取逻辑
+
+### 结论先行
+
+BookStack 的用户通知偏好系统 **极简**：
+
+- **Mute（全局静音）**：❌ 不存在。唯一接近的是 `WatchLevels::IGNORE` 针对**单个实体**静音，无法全局关邮件
+- **频道选择（邮件 / 站内 / Push）**：❌ 不存在。只有邮件一个通道，没得选
+- **频率限制（即时 / 每日摘要 / 每周摘要 / 免打扰时段）**：❌ 不存在。所有通知即时发送
+
+实际存在的只有 **4 项布尔开关**，全部落在 `settings` 表的 KV 存储里。
+
+### 6.1 4 项通知偏好定义
+
+`app/Settings/UserNotificationPreferences.php`
+
+| 方法 | 对应设置键 | 含义 |
+|------|-----------|------|
+| `notifyOnOwnPageChanges()` | `notifications#own-page-changes` | 自己拥有的页面被他人修改时通知 |
+| `notifyOnOwnPageComments()` | `notifications#own-page-comments` | 自己拥有的页面收到评论时通知 |
+| `notifyOnCommentReplies()` | `notifications#comment-replies` | 自己的评论收到回复时通知 |
+| `notifyOnCommentMentions()` | `notifications#comment-mentions` | 在评论中被 @提及时通知 |
+
+### 6.2 存储方式：`settings` 表的前缀 KV
+
+`SettingService::putUser()` (`app/Settings/SettingService.php:222`)：
+
+```php
+public function putUser(User $user, string $key, string $value): bool
+{
+    if ($user->isGuest()) {
+        session()->put($key, $value);
+        return true;
+    }
+    return $this->put($this->userKey($user->id, $key), $value);
+}
+
+protected function userKey(string $userId, string $key = ''): string
+{
+    return 'user:' . $userId . ':' . $key;
+}
+```
+
+实际存入 `settings` 表的 `setting_key` 为：`user:123:notifications#own-page-changes`
+
+存储值是字符串 `'true'` 或 `'false'`，读取时由 `SettingService::formatValue()` 自动转为 PHP 布尔值。
+
+### 6.3 写入逻辑 — 白名单校验
+
+`UserNotificationPreferences::updateFromSettingsArray()` (`app/Settings/UserNotificationPreferences.php:34`)
+
+```php
+public function updateFromSettingsArray(array $settings)
+{
+    $allowList = ['own-page-changes', 'own-page-comments', 'comment-replies', 'comment-mentions'];
+    foreach ($settings as $setting => $status) {
+        if (!in_array($setting, $allowList)) {
+            continue;
+        }
+        $value = $status === 'true' ? 'true' : 'false';
+        setting()->putUser($this->user, 'notifications#' . $setting, $value);
+    }
+}
+```
+
+- 白名单机制：只有 4 个允许的键能被修改，其他键被静默丢弃
+- 非 `'true'` 的值一律存为 `'false'`（输入归一化）
+
+### 6.4 读取逻辑 — 带默认值
+
+`UserNotificationPreferences::getNotificationSetting()` (`app/Settings/UserNotificationPreferences.php:47`)
+
+```php
+protected function getNotificationSetting(string $key): bool
+{
+    return setting()->getUser($this->user, 'notifications#' . $key);
+}
+```
+
+`SettingService::getUser()` 会自动 fallback 到 `config('setting-defaults.user.' . $key)`。
+
+`app/Config/setting-defaults.php:44` 中只配置了一个默认值：
+
+```php
+'user' => [
+    // ...
+    'notifications#comment-mentions' => true,  // 唯一有默认值的
+],
+```
+
+**其他 3 项偏好默认值**：`config('setting-defaults.user.notifications#own-page-changes')` 不存在，`SettingService::get()` 会取 `false` 作为兜底（`get($key, $default = null)` → `$default = null` → 取 `config('setting-defaults.' . $key, false)` → 最终 `false`）。
+
+总结默认值：
+
+| 偏好 | 默认值 |
+|------|--------|
+| `own-page-changes` | `false` |
+| `own-page-comments` | `false` |
+| `comment-replies` | `false` |
+| `comment-mentions` | `true`（显式配置） |
+
+### 6.5 读取缓存策略
+
+`SettingService` 有一个请求级内存缓存 `$localCache`，按分类分组：
+
+- 应用级设置 → 缓存键 `'app'`，用 `WHERE setting_key NOT LIKE 'user:%'` 批量加载
+- 用户级设置 → 缓存键 `'user:{userId}'`，用 `WHERE setting_key LIKE 'user:{userId}:%'` 批量加载
+
+首次读取用户的任一偏好时，会把该用户所有 `user:{userId}:%` 开头的设置全部查出来缓存。后续读取同用户其他偏好直接走数组键查找，无 DB 查询。
+
+### 6.6 HTTP 入口 — Controller 与路由
+
+`app/Users/Controllers/UserAccountController.php`：
+
+| 方法 | 路由 | 职责 |
+|------|------|------|
+| `showNotifications()` | `GET /my-account/notifications` | 渲染偏好表单 + 用户 Watch 订阅列表 |
+| `updateNotifications()` | `PUT /my-account/notifications` | 接收表单提交 → `updateFromSettingsArray()` 写入 |
+
+前置权限：`$this->checkPermission(Permission::ReceiveNotifications)`，无此角色权限的用户无法访问或修改通知偏好。
+
+### 6.7 UI 表单结构
+
+`resources/views/users/account/notifications.blade.php` 用 4 个 `form.toggle-switch` 组件渲染，`name` 对应 `preferences[own-page-changes]` 等数组格式，`$preferences->notifyOnXxx()` 填充当前值。
+
+表单下方还展示该用户的所有 Watch 订阅列表（分页 20 条/页），每条显示实体图标 + 订阅等级名称。
+
+### 6.8 不存在的功能与替代设计
+
+| 用户诉求 | 是否存在 | 替代 / 近似方案 |
+|---------|---------|----------------|
+| **全局 Mute（关闭所有邮件通知）** | ❌ | 可移除角色权限 `ReceiveNotifications`，`BaseNotificationHandler` 会检查 `$user->can(Permission::ReceiveNotifications)` 直接跳过发送 |
+| **单实体 Mute** | ✅ | `WatchLevels::IGNORE (level=0)`，设置后 `EntityWatchers::isUserIgnoring()` 返回 true，被 Handler 用于排除（如页面 Owner 的通知） |
+| **按频道选择（邮件 vs 站内 vs Push）** | ❌ | 只有邮件通道，无选择余地 |
+| **发送频率（即时 / 摘要）** | ❌ | 全部即时发送，无 digest / batch 机制 |
+| **免打扰时段（Do Not Disturb）** | ❌ | 无任何时间窗口判断 |
+| **按活动类型细分（只关 PageUpdate 不关 Comment）** | ❌ | 4 项偏好是按场景聚合的，无法精细到 `PAGE_CREATE` vs `PAGE_UPDATE` |
+
+全局 Mute 的替代路径值得注意：角色权限检查在 `BaseNotificationHandler` 中作为**发送层总开关**存在，如果管理员把用户的 `ReceiveNotifications` 权限拿掉，该用户不会收到任何活动通知邮件，这实际上就是"全局静音"。只是用户自己无法在 UI 上切换，需要管理员介入角色管理。
+
+---
+
+## 专项深挖补充：第 2 轮三层全景总览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                  通知中心未读/已读 — ❌ 不存在                        │
+│                                                                     │
+│  · 无 notifications 表迁移（Laravel DatabaseNotification 未启用）     │
+│  · User 模型无 HasDatabaseNotifications                              │
+│  · Notification::via() 只返回 ['mail']                               │
+│  · 无 markAsRead / unreadNotifications / read_at 代码               │
+│  · Header 无通知铃铛 / 未读计数 UI                                   │
+│                                                                     │
+│  实际存在的 3 张核心表：                                              │
+│  ┌────────────┬────────────────────────────────────────────┐       │
+│  │ activities │ PK(id), INDEX(type), INDEX(created_at),    │       │
+│  │            │ INDEX(ip), (loggable_*) 无复合索引          │       │
+│  ├────────────┼────────────────────────────────────────────┤       │
+│  │ watches    │ INDEX(user_id), INDEX(level),               │       │
+│  │            │ COMPOSITE(watchable_id, watchable_type)     │       │
+│  ├────────────┼────────────────────────────────────────────┤       │
+│  │ mention_   │ INDEX(mentionable_type),                   │       │
+│  │ history    │ INDEX(mentionable_id)  [两单列非复合]       │       │
+│  └────────────┴────────────────────────────────────────────┘       │
+└────────────────────────────────────┬────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│          Deep Link / 移动端通知点击回跳 — ❌ 无原生 App              │
+│                                                                     │
+│  · 无 app:// / intent:// 等 Schema                                   │
+│  · 无 apple-app-site-association / assetlinks.json                  │
+│  · 无 notification_id / utm_source 等追踪参数                         │
+│                                                                     │
+│  链接全部为标准 Web URL，由 Entity::getUrl() 构建：                    │
+│  ┌──────────────────────┬───────────────────────────────────────┐   │
+│  │ PageCreation/Update  │ /books/{slug}/page/{slug}            │   │
+│  ├──────────────────────┼───────────────────────────────────────┤   │
+│  │ CommentCreation/     │ /books/{slug}/page/{slug}#comment{id} │   │
+│  │ CommentMention       │                                       │   │
+│  ├──────────────────────┼───────────────────────────────────────┤   │
+│  │ 底部"管理偏好"链接     │ /my-account/notifications            │   │
+│  └──────────────────────┴───────────────────────────────────────┘   │
+│                                                                     │
+│  点击后：标准 Web 路由（routes/web.php）→ Controller → View          │
+│  无自动标记已读（因为没有"未读"概念）                                   │
+└────────────────────────────────────┬────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│      用户偏好 Mute / 频道 / 频率 — 极简（仅 4 个布尔开关）            │
+│                                                                     │
+│  存储：settings 表 KV                                                │
+│    setting_key = "user:{uid}:notifications#{type}"                   │
+│    value = "true" / "false" (string)                                 │
+│  读取经 SettingService 请求级批量缓存                                  │
+│                                                                     │
+│  ┌────────────────────────┬───────────┬──────────────────────────┐  │
+│  │ 偏好项                 │ 默认值    │ 控制的通知场景            │  │
+│  ├────────────────────────┼───────────┼──────────────────────────┤  │
+│  │ own-page-changes       │ false     │ 自己的页面被修改（UPD）  │  │
+│  │ own-page-comments      │ false     │ 自己的页面被评论（CRE）  │  │
+│  │ comment-replies        │ false     │ 自己的评论被回复         │  │
+│  │ comment-mentions       │ true      │ 评论中被 @提及           │  │
+│  └────────────────────────┴───────────┴──────────────────────────┘  │
+│                                                                     │
+│  ❌ 不存在的功能：                                                    │
+│  · 全局 Mute → 替代：移除 ReceiveNotifications 角色权限              │
+│  · 单实体 Mute → 有：WatchLevels::IGNORE (level=0)                  │
+│  · 频道选择 → 只有 mail 单通道                                       │
+│  · 频率限制（即时/摘要）→ 全部即时发送                                │
+│  · 免打扰时段 → 无任何时间判断                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+

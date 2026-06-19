@@ -1287,3 +1287,403 @@ protected function getNotificationSetting(string $key): bool
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## 专项深挖 7：通知摘要 / 批量打包推送的合并触发机制
+
+### 结论先行：BookStack **完全没有** 通知摘要（Digest）或批量打包推送机制
+
+所有通知都是**逐事件、逐用户、即时发出**的。不存在按 1 小时 / 1 天 / 1 周将多条通知合并为一封摘要邮件的逻辑，也不存在将同一用户的多条待发送通知合并为一个 Job 的机制。
+
+### 7.1 证据链
+
+#### 无任何摘要 / 批量相关代码
+
+全局搜索 `digest`、`batch.*notif`、`aggregate.*notif`、`bundle.*notif`、`consolidate`、`collate` 均无结果。
+
+#### 调度器 `schedule()` 为空
+
+`app/Console/Kernel.php` 的 `schedule()` 方法是空的：
+
+```php
+protected function schedule(Schedule $schedule)
+{
+    // nothing
+}
+```
+
+摘要邮件（Digest）必须依赖定时任务（如 hourly / daily / weekly）来周期性地收集待合并的活动并集中发送。BookStack 没有任何调度任务，自然也不可能运行摘要机制。
+
+#### NotificationManager 每次 Activity 即时分发
+
+`NotificationManager::handle()` (`app/Activity/Notifications/NotificationManager.php:36`) 在每次 `ActivityLogger::add()` 时被立即调用，没有任何延迟或聚合：
+
+```php
+// ActivityLogger::add() 内部，紧接在 $activity->save() 之后
+$this->notifications->handle($activity, $detail, $user);
+```
+
+#### `BaseNotificationHandler` 逐用户即时 `notify()`
+
+`BaseNotificationHandler::sendNotificationToUserIds()` (`app/Activity/Notifications/Handlers/BaseNotificationHandler.php:19`) 对每个目标用户单独调用 `$user->notify(new $notification(...))`，每个用户生成一条独立的 Queue Job（如果配置了队列）：
+
+```php
+foreach ($notifiableUsers as $user) {
+    try {
+        $user->notify(new $notification($detail, $initiator));
+    } catch (\Exception $exception) {
+        Log::error("Failed to send email notification to user ...");
+    }
+}
+```
+
+没有 `Notification::send($users, new $notification(...))` 批量发送，也没有 Job chaining / batching。
+
+#### 没有临时存储待合并通知的表 / 缓存
+
+搜索相关关键词（`pending_notif`、`queued_notif`、`notification_buffer`、`notif_digest`）均无结果。数据库中也不存在用于暂存待合并通知的表。
+
+### 7.2 唯一接近"合并"的机制：Page Update 15 分钟防抖
+
+`PageUpdateNotificationHandler` 有 15 分钟时间窗口的去重逻辑（详见「专项深挖 1 / C-1」），但这是**防重复**而非**合并打包**：
+- 当防抖命中时，整个通知被**跳过**（`return`），完全不发
+- 不是把 A 更新 + B 更新合并成一封"页面有 2 条更新"的摘要邮件，而是后一条直接丢弃
+
+### 7.3 理论改造方向（如果要做摘要）
+
+如果需要实现摘要推送，可考虑：
+
+1. **新增存储层**：`notification_digest` 表（user_id、活动类型分组、聚合的 activity_ids、待发送时间戳）
+2. **替换 Handler 发送逻辑**：Handler 不再即时 notify，而是写入 digest 表，标记"该用户此活动类型有待发送摘要"
+3. **新增调度任务**：在 `schedule()` 中注册 hourly / daily 命令，扫描到期的 digest 记录，按用户聚合活动数据，生成并发送摘要邮件
+4. **摘要模板**：需要新增 `PageDigestNotification` 等摘要邮件类，包含多条活动的列表视图
+5. **用户偏好扩展**：在 `UserNotificationPreferences` 中增加 frequency 字段（`instant` / `hourly` / `daily` / `weekly`），Handler 根据偏好选择是即时发送还是写入 digest
+
+但当前代码中完全没有这些。
+
+---
+
+## 专项深挖 8：通知撤回与编辑场景下已发通知的处理
+
+### 结论先行
+
+**邮件一旦发出无法撤回**（这是邮件协议的本质），BookStack 也没有实现任何类似"通知已过期"的补发 / 更正邮件机制。编辑场景下，只有一部分操作会补发新通知，且完全不处理之前已发的旧通知。
+
+### 8.1 编辑操作与通知触发关系表
+
+| 操作 | Activity 类型 | 注册的 Notification Handler | 是否补发 | 对旧通知的处理 |
+|------|--------------|----------------------------|---------|--------------|
+| **页面内容 / 标题修改** | `PAGE_UPDATE` | `PageUpdateNotificationHandler` | **可能补发**（15 分钟防抖判定） | ❌ 无处理，已发邮件保留 |
+| **页面移动** | `PAGE_MOVE` | ❌ 未注册 Handler | ❌ 不补发 | — |
+| **页面从回收站恢复** | `PAGE_RESTORE` | ❌ 未注册 Handler | ❌ 不补发 | — |
+| **章节移动 / 修改** | `CHAPTER_MOVE` / `CHAPTER_UPDATE` | ❌ 未注册 Handler | ❌ 不补发 | — |
+| **图书编辑 / 排序** | `BOOK_UPDATE` / `BOOK_SORT` | ❌ 未注册 Handler | ❌ 不补发 | — |
+| **评论内容修改** | `COMMENT_UPDATE` | `CommentMentionNotificationHandler` | **只补发新增的 @提及** | ❌ 已发的评论创建通知不撤回；旧 @提及也不补发（mention_history 去重） |
+| **评论归档 / 取消归档** | `COMMENT_UPDATE` | `CommentMentionNotificationHandler` | ⚠️ 会解析评论 HTML 中的 @，归档不改动内容实际效果等价于不补发 | ❌ 无处理 |
+| **评论删除** | `COMMENT_DELETE` | ❌ 未注册 Handler | ❌ 不补发（也不补发"该评论已被删除"通知） | ❌ 无处理 |
+| **页面删除（进回收站）** | `PAGE_DELETE` | ❌ 未注册 Handler | ❌ 不补发（不通知订阅者该页面已被删除） | ❌ 已发的该页面通知链接仍在，但打开后无权限（页面被软删） |
+| **回收站清空（永久删除）** | `RECYCLE_BIN_DESTROY` | ❌ 未注册 Handler | ❌ 不补发 | ❌ 无处理 |
+
+### 8.2 两处关键的"部分补发"机制详解
+
+#### Page Update：防抖窗口决定是否补发
+
+`PageUpdateNotificationHandler::handle()` 中的 15 分钟防抖逻辑决定了：
+- A 用户编辑页面 → 正常发通知
+- 10 分钟后 A 用户再次编辑 → **跳过**（防抖命中）
+- 16 分钟后 A 用户再次编辑 → **正常发通知**（防抖窗口已过，第二封邮件发出，第一封邮件仍然存在且有效）
+- B 用户在 A 编辑后 5 分钟编辑 → **正常发通知**（user_id 不同，防抖不生效）
+
+效果：15 分钟窗口内同一用户的连续编辑合并为"最多一封"通知，但窗口跨越或切换用户就会多发多封，且邮件内只有本次编辑信息，不会列出"这段时间内还有 N 次编辑"。
+
+#### Comment Update：只处理新增 @提及
+
+`CommentMentionNotificationHandler` 对 `COMMENT_UPDATE` 的处理：
+
+1. 从更新后的 HTML 重新解析所有 @提及用户 ID
+2. 查 `mention_history` 表，找出该评论历史上已经通知过的被提及者
+3. `array_diff` 计算出**新增的被提及者**，只给这些人发通知
+4. 将新增的写入 `mention_history`
+
+**效果**：
+- 评论原文"@张三 你好" → 第一次创建时已通知张三
+- 编辑改为"@张三 @李四 @王五 你好" → 仅新增通知李四和王五，张三不重复收到
+- 编辑改为"@李四 你好"（移除了张三） → **无任何撤回**，张三已收到的邮件不受影响，李四收到新增通知
+- 评论已删除（`COMMENT_DELETE`）→ 没有 Handler，已被 @的用户不会收到"该评论被删除"的更正邮件
+
+### 8.3 通知链接失效场景：页面 / 评论被删除
+
+邮件中的链接指向标准 Web 路由。当目标实体被删除后，会发生什么：
+
+| 实体状态 | 链接打开效果 |
+|---------|-------------|
+| 页面进回收站（软删） | 用户访问 → 权限检查失败 → 404 / 无权限页面 |
+| 页面被永久删除（回收站清空） | 同上 |
+| 评论被删除 | 页面可正常打开，但 `#comment{local_id}` 锚点找不到对应元素，定位到页首 |
+| 评论被归档 | 页面可打开，评论被折叠为"此评论已被归档"样式 |
+
+**没有任何机制**在页面 / 评论被删除后：
+- 撤回已发出的邮件（协议层不可能）
+- 发送更正邮件告知订阅者"之前通知的内容已被删除 / 修改"
+- 自动生成 redirect 跳转到新 URL（仅页面 slug 变化时有 slugHistory 永久链接 `link/{id}` 兜底，但通知邮件没使用这个格式）
+
+### 8.4 代码中"撤回"能力的唯一近似点
+
+只有 **Laravel 队列层** 提供的机制可能拦截"尚未发送"的通知：
+
+1. **sync 驱动下**：通知在请求线程内同步执行，如果 Handler 执行到 `notify()` 前用户点击了删除（不可能，时间窗太紧），可能碰巧跳过
+2. **async 驱动下**：Job 已投递给队列但尚未被 worker 消费时
+   - 可以直接从 `jobs` 表手动删除该条记录
+   - 但 BookStack 的 Job 没有唯一标识，无法精确定位"发给用户 X 的页面 Y 更新通知"这条 Job
+3. **彻底的拦截点**：`BaseNotificationHandler::sendNotificationToUserIds()` 在调用 `notify()` 前会检查 `$user->can(Permission::ReceiveNotifications)`，如果此时管理员恰好移除了该权限，Job 在执行时会跳过发送
+
+这些都是依赖外部条件的旁路手段，不是系统内建的撤回功能。
+
+### 8.5 理论改造方向
+
+若要实现"通知更正"能力：
+1. 在 `mention_history` 上扩展类似"评论删除时发送撤销邮件"的 Hook
+2. 在 Page 永久删除时，查找近期关于该页面的通知（通过 activities 表反查），发送"页面已被删除"的后续通知（但邮件通知不可撤回，只能补发更正）
+3. 引入站内通知通道后，可支持标记为"已过期 / 已撤回"（但 mail 通道仍然做不到）
+
+---
+
+## 专项深挖 9：通知与 Activity Log 的数据冗余、归档迁移机制
+
+### 结论先行
+
+BookStack **没有** 自动归档、冷热分层、增量迁移等大数据治理能力。与通知 / 活动相关的四个核心表（activities / watches / mention_history / settings）都不做自动清理，唯一的运维命令是 `bookstack:clear-activity` 全表 `TRUNCATE`。
+
+### 9.1 数据冗余分析：四张核心表的冗余特征
+
+#### `activities` 表 — 最大的"堆积风险点"
+
+| 维度 | 情况 |
+|------|------|
+| 写入量 | 每次用户操作都写入一条。高活跃实例下，单页多次编辑、评论频繁互动、文件上传等都会迅速累积百万级记录 |
+| 冗余字段 | `detail` 字段在 `loggable_id/type` 有值时通常是 `Entity::logDescriptor()` 返回的名称，与关联实体的 name 字段冗余 |
+| 读场景 | AuditLog 页（管理员）、首页 Recent Activity、实体页活动列表、用户 Profile 活动列表。后三者都走 `ActivityQueries`，有 `filterSimilar` 折叠，实际取数比展示数多 |
+| 生命周期 | 默认无限期保留，只有手动 `TRUNCATE` |
+| 无索引的常见查询 | `WHERE loggable_type = ? AND loggable_id = ?`（`ActivityQueries::entityActivity`、`EntityWatchers::getRelevantWatches` 等）走全表扫描 |
+| 数据保留矛盾 | AuditLog（审计日志）要求 180 天+ 保留合规，但活动列表 UI 只看近期（一般 7~30 天），两者共用同一张表 |
+
+#### `watches` 表 — 增长可控
+
+| 维度 | 情况 |
+|------|------|
+| 写入量 | 每个用户对每个感兴趣的实体最多一条。总规模 ≈ 用户数 × 平均订阅实体数，线性但可控 |
+| 清理时机 | 实体被**永久删除**（回收站清空）时由 `TrashCan::destroyCommonRelations()` 调用 `$entity->watches()->delete()` 删除 |
+| 漏删场景 | 实体只进回收站（软删）时，watches 不删除；用户被永久删除后，其 watches 没有级联删除（无外键约束） |
+
+#### `mention_history` 表 — 累积膨胀
+
+| 维度 | 情况 |
+|------|------|
+| 写入量 | 每次创建或编辑评论时，每条新增 @提及写入一条。高频评论互动场景会迅速增长 |
+| 生命周期 | **无限期保留**。没有 TTL，代码中不存在清理逻辑 |
+| 用途 | 仅用于 `COMMENT_UPDATE` 时的去重判定；评论创建后从未被编辑时，这些记录永远不会再被读取 |
+| 冗余场景 | 评论被删除时，对应的 mention_history 不会被级联删除（Comment 表无 `deleting` 观察器、无外键） |
+| 实体永久删除时 | 由 `destroyCommonRelations()` 清理 `$entity->comments()`，但评论没有再触发 mention_history 清理 → **可能产生孤儿记录** |
+
+#### `settings` 表（通知偏好部分）— 低增长
+
+| 维度 | 情况 |
+|------|------|
+| 写入量 | 每个用户最多 4 条（4 项偏好）。总规模很小 |
+| 生命周期 | 无限期。用户被删除时，`AppServiceProvider::deleteUser()` 会清理 `user:{uid}:%` 的 setting 记录 |
+
+### 9.2 外键与级联 — 全部缺席，全靠代码显式清理
+
+四张核心表**都没有数据库级外键约束**（migration 中找不到 `foreign()->onDelete()->cascade()`）。所有数据一致性由业务层手动维护：
+
+#### 实体被永久删除时的清理入口
+
+`app/Entities/Tools/TrashCan.php:391` — `destroyCommonRelations(Entity $entity)`
+
+```php
+protected function destroyCommonRelations(Entity $entity): void
+{
+    Activity::removeEntity($entity);           // ← 见下详解
+    $entity->views()->delete();
+    $entity->permissions()->delete();
+    $entity->tags()->delete();
+    $entity->comments()->delete();            // ← 只删了 comments，没级联删 mention_history
+    $entity->jointPermissions()->delete();
+    $entity->searchTerms()->delete();
+    $entity->deletions()->delete();
+    $entity->favourites()->delete();
+    $entity->watches()->delete();             // ← watches 被删了
+    $entity->referencesTo()->delete();
+    $entity->referencesFrom()->delete();
+    $entity->slugHistory()->delete();
+    // ...封面图...
+    $entity->relatedData()->delete();
+}
+```
+
+#### `Activity::removeEntity()`：不是删除，而是"软解绑"
+
+`app/Activity/Tools/ActivityLogger.php:64`
+
+```php
+public function removeEntity(Entity $entity): void
+{
+    $entity->activity()->update([
+        'detail'        => $entity->name,
+        'loggable_id'   => null,
+        'loggable_type' => null,
+    ]);
+}
+```
+
+这个设计非常有特点——**不删除活动记录，而是保留审计痕迹**：
+- 所有该实体的活动记录都把 `loggable_id` 和 `loggable_type` 置空
+- 同时把实体名称拷贝到 `detail` 字段，保留"是什么被操作了"的可读信息
+- 审计日志（AuditLog）页面仍然能看到这条历史记录，只是不再有多态关联跳转链接
+
+副作用：**activities 表永远增长**，即使所有实体都被删除，活动记录依然存在。
+
+### 9.3 唯一运维命令：`bookstack:clear-activity`
+
+`app/Console/Commands/ClearActivityCommand.php:29`
+
+```php
+public function handle(): int
+{
+    Activity::query()->truncate();
+    $this->comment('System activity cleared');
+    return 0;
+}
+```
+
+```
+TRUNCATE TABLE activities;
+```
+
+| 维度 | 说明 |
+|------|------|
+| 粒度 | **全表清空**，不支持按日期范围 / 用户 / 活动类型筛选 |
+| 调用方式 | 命令行手动执行，`Console/Kernel::schedule()` 为空，无 cron 自动调用 |
+| 对通知的影响 | 通知邮件已发出，删 activities 不影响已收到的邮件；但未来的 PageUpdate 防抖逻辑会失效（因为上一条 update 的判定依据 `$detail->activity()` 查不到了，短时间内同用户编辑不会再被防抖跳过） |
+| 一致性 | 只清 activities，不清 watch / mention_history / settings |
+
+### 9.4 回收站（Soft Delete）相关的隐式保留机制
+
+`TrashCan::autoClearOld()`：
+```php
+$lifetime = intval(config('app.recycle_bin_lifetime'));
+if ($lifetime < 0) return 0; // 默认 -1 = 永不过期
+// 查询 Deletion::where('created_at', '<', now()->subDays($lifetime)) 并销毁
+```
+
+- 作用对象是 Deletions（回收站条目）及其关联实体，不是 activities 表
+- 默认 `recycle_bin_lifetime = -1`，即回收站条目也永久保留，不会触发自动清空
+- 只有显式设置了正整数（天数）才会自动销毁过期条目，销毁时触发 `destroyCommonRelations()`，连带清理 watches 和"软解绑" activities
+
+### 9.5 数据迁移 / 归档：依赖于 Laravel Schema + 通用数据库工具
+
+项目本身不提供 activities 的归档迁移命令。实际可行的方案（需自行实现）：
+
+| 方案 | 说明 |
+|------|------|
+| **按时间分表** | MySQL `CREATE TABLE activities_202X LIKE activities` + `RENAME TABLE`，配合 `AuditLogController` 用 UNION ALL 查询分表 |
+| **导出 CSV** | 管理员从 AuditLog 页面复制表格，或直接用 `mysqldump --where="created_at < '202X-01-01'"` 导出历史 |
+| **定期 Delete** | `Activity::where('created_at', '<', now()->subDays(90))->delete()`（注意 DELETE vs TRUNCATE 性能差异） |
+| **列存数仓同步** | 通过 Debezium / Canal 监听 MySQL binlog，将 activities 同步到 ClickHouse / Doris 做长期分析，主库只留近期 |
+
+但 BookStack 代码中**没有任何内建的归档 / 迁移 / 导出功能**，AuditLogController 只有列表分页查询，没有 `Excel/CSV Export` 控制器方法或 Job。
+
+### 9.6 三张辅助表的清理遗漏点（潜在的孤儿数据）
+
+| 场景 | 遗留数据 | 原因 |
+|------|---------|------|
+| 评论被删除 | `mention_history` 中对应 `mentionable_id` 的记录 | `destroyCommonRelations()` 只 `$entity->comments()->delete()`，Comment 模型没有 `static::deleting()` 观察器去清 mention_history，也没有外键级联 |
+| 用户被删除 | `watches.user_id`、`mention_history.from_user_id` / `to_user_id` | `User::delete` 只清 settings，watches / mention_history 无级联清理 |
+| 页面被永久删除但评论很多（嵌套级联清理） | 同上 | 同上 |
+| 活动被 TRUNCATE 后 | `mention_history` 无法再追溯对应活动的关联关系 | activities 被清空，但 mention_history 独立存在 |
+| 用户修改订阅偏好 | settings 中旧值被覆盖，没有保留偏好变更历史 | settings 是 KV 覆盖写，无审计表 |
+
+---
+
+## 专项深挖补充：第 3 轮三层全景总览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│               通知摘要 / 批量打包推送 — ❌ 不存在                     │
+│                                                                     │
+│  · Console/Kernel::schedule() 为空，无 cron 定时触发                   │
+│  · 无 digest / batch / bundle / consolidate 相关代码                   │
+│  · 无 pending_notif 缓存表或待合并暂存层                                │
+│  · NotificationManager::handle() 在 Activity::add 后即时调用           │
+│  · BaseNotificationHandler 对每用户逐次 $user->notify()                 │
+│  · 每通知 = 独立 Queue Job（如果 QUEUE_CONNECTION != sync）            │
+│                                                                     │
+│  唯一"近似合并"：PageUpdate 15 分钟防抖                                │
+│    └─ 命中时整条通知被跳过（防重复），非合并打包                         │
+│                                                                     │
+│  典型效果：A 在 10 分钟内编辑了 5 次某页面                              │
+│    · 只发 1 次通知（防抖命中后 4 条被跳过）                             │
+│    · 邮件只显示"页面被更新了"，不包含 5 次编辑的聚合信息                 │
+│    · A 编辑完 10 分钟后 B 又编辑 → 立即再发第 2 封邮件                  │
+└────────────────────────────────────┬────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│           通知撤回 / 编辑场景已发通知处理 — ❌ 无撤回机制              │
+│                                                                     │
+│  ┌──────────────────────┬────────────────────────────────────────┐ │
+│  │ 操作                 │ 对已发通知的处理                        │ │
+│  ├──────────────────────┼────────────────────────────────────────┤ │
+│  │ PAGE_UPDATE          │ 15min 窗口内同用户编辑跳过 → 合并不发   │ │
+│  │                      │ 窗口外或切换用户 → 发新邮件，旧邮件保留 │ │
+│  ├──────────────────────┼────────────────────────────────────────┤ │
+│  │ PAGE_MOVE / RESTORE  │ 不发新通知，旧链接失效                  │ │
+│  │ PAGE_DELETE          │ 不发通知，旧链接 404                    │ │
+│  ├──────────────────────┼────────────────────────────────────────┤ │
+│  │ COMMENT_CREATE       │ 创建时发完整通知（评论内容+@提及）       │ │
+│  ├──────────────────────┼────────────────────────────────────────┤ │
+│  │ COMMENT_UPDATE       │ 仅给新增的 @提及用户发通知              │ │
+│  │                      │ （mention_history 去重）                │ │
+│  │                      │ 移除的 @提及 → 不撤回旧邮件             │ │
+│  ├──────────────────────┼────────────────────────────────────────┤ │
+│  │ COMMENT_DELETE       │ 不发"已删除"更正通知，旧邮件永久有效    │ │
+│  └──────────────────────┴────────────────────────────────────────┘ │
+│                                                                     │
+│  拦截能力（仅对"未被消费的异步 Job"可能生效）：                         │
+│  · 手动从 jobs 表删除（无法精确定位）                                  │
+│  · 移除 ReceiveNotifications 角色权限（Handler 发送前检查）            │
+│  · mail channel 不可撤回（SMTP 协议本质）                              │
+└────────────────────────────────────┬────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Activity / 通知数据归档迁移 — ❌ 无自动治理，仅 TRUNCATE 全清        │
+│                                                                     │
+│  清理能力：                                                          │
+│  ┌────────────────────┬──────────────────────────────────────────┐ │
+│  │ 命令               │ 效果                                     │ │
+│  ├────────────────────┼──────────────────────────────────────────┤ │
+│  │ bookstack:clear-   │ TRUNCATE activities 表（全量清空）       │ │
+│  │ activity           │ 不支持按日期/用户/类型筛选                │ │
+│  │                    │ 不清理 watches / mention_history         │ │
+│  ├────────────────────┼──────────────────────────────────────────┤ │
+│  │ TrashCan::         │ 实体永久删除时：                          │ │
+│  │ destroyCommon      │   · activities → 软解绑（loggable_id/    │ │
+│  │ Relations          │     type 置空，detail 存 name）          │ │
+│  │                    │   · watches → DELETE                     │ │
+│  │                    │   · comments → DELETE                    │ │
+│  │                    │   · mention_history → ❌ 漏删（孤儿）    │ │
+│  ├────────────────────┼──────────────────────────────────────────┤ │
+│  │ TrashCan::         │ 默认 -1（永不过期），正整数天数时自动销毁 │ │
+│  │ autoClearOld       │ 回收站条目，触发 destroyCommonRelations  │ │
+│  └────────────────────┴──────────────────────────────────────────┘ │
+│                                                                     │
+│  ❌ 全部缺席：                                                        │
+│  · 自动归档（按时间分区 / 冷热分层）                                   │
+│  · AuditLog CSV/Excel 导出                                           │
+│  · 表分区、TTL 列                                                     │
+│  · 数据库外键级联（四张表都没有 foreign 约束）                         │
+│  · mention_history / watches 的孤儿数据定期巡检                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+

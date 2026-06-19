@@ -1687,3 +1687,494 @@ if ($lifetime < 0) return 0; // 默认 -1 = 永不过期
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## 专项深挖 10：跨实例通知统一队列 — 多 BookStack 部署场景的协调机制
+
+### 结论先行：BookStack **没有** 内建的多实例部署协调机制
+
+所有与队列 / 缓存 / Session 相关的协调都依赖 Laravel 框架层的通用能力，BookStack 本身没有针对多实例部署做任何定制化协调逻辑。配置正确的前提下多实例可以共享队列，但没有任何队列管理、负载均衡、任务去重、脑裂防护等机制。
+
+### 10.1 队列共享的两种方式
+
+BookStack 支持 3 种队列驱动（`app/Config/queue.php`）：
+
+| 驱动 | 多实例共享 | 说明 |
+|------|-----------|------|
+| `sync`（默认） | ❌ 否 | 每个实例在自己的请求线程内同步执行，没有集中队列 |
+| `database` | ✅ 是 | 所有实例共享 `jobs` 表 / `failed_jobs` 表，任何实例的队列 worker 都可以消费 |
+| `redis` | ✅ 是 | 所有实例共享同一个 Redis，队列任务存在 Redis list 中，支持多实例 worker 并发消费 |
+
+**切换方式**：通过环境变量 `QUEUE_CONNECTION=database` 或 `QUEUE_CONNECTION=redis`。
+
+### 10.2 多实例部署的必要依赖切换
+
+要实现多实例 + 共享队列，需要切换多个共享基础组件（否则会出现数据不一致 / 会话丢失 / 缓存命中率为 0 等问题）：
+
+| 组件 | 默认值 | 多实例推荐配置 | 配置项 |
+|------|--------|---------------|--------|
+| Session | `file`（本地文件） | `database` / `redis` | `SESSION_DRIVER` |
+| Cache | `file`（本地文件） | `redis` / `memcached` / `database` | `CACHE_DRIVER` |
+| Queue | `sync` | `database` / `redis` | `QUEUE_CONNECTION` |
+| Storage（上传文件） | 本地 filesystem | S3 / 共享存储 | `STORAGE_TYPE` 等 |
+
+**BookStack 没有**内建的"多实例部署检查"或"配置完整性校验"，管理员需要自行确保这些组件都指向共享存储。
+
+### 10.3 队列 Worker 的部署方式
+
+- **无内建 worker 管理**：BookStack 不提供 Horizon、Supervisor 配置模板或专用 CLI 命令来管理队列 worker
+- **依赖运维侧**：需手动配置 `php artisan queue:work` 或 Supervisor 来启动 worker 进程
+- **无优先级队列**：所有通知和 Webhook Job 都在 `default` 队列，没有高低优先级分离
+- **无并发控制**：worker 数量和 `--max-jobs`、`--max-time` 等参数完全由运维决定
+
+### 10.4 跨实例的任务重复 / 一致性问题
+
+因为 BookStack 没有使用 `ShouldBeUnique` 接口，也没有自定义唯一键，在多实例场景下存在以下潜在问题：
+
+| 问题场景 | 风险 | 当前代码行为 |
+|---------|------|-------------|
+| **同一活动被多次记录** | 低 | Activity 写入是请求线程内同步执行的，只要请求不重复就不会重复 |
+| **同一通知被多次投递** | 中（异步队列场景） | `retry_after=90` 秒后 Job 可被其他 worker 重新消费，如果原 worker 只是慢了没死，就可能重复发送 |
+| **PageUpdate 防抖失效** | 低 | 防抖依据是 `activities` 表里的上一条活动记录，表是共享的所以防抖逻辑跨实例依然生效 |
+| **Mention 去重失效** | 低 | 去重依据是 `mention_history` 表，表是共享的所以去重跨实例依然生效 |
+| **设置缓存不一致** | 中 | `SettingService` 有请求级内存缓存 `$localCache`，实例 A 修改了设置，实例 B 的请求内缓存不会失效（但每请求重新加载，不会长期不一致） |
+| **Session 丢失** | 高（如果 driver 还是 file） | 默认 file driver 不共享，多实例轮询会导致频繁登出 |
+
+### 10.5 无队列管理 UI
+
+- 没有队列长度监控面板
+- 没有失败任务重试 / 查看 / 删除 UI
+- 管理员只能通过 `php artisan queue:failed` / `queue:retry` / `queue:flush` 等 Artisan 命令管理
+- `AuditLogController` 只管 activities 表，不管队列
+
+### 10.6 无粘性会话（Sticky Session）配置
+
+BookStack 代码中**不存在**任何粘性会话（Sticky Session）逻辑，也没有 `X-Forwarded-Host` 处理或实例标识。如果用负载均衡轮询且 Session 还是 file driver，会出现"刚登录刷新就掉线"的典型症状。
+
+### 10.7 多实例部署的官方推荐路径
+
+虽然代码里没直接写，但从配置项推断，标准多实例部署应该是：
+
+```
+                              ┌──────────────┐
+                              │  Load Balancer│
+                              └──────┬───────┘
+                                     │ round-robin
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                ▼
+            ┌────────────┐   ┌────────────┐   ┌────────────┐
+            │ BookStack   │   │ BookStack   │   │ BookStack   │
+            │  Instance 1 │   │  Instance 2 │   │  Instance N │
+            └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+                   │                 │                 │
+                   └─────────────────┼─────────────────┘
+                                     │
+                      ┌──────────────┼──────────────┐
+                      ▼              ▼              ▼
+                ┌─────────┐    ┌─────────┐    ┌──────────┐
+                │ MySQL   │    │ Redis   │    │ S3/共享   │
+                │ (共享DB) │    │ (队列+   │    │ 存储      │
+                │          │    │  缓存+   │    │           │
+                │          │    │  Session)│    │           │
+                └─────────┘    └─────────┘    └──────────┘
+```
+
+关键前提：**Session、Cache、Queue 三者必须同时切换到共享驱动**，否则多实例部署会出问题。
+
+---
+
+## 专项深挖 11：通知模板自定义与多语言切换的代码路径
+
+### 11.1 通知邮件模板结构
+
+通知邮件的视图层由**两部分**组成：
+
+#### 外层壳模板（所有邮件共用）
+
+`resources/views/vendor/notifications/email.blade.php`（HTML）和 `email-plain.blade.php`（纯文本）
+
+这是 Laravel 通知的标准模板路径，BookStack 做了自定义覆盖，包含：
+
+| 区域 | 实现 |
+|------|------|
+| Logo / 站点名称 | `{{ setting('app-name') }}` + 链接到首页 |
+| 主题色 | `{{ setting('app-color') }}` 控制边框和按钮颜色 |
+| 语言方向 | `<html lang="{{ $locale->htmlLang() }}">` + RTL 支持 |
+| Greeting | `@if (!empty($greeting) ...)` 有则显示 H1 标题 |
+| 正文（introLines） | 循环渲染 `$introLines` 数组 |
+| 行动按钮 | `@if (isset($actionText))` 渲染 CTA 按钮 |
+| 附言（outroLines） | 循环渲染 `$outroLines` 数组 |
+| 页脚 | 版权年份 + 站点名 + 权益说明 |
+
+模板中大量使用内联 CSS 样式数组（`$style` 变量），兼容邮件客户端对 CSS 的有限支持。
+
+#### 内层内容（每种通知类各自组装）
+
+具体通知类（如 `PageUpdateNotification`）通过 Laravel 的 `MailMessage` 流式 API 组装内容，最终填充到外层模板的 `introLines` / `outroLines` / `actionText` / `actionUrl` / `greeting` / `level` 等插槽中。
+
+### 11.2 模板组装链路 — 以 PageUpdateNotification 为例
+
+```
+PageUpdateNotification::toMail($notifiable)
+    │
+    ├─ $locale = $notifiable->getLocale()   ← 获取收件用户的语言
+    │
+    ├─ 组装 $listLines（键值对数组）
+    │   ├─ "页面名称" → EntityLinkMessageLine
+    │   ├─ "页面路径" → EntityPathMessageLine（按权限过滤父章节/图书）
+    │   └─ "更新者" → 用户名
+    │
+    ├─ $this->newMailMessage($locale)         ← 创建 MailMessage + 绑定模板
+    │
+    ├─ ->subject(...)                         ← 邮件标题
+    ├─ ->line("...intro...")                  ← 加入 introLines
+    ├─ ->line(new ListMessageLine(...))       ← 详情列表（键值对）
+    ├─ ->line("...debounce...")               ← 防抖说明
+    ├─ ->action("查看页面", $page->getUrl())   ← CTA 按钮
+    └─ ->line($this->buildReasonFooterLine()) ← 底部"管理通知偏好"链接
+```
+
+### 11.3 自定义 Message Parts — 可复用的内容组件
+
+`app/Activity/Notifications/MessageParts/` 目录下有 4 种可复用的内容行组件，全部实现 `__toString()` 方法，可以直接传给 `->line()`：
+
+| 组件类 | 用途 | 输出示例 |
+|--------|------|---------|
+| `LinkedMailMessageLine` | 带链接的文本行 | 文字 + 链接（邮件里显示为 inline 链接） |
+| `EntityLinkMessageLine` | 实体名称超链接 | 页面/图书/章节名 + getUrl() 链接 |
+| `EntityPathMessageLine` | 实体面包屑路径 | "Book > Chapter" 形式的层级路径 |
+| `ListMessageLine` | 键值对列表 | 多行为 label: value 格式的详情列表 |
+
+这些组件封装了邮件中反复出现的 UI 模式，避免每个通知类都重复拼 HTML 字符串。
+
+### 11.4 多语言切换机制
+
+#### 语言存储位置
+
+用户语言存在 `settings` 表的 KV 中：
+- `setting_key = "user:{uid}:language"`
+- 默认值：`config('app.default_locale')`，即 `APP_DEFAULT_LOCALE` 环境变量，默认 `en`
+- 访客用户（未登录）：如果 `APP_AUTO_DETECT_LOCALE=true`，会从 `Accept-Language` 请求头自动匹配
+
+#### 语言切换中间件
+
+`app/Http/Middleware/Localization.php` — 每个 Web 请求都会执行：
+
+```php
+$userLocale = $this->localeManager->getForUser(user());
+view()->share('locale', $userLocale);
+app()->setLocale($userLocale->appLocale());
+```
+
+设置全局 `app()`  locale 并把 `LocaleDefinition` 对象共享给视图。
+
+#### LocaleDefinition — 语言对象
+
+`app/Translation/LocaleDefinition.php` 封装了三种名称：
+
+| 方法 | 用途 | 示例 |
+|------|------|------|
+| `appLocale()` | BookStack 内部 locale 名（用于 `trans()`） | `zh_CN` |
+| `isoLocale()` | ISO 标准 locale 名（用于 setlocale 等） | `zh_CN` |
+| `htmlLang()` | HTML `lang` 属性格式 | `zh-CN` |
+
+关键方法 `trans($key, $replace)` — 直接调用 `trans($key, $replace, $this->appLocale())`，显式指定 locale 参数，**不依赖全局 app locale**。
+
+#### 通知邮件的语言：以收件人为准
+
+这是非常重要的设计细节——**通知用接收者的语言渲染，而不是触发者的语言**。
+
+每个通知类的 `toMail()` 方法开头都有：
+
+```php
+$locale = $notifiable->getLocale();
+```
+
+然后全文本都用 `$locale->trans(...)` 而不是全局 `trans(...)`。
+
+**队列中的语言安全**：因为 `toMail()` 在 Job 执行时才调用（此时 worker 进程的全局 locale 可能是系统默认），但由于通知类显式通过 `$notifiable->getLocale()` 获取并使用 `LocaleDefinition::trans()` 指定 locale 参数，所以不受全局 locale 影响——即使队列 worker 运行在英文环境，给中文用户发的邮件仍然是中文。
+
+### 11.5 模板自定义的两种方式
+
+#### 方式一：主题系统覆盖视图
+
+BookStack 主题系统（Theming System）通过 `THEME_REGISTER_VIEWS` 事件（`app/Theming/ThemeEvents.php:181`）允许自定义主题注册视图覆盖路径。
+
+主题可以在自己的 `views/` 目录下放同名文件：
+- `vendor/notifications/email.blade.php` — 覆盖外层邮件壳
+- 也可以通过监听 `WEB_MIDDLEWARE_BEFORE` / `APP_BOOT` 等事件，在通知发送前替换视图命名空间
+
+#### 方式二：监听 Theme 事件扩展内容
+
+- `ACTIVITY_LOGGED` — 活动记录时触发，可以自定义记录字段
+- `WEBHOOK_CALL_BEFORE` — Webhook 调用前触发，可以自定义 POST 数据
+- **但没有 `NOTIFICATION_SENDING` 事件** — 通知邮件发送前没有专属事件点
+
+如果需要在通知发送前修改内容，只能：
+1. 通过主题覆盖视图模板
+2. 或者创建自定义 Handler 替换默认 Handler
+3. 或者在 `NotificationManager` 注册时注入自定义 Handler 类
+
+#### 方式三：直接修改代码 / 语言文件
+
+- 文本内容都在 `lang/{locale}/notifications.php` 里，是 PHP 数组格式
+- 邮件模板在 `resources/views/vendor/notifications/email.blade.php`
+- 但这些都不是"配置级自定义"，改了代码升级时会被覆盖
+
+### 11.6 语言文件结构
+
+每个语言目录下与通知相关的有 4 个文件：
+
+| 文件 | 内容 |
+|------|------|
+| `lang/{locale}/notifications.php` | 通知邮件的所有文案（subject、intro、detail、action、footer 等） |
+| `lang/{locale}/activities.php` | Activity 类型展示名（活动列表 / 审计日志中使用） |
+| `lang/{locale}/settings.php` | 设置页面文案，含测试邮件文案 |
+| `lang/{locale}/common.php` | 公用文案，含邮件底部权益说明等 |
+
+---
+
+## 专项深挖 12：通知发送失败的重试策略、降级路径与死信处理
+
+### 结论先行：业务层零定制，全靠 Laravel 默认行为 + 配置兜底
+
+BookStack 没有在业务代码中定义任何重试次数、退避策略、超时控制、死信路由。所有失败处理完全依赖 Laravel Queue 框架的默认行为和 `queue.php` / `mail.php` 的配置。
+
+### 12.1 通知 Job 的失败重试策略
+
+#### 无定制参数的默认行为
+
+`MailNotification` 基类和所有子类都没有定义：
+- `public $tries` — 最大重试次数（未定义则无上限）
+- `public $timeout` — 执行超时时间（未定义则无限制）
+- `public $backoff` / `backoff()` — 重试间隔退避（未定义则 0 秒）
+- `public $maxExceptions` — 最大异常数
+- `retryUntil()` — 重试截止时间
+- `failed()` — 失败回调方法
+- `ShouldBeUnique` / `uniqueId()` — 任务唯一
+
+**等于完全继承 Laravel Queueable trait 的零值默认**。
+
+#### retry_after 与 Job 抢占
+
+`app/Config/queue.php:29`：
+```php
+'retry_after' => 90,  // database 和 redis 都是 90 秒
+```
+
+这意味着：
+- Job 被 worker 领取后，`reserved_at` 时间戳被更新
+- 如果 90 秒内没完成也没标记为失败/成功，其他 worker 可以把它再拿出来执行
+- 多实例场景下，慢 Job 可能被多个 worker 重复执行 → **通知可能重复发送**
+- 90 秒对于发邮件来说非常充裕，正常 SMTP 不会超，但网络异常时可能触发
+
+#### Worker 层面的重试控制
+
+实际生效的重试次数由 **worker 启动命令参数** 决定：
+
+```bash
+php artisan queue:work --tries=3 --backoff=10
+```
+
+如果运维没有加 `--tries` 参数，Job 会**无限重试**直到成功或手动删除。
+
+**BookStack 没有内建的 worker 启动脚本或 Supervisor 配置**，这些完全由部署环境决定。
+
+### 12.2 死信处理（DLQ）
+
+#### 有 failed_jobs 表，但没有 DLQ 队列
+
+`database/migrations/2021_12_13_152120_create_failed_jobs_table.php` 创建了 `failed_jobs` 表：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 自增主键 |
+| `uuid` | UUID，唯一索引 |
+| `connection` | 连接名（database / redis） |
+| `queue` | 队列名 |
+| `payload` | 完整 Job 序列化数据（longText） |
+| `exception` | 异常堆栈（longText） |
+| `failed_at` | 失败时间戳 |
+
+配置 (`app/Config/queue.php:51`)：
+```php
+'failed' => [
+    'driver'   => 'database-uuids',
+    'database' => 'mysql',
+    'table'    => 'failed_jobs',
+],
+```
+
+#### 失败后的状态
+
+- Job 超过最大重试次数 → 被标记为 failed → 写入 `failed_jobs` 表
+- 不会自动进入另一个"死信队列"等待重试
+- 没有失败告警（没有邮件 / Slack / 钉钉通知管理员）
+- 没有自动重试策略（比如失败后延迟 1 小时再试）
+
+#### 手动管理方式
+
+只能通过 Artisan 命令操作：
+- `php artisan queue:failed` — 列出失败 Job
+- `php artisan queue:retry {id}` — 重试指定失败 Job
+- `php artisan queue:retry all` — 重试所有失败 Job
+- `php artisan queue:forget {id}` — 删除指定失败 Job
+- `php artisan queue:flush` — 清空所有失败 Job
+
+**BookStack 管理后台没有失败任务管理页面**。
+
+### 12.3 两层降级路径
+
+#### 降级层 1：Mailer Failover — SMTP 失败后写日志
+
+`app/Config/mail.php:60` 定义了 `failover` mailer：
+
+```php
+'failover' => [
+    'transport' => 'failover',
+    'mailers' => [
+        'smtp',
+        'log',
+    ],
+],
+```
+
+如果 `MAIL_MAILER=failover`：
+1. 先尝试 SMTP 发送
+2. SMTP 抛异常 → 自动降级为 `log` mailer → 把邮件内容写入日志文件
+3. 邮件不会真正送达，但不会阻塞进程，也不会让 Job 失败
+
+这是一个非常实用的静默降级，但**默认不启用**（默认是 `SMTP_MAILER` → `MAIL_DRIVER` → 默认 `smtp`）。
+
+#### 降级层 2：Handler 层 try/catch — 单用户失败不影响其他用户
+
+`BaseNotificationHandler::sendNotificationToUserIds()` (`app/Activity/Notifications/Handlers/BaseNotificationHandler.php:26`)：
+
+```php
+try {
+    $user->notify(new $notification($detail, $initiator));
+} catch (\Exception $exception) {
+    Log::error("Failed to send email notification to user [id:{$user->id}] with error: {$exception->getMessage()}");
+}
+```
+
+每个用户独立 try/catch：
+- 某一个用户的通知失败，**不会影响**其他用户的通知发送
+- 异常只记日志，不向上抛出
+- 注意：这个 try/catch **只对 sync 驱动有效**。如果是异步队列，`notify()` 只是把 Job 投递给队列，马上返回成功；真正发送失败发生在 Job 执行时，不会被这个 try/catch 捕获，而是走 Laravel 失败 Job 流程
+
+### 12.4 Webhook Job 的失败策略
+
+`DispatchWebhookJob` (`app/Activity/DispatchWebhookJob.php`) 同样没有 `tries` / `timeout` / `backoff`。
+
+Webhook 调用失败的处理：
+- HTTP 异常被 catch → 记录 `last_errored_at` 和 `last_error` 到 webhook 表
+- **不会让 Job 失败** → 不会进 failed_jobs 表 → 不会自动重试
+- 记录一下就完事，没有后续重放机制
+
+这是一个设计取舍：Webhook 失败只记状态，不反复重试，避免对下游服务造成雪崩压力，但代价是可能丢通知。
+
+### 12.5 失败场景全景表
+
+| 失败场景 | 重试？ | 降级？ | 失败后位置 | 可观测性 |
+|---------|-------|-------|-----------|---------|
+| SMTP 连接超时 / 拒绝 | 无限次（worker 无 --tries 时） | ❌ 否 | `failed_jobs` 表 | 异常堆栈 |
+| SMTP 5xx 永久错误 | 同上 | ❌ 否 | 同上 | 同上 |
+| 邮件格式错误 | 不会重试（同步构造时就失败） | ❌ 否 | Handler try/catch → Log | 日志 |
+| 用户无权限查看内容 | 不会重试（Handler 内 skip） | ❌ 否 | 直接跳过 | 无日志，静默 |
+| **MAIL_MAILER=failover 时 SMTP 失败** | 不重试 | ✅ 降级为 log mailer | 日志文件 | 日志 |
+| Webhook 端点 5xx | 不重试 | ❌ 否 | webhook 表 last_error 字段 | last_error 文本 |
+| Webhook 端点超时 | 不重试 | ❌ 否 | 同上 | 同上 |
+| 异步队列 Job 执行超过 90s | 被其他 worker 抢占 → 可能重复执行 | ❌ 否 | 未超时的成功、超时的可能重复 | 无特殊日志 |
+
+### 12.6 没有的能力汇总
+
+| 能力 | 是否存在 |
+|------|---------|
+| 指数退避（Exponential backoff） | ❌ |
+| 最大重试次数（业务层定义） | ❌ |
+| 死信队列（DLQ） | ❌（只有 failed_jobs 表） |
+| 失败告警（通知管理员） | ❌ |
+| 幂等性保证 / 去重发送 | ❌（多实例 + retry_after 可能重复发） |
+| 熔断（连续失败后暂停发送） | ❌ |
+| 批量失败重试（定时重放失败队列） | ❌（只有手动 queue:retry） |
+| 发送成功率监控 | ❌ |
+
+---
+
+## 专项深挖补充：第 4 轮三层全景总览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│          跨实例通知统一队列 — ❌ 无内建协调，靠 Laravel 配置          │
+│                                                                     │
+│  默认 QUEUE_CONNECTION=sync → 各实例本地同步执行                      │
+│  切 database/redis → 多实例共享队列，但：                             │
+│                                                                     │
+│  ┌─────────────────────────┬──────────────────────────────────────┐ │
+│  │ 能力                    │ 状态                                 │ │
+│  ├─────────────────────────┼──────────────────────────────────────┤ │
+│  │ 任务去重（ShouldBeUnique）│ ❌ 无，retry_after=90s 可能重复发   │ │
+│  │ 优先级队列               │ ❌ 全走 default 队列                  │ │
+│  │ 队列管理 UI              │ ❌ 只有 Artisan 命令                 │ │
+│  │ 失败任务重试 UI          │ ❌ 只有 queue:retry / forget        │ │
+│  │ Worker 管理 (Horizon)    │ ❌ 无，需自行配 Supervisor           │ │
+│  │ 粘性会话                 │ ❌ 无，需自行在 LB 层做              │ │
+│  │ Session 共享             │ ⚠️ 默认 file driver 不共享，需切 DB/redis│ │
+│  │ Cache 共享               │ ⚠️ 默认 file driver 不共享，需切 redis │ │
+│  │ PageUpdate 防抖          │ ✅ 共享 DB → 跨实例仍生效            │ │
+│  │ Mention 去重             │ ✅ 共享 DB → 跨实例仍生效            │ │
+│  └─────────────────────────┴──────────────────────────────────────┘ │
+└────────────────────────────────────┬────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│           通知模板自定义 / 多语言切换                                 │
+│                                                                     │
+│  模板结构：                                                          │
+│    外层壳：resources/views/vendor/notifications/email.blade.php      │
+│    内容层：每个通知类 toMail() 用 MailMessage 流式 API 组装           │
+│    可复用组件：MessageParts/ 下 4 种 Line 组件                        │
+│                                                                     │
+│  多语言机制：                                                        │
+│    · 用户语言存在 settings 表：user:{uid}:language                  │
+│    · 访客自动检测 Accept-Language 头                                 │
+│    · 每个通知用 $notifiable->getLocale() 获取收件人语言               │
+│    · 用 $locale->trans() 而非全局 trans() → 队列环境下仍正确          │
+│    · 模板 lang / dir 属性随 locale 动态设置                           │
+│                                                                     │
+│  自定义方式：                                                        │
+│    · 主题系统覆盖视图（THEME_REGISTER_VIEWS 事件）                    │
+│    · 修改 lang/{locale}/notifications.php 文案                       │
+│    · ❌ 无通知发送前事件（NOTIFICATION_SENDING）                     │
+│    · ❌ 无可视化模板编辑器                                           │
+└────────────────────────────────────┬────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│          通知发送失败 — 重试 / 降级 / 死信                           │
+│                                                                     │
+│  重试策略：                                                          │
+│    · 业务层零定制：无 tries / timeout / backoff / uniqueId           │
+│    · retry_after = 90s → 超时后可被其他 worker 重跑                  │
+│    · 实际重试次数由 worker --tries 参数决定（默认无限）               │
+│    · 多实例 + 慢 Job → 可能重复发送（无幂等保护）                     │
+│                                                                     │
+│  降级路径（2 层）：                                                  │
+│    1. Handler 层 try/catch → 单用户失败不影响他人（仅 sync 有效）     │
+│    2. Mailer failover → SMTP 失败自动降级写日志（需 MAIL_MAILER=failover）│
+│                                                                     │
+│  死信处理：                                                          │
+│    · failed_jobs 表记录失败 Job（payload + exception + failed_at）   │
+│    · ❌ 无 DLQ 队列自动重试                                          │
+│    · ❌ 无失败告警                                                    │
+│    · 仅可手动 Artisan queue:retry / forget / flush                   │
+│    · ❌ 无管理后台 UI                                                 │
+│                                                                     │
+│  Webhook 失败：                                                      │
+│    · 只记 last_error 到 webhook 表                                   │
+│    · 不让 Job 失败 → 不进 failed_jobs → 不自动重试                   │
+│    · 设计取舍：避免雪崩，但可能丢通知                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
